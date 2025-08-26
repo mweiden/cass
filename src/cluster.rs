@@ -378,10 +378,10 @@ impl Cluster {
         if broadcast {
             replicas.extend(self.ring.values().cloned());
         } else {
-            let keys = engine
-                .partition_keys(&self.db, sql)
-                .await
-                .unwrap_or_else(|_| vec![sql.to_string()]);
+            let keys = match engine.partition_keys(&self.db, sql).await {
+                Ok(k) => k,
+                Err(e) => return Err(e),
+            };
             for key in keys {
                 for node in self.replicas_for(&key) {
                     replicas.insert(node);

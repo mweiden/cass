@@ -466,9 +466,11 @@ impl SqlEngine {
     ) -> Result<Vec<String>, QueryError> {
         let stmts = self.parse(sql)?;
         let mut keys = Vec::new();
+        let mut needs_key = false;
         for stmt in stmts {
             match stmt {
                 Statement::Insert(insert) => {
+                    needs_key = true;
                     let ns = match &insert.table {
                         sqlparser::ast::TableObject::TableName(name) => {
                             object_name_to_ns(name).ok_or(QueryError::Unsupported)?
@@ -499,6 +501,7 @@ impl SqlEngine {
                 Statement::Update {
                     table, selection, ..
                 } => {
+                    needs_key = true;
                     let ns = table_factor_to_ns(&table.relation).ok_or(QueryError::Unsupported)?;
                     let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
                     if let Some(expr) = selection {
@@ -507,6 +510,7 @@ impl SqlEngine {
                     }
                 }
                 Statement::Delete(delete) => {
+                    needs_key = true;
                     let table = match &delete.from {
                         FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
                     };
@@ -522,6 +526,7 @@ impl SqlEngine {
                     }
                 }
                 Statement::Query(q) => {
+                    needs_key = true;
                     if let SetExpr::Select(select) = *q.body {
                         if select.from.len() != 1 {
                             return Err(QueryError::Unsupported);
@@ -537,6 +542,11 @@ impl SqlEngine {
                 }
                 _ => {}
             }
+        }
+        if needs_key && keys.is_empty() {
+            return Err(QueryError::Other(
+                "partition key must be fully specified".into(),
+            ));
         }
         Ok(keys)
     }
