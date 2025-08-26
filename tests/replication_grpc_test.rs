@@ -61,7 +61,7 @@ async fn union_and_lww_across_replicas() {
     let mut c2 = CassClient::connect(base2.to_string()).await.unwrap();
 
     c1.query(QueryRequest {
-        sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+        sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id, val))".into(),
     })
     .await
     .unwrap();
