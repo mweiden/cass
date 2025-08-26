@@ -110,8 +110,8 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "builder",
-          "expr": "sum by(path, method) (rate(http_requests_total[$__rate_interval]))",
-          "legendFormat": "{{method}} {{path}}",
+          "expr": "sum by(grpc_method) (rate(grpc_server_handled_total[$__rate_interval]))",
+          "legendFormat": "{{grpc_method}}",
           "range": true,
           "refId": "A"
         }
@@ -208,7 +208,7 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "builder",
-          "expr": "sum by(status) (rate(http_requests_total[$__rate_interval]))",
+          "expr": "sum by(grpc_code) (rate(grpc_server_handled_total[$__rate_interval]))",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -302,8 +302,8 @@
       "targets": [
         {
           "editorMode": "builder",
-          "expr": "histogram_quantile(0.95, sum by(le, method, path) (rate(http_request_duration_seconds_bucket[$__rate_interval])))",
-          "legendFormat": "{{method}} {{path}}",
+          "expr": "histogram_quantile(0.95, sum by(le, grpc_method) (rate(grpc_server_handling_seconds_bucket[$__rate_interval])))",
+          "legendFormat": "{{grpc_method}}",
           "range": true,
           "refId": "A"
         }
@@ -685,5 +685,5 @@
   "timezone": "browser",
   "title": "Cass",
   "uid": "0b04c060-f0f1-444d-843d-d416074e6d2f",
-  "version": 1
+  "version": 2
 }
