@@ -105,13 +105,27 @@ docker compose up
 Connect using the built-in REPL and run some queries:
 
 ```bash
-cass repl http://localhost:8080
-> CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id));
-> INSERT INTO kv VALUES ('hello','world');
-> SELECT val FROM kv WHERE id = 'hello';
-[
-  { "val": "world" }
-]
+$ cass repl http://localhost:8080
+
+> CREATE TABLE orders (customer_id TEXT, order_id TEXT, order_date TEXT, PRIMARY KEY(customer_id, order_id))
+CREATE TABLE 1 table
+> INSERT INTO orders VALUES ('nike', 'abc123', '2025-08-25')
+INSERT 1 row
+> INSERT INTO orders VALUES ('nike', 'def456', '2025-08-26')
+INSERT 1 row
+> SELECT * FROM orders WHERE customer_id = 'nike'
+customer_id | order_date | order_id
+nike | 2025-08-25 | abc123
+nike | 2025-08-26 | def456
+(2 rows)
+> SELECT COUNT(1) FROM orders WHERE customer_id = 'nike'
+count
+2
+(1 rows)
+> SELECT * FROM orders WHERE customer_id = 'nike' AND order_id = 'abc123'
+customer_id | order_date | order_id
+nike | 2025-08-25 | abc123
+(1 rows)
 ```
 
 ## Maintenance Commands
