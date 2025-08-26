@@ -1,6 +1,5 @@
 use cass::storage::{Storage, local::LocalStorage};
-use cass::{Database, SqlEngine};
-use serde_json::{Value, json};
+use cass::{Database, SqlEngine, query::QueryOutput};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -25,10 +24,11 @@ async fn update_delete_and_count() {
     let res = engine
         .execute(&db, "SELECT val FROM kv WHERE id = 'a'")
         .await
-        .unwrap()
         .unwrap();
-    let val: Value = serde_json::from_slice(&res).unwrap();
-    assert_eq!(val, json!([{ "val": "2" }]));
+    match res {
+        QueryOutput::Rows(rows) => assert_eq!(rows[0].get("val"), Some(&"2".to_string())),
+        _ => panic!("unexpected"),
+    }
 
     engine
         .execute(&db, "DELETE FROM kv WHERE id = 'a'")
@@ -37,10 +37,11 @@ async fn update_delete_and_count() {
     let res = engine
         .execute(&db, "SELECT val FROM kv WHERE id = 'a'")
         .await
-        .unwrap()
         .unwrap();
-    let v: Value = serde_json::from_slice(&res).unwrap();
-    assert_eq!(v, json!([]));
+    match res {
+        QueryOutput::Rows(rows) => assert!(rows.is_empty()),
+        _ => panic!("unexpected"),
+    }
 
     engine
         .execute(&db, "INSERT INTO kv (id, val) VALUES ('b','3')")
@@ -54,25 +55,34 @@ async fn update_delete_and_count() {
     let res = engine
         .execute(&db, "SELECT COUNT(*) FROM kv")
         .await
-        .unwrap()
         .unwrap();
-    let v: Value = serde_json::from_slice(&res).unwrap();
-    assert_eq!(v, json!([{"count":2}]));
+    match res {
+        QueryOutput::Rows(rows) => {
+            assert_eq!(rows[0].get("count"), Some(&"2".to_string()));
+        }
+        _ => panic!("unexpected"),
+    }
     let res = engine
         .execute(&db, "SELECT COUNT(*) FROM kv WHERE id = 'b'")
         .await
-        .unwrap()
         .unwrap();
-    let v: Value = serde_json::from_slice(&res).unwrap();
-    assert_eq!(v, json!([{"count":1}]));
+    match res {
+        QueryOutput::Rows(rows) => {
+            assert_eq!(rows[0].get("count"), Some(&"1".to_string()));
+        }
+        _ => panic!("unexpected"),
+    }
 
     let res = engine
         .execute(&db, "SELECT COUNT(*) FROM kv WHERE val = '3'")
         .await
-        .unwrap()
         .unwrap();
-    let v: Value = serde_json::from_slice(&res).unwrap();
-    assert_eq!(v, json!([{"count":1}]));
+    match res {
+        QueryOutput::Rows(rows) => {
+            assert_eq!(rows[0].get("count"), Some(&"1".to_string()));
+        }
+        _ => panic!("unexpected"),
+    }
 }
 
 #[tokio::test]
@@ -91,17 +101,22 @@ async fn table_names_and_cast() {
         .await
         .unwrap();
 
-    let tables = engine.execute(&db, "SHOW TABLES").await.unwrap().unwrap();
-    let tbls: Value = serde_json::from_slice(&tables).unwrap();
-    assert_eq!(tbls, json!(["kv"]));
+    let tables = engine.execute(&db, "SHOW TABLES").await.unwrap();
+    match tables {
+        QueryOutput::Tables(t) => assert_eq!(t, vec!["kv".to_string()]),
+        _ => panic!("unexpected"),
+    }
 
     let cast = engine
         .execute(&db, "SELECT CAST(val AS INT) FROM kv WHERE id = 'a'")
         .await
-        .unwrap()
         .unwrap();
-    let castv: Value = serde_json::from_slice(&cast).unwrap();
-    assert_eq!(castv, json!([{ "val": "1" }]));
+    match cast {
+        QueryOutput::Rows(rows) => {
+            assert_eq!(rows[0].get("val"), Some(&"1".to_string()));
+        }
+        _ => panic!("unexpected"),
+    }
 }
 
 #[tokio::test]
@@ -118,8 +133,12 @@ async fn multi_row_insert_count() {
     let res = engine
         .execute(&db, "INSERT INTO kv (id, val) VALUES ('a','1'),('b','2')")
         .await
-        .unwrap()
         .unwrap();
-    let ack: Value = serde_json::from_slice(&res).unwrap();
-    assert_eq!(ack, json!({"op":"INSERT","unit":"row","count":2}));
+    match res {
+        QueryOutput::Mutation { op, count, .. } => {
+            assert_eq!(op, "INSERT");
+            assert_eq!(count, 2);
+        }
+        _ => panic!("unexpected"),
+    }
 }

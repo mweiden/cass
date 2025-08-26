@@ -1,39 +1,95 @@
 use std::{
+    convert::Infallible,
     fs,
     net::SocketAddr,
     path::Path,
-    sync::Arc,
-    time::{Duration, Instant},
+    sync::{Arc, Mutex},
 };
 
-use axum::{
-    Json, Router,
-    body::Body,
-    extract::{ConnectInfo, State},
-    http::{Request, StatusCode, Version},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-};
 use cass::{
     Database,
     cluster::Cluster,
+    rpc::{
+        FlushRequest, FlushResponse, HealthRequest, HealthResponse, PanicRequest, PanicResponse,
+        QueryRequest, QueryResponse, Row as RpcRow,
+        cass_client::CassClient,
+        cass_server::{Cass, CassServer},
+        query_response,
+    },
     storage::{Storage, local::LocalStorage, s3::S3Storage},
 };
-use chrono::Utc;
-use clap::{Parser, ValueEnum};
-use prometheus::{
-    Encoder, Gauge, HistogramVec, IntCounterVec, IntGaugeVec, TextEncoder, register_gauge,
-    register_histogram_vec, register_int_counter_vec, register_int_gauge_vec,
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use hyper::{
+    Body as HttpBody, Request as HttpRequest, Response as HttpResponse, Server as HyperServer,
+    header::{CONTENT_TYPE, HeaderValue},
+    service::{make_service_fn, service_fn},
 };
-use reqwest::Url;
-use serde_json::{Value, json};
+use once_cell::sync::Lazy;
+use prometheus::{Gauge, GaugeVec, register_gauge, register_gauge_vec};
 use sysinfo::System;
+use tonic::{Request, Response, Status, transport::Server};
+use tonic_prometheus_layer::{MetricsLayer, metrics as tl_metrics};
+use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::{Level, info};
+use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use url::Url;
 
 type DynStorage = Arc<dyn Storage>;
 
+static NODE_HEALTH: Lazy<GaugeVec> = Lazy::new(|| {
+    register_gauge_vec!("node_health", "Health status of peer nodes", &["peer"]).unwrap()
+});
+static RAM_USAGE: Lazy<Gauge> =
+    Lazy::new(|| register_gauge!("ram_usage_bytes", "RAM usage in bytes").unwrap());
+static CPU_USAGE: Lazy<Gauge> =
+    Lazy::new(|| register_gauge!("cpu_usage_percent", "CPU usage percentage").unwrap());
+static SSTABLE_DISK_USAGE: Lazy<Gauge> = Lazy::new(|| {
+    register_gauge!("sstable_disk_usage_bytes", "SSTable disk usage in bytes").unwrap()
+});
+
+fn print_rows(rows: &[RpcRow]) {
+    if rows.is_empty() {
+        println!("(0 rows)");
+        return;
+    }
+    let mut cols: Vec<String> = rows
+        .iter()
+        .flat_map(|r| r.columns.keys().cloned())
+        .collect();
+    cols.sort();
+    cols.dedup();
+    println!("{}", cols.join(" | "));
+    for row in rows {
+        let mut vals: Vec<String> = Vec::new();
+        for c in &cols {
+            vals.push(row.columns.get(c).cloned().unwrap_or_default());
+        }
+        println!("{}", vals.join(" | "));
+    }
+    println!("({} rows)", rows.len());
+}
+
 #[derive(Parser)]
-struct Args {
+#[command(name = "cass")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the gRPC server
+    Server(ServerArgs),
+    /// Broadcast a flush across the cluster via the target node
+    Flush { target: String },
+    /// Make the specified node unhealthy for a short period
+    Panic { target: String },
+    /// Start an interactive SQL REPL against the provided nodes
+    Repl { nodes: Vec<String> },
+}
+
+#[derive(Args)]
+struct ServerArgs {
     #[arg(long, default_value = "local", value_enum)]
     storage: StorageKind,
     #[arg(long, default_value = "/tmp/cass-data")]
@@ -57,102 +113,98 @@ enum StorageKind {
 }
 
 #[derive(Clone)]
-struct AppState {
+struct CassService {
     cluster: Arc<Cluster>,
-    metrics: Arc<Metrics>,
-    data_dir: String,
 }
 
-#[derive(Clone)]
-struct Metrics {
-    req_count: IntCounterVec,
-    req_duration: HistogramVec,
-    health: IntGaugeVec,
-    ram: Gauge,
-    cpu: Gauge,
-    sstable: Gauge,
-}
-
-impl Metrics {
-    fn new() -> Self {
-        Self {
-            req_count: register_int_counter_vec!(
-                "http_requests_total",
-                "HTTP request counts",
-                &["method", "path", "status"]
-            )
-            .unwrap(),
-            req_duration: register_histogram_vec!(
-                "http_request_duration_seconds",
-                "HTTP request latencies",
-                &["method", "path", "status"]
-            )
-            .unwrap(),
-            health: register_int_gauge_vec!(
-                "node_health",
-                "Health status of peer nodes",
-                &["peer"]
-            )
-            .unwrap(),
-            ram: register_gauge!("ram_usage_bytes", "RAM usage in bytes").unwrap(),
-            cpu: register_gauge!("cpu_usage_percent", "CPU usage percentage").unwrap(),
-            sstable: register_gauge!("sstable_disk_usage_bytes", "SSTable disk usage in bytes")
-                .unwrap(),
+#[tonic::async_trait]
+impl Cass for CassService {
+    async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
+        let sql = req.into_inner().sql;
+        match self.cluster.execute(&sql, false).await {
+            Ok(resp) => Ok(Response::new(resp)),
+            Err(e) => Err(Status::invalid_argument(e.to_string())),
         }
     }
-}
 
-/// Handle incoming SQL queries sent by clients.
-async fn handle_query(State(state): State<AppState>, body: String) -> (StatusCode, String) {
-    match state.cluster.execute(&body, false).await {
-        Ok(Some(bytes)) => (StatusCode::OK, String::from_utf8_lossy(&bytes).to_string()),
-        Ok(None) => (StatusCode::OK, String::new()),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()),
+    async fn internal(
+        &self,
+        req: Request<QueryRequest>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        let sql = req.into_inner().sql;
+        match self.cluster.execute(&sql, true).await {
+            Ok(resp) => Ok(Response::new(resp)),
+            Err(e) => Err(Status::invalid_argument(e.to_string())),
+        }
+    }
+
+    async fn flush(&self, _req: Request<FlushRequest>) -> Result<Response<FlushResponse>, Status> {
+        self.cluster.flush_all().await.map_err(Status::internal)?;
+        Ok(Response::new(FlushResponse {}))
+    }
+
+    async fn flush_internal(
+        &self,
+        _req: Request<FlushRequest>,
+    ) -> Result<Response<FlushResponse>, Status> {
+        self.cluster
+            .flush_self()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(FlushResponse {}))
+    }
+
+    async fn panic(&self, _req: Request<PanicRequest>) -> Result<Response<PanicResponse>, Status> {
+        self.cluster
+            .panic_for(std::time::Duration::from_secs(60))
+            .await;
+        let healthy = self.cluster.self_healthy().await;
+        Ok(Response::new(PanicResponse { healthy }))
+    }
+
+    async fn health(
+        &self,
+        _req: Request<HealthRequest>,
+    ) -> Result<Response<HealthResponse>, Status> {
+        if !self.cluster.self_healthy().await {
+            return Err(Status::unavailable("unhealthy"));
+        }
+        Ok(Response::new(HealthResponse {
+            info: self.cluster.health_info().to_string(),
+        }))
     }
 }
 
-/// Handle internal replication requests from peers.
-async fn handle_internal(State(state): State<AppState>, body: String) -> (StatusCode, String) {
-    match state.cluster.execute(&body, true).await {
-        Ok(Some(bytes)) => (StatusCode::OK, String::from_utf8_lossy(&bytes).to_string()),
-        Ok(None) => (StatusCode::OK, String::new()),
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()),
-    }
-}
-
-async fn handle_panic(State(state): State<AppState>) -> Json<Value> {
-    state.cluster.panic_for(Duration::from_secs(60)).await;
-    let healthy = state.cluster.self_healthy().await;
-    let addr = state.cluster.self_addr();
-    state
-        .metrics
-        .health
-        .with_label_values(&[addr])
-        .set(if healthy { 1 } else { 0 });
-    Json(json!({ "healthy": healthy }))
-}
-
-async fn handle_flush(State(state): State<AppState>) -> (StatusCode, String) {
-    match state.cluster.flush_all().await {
-        Ok(_) => (StatusCode::OK, String::new()),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
-}
-
-async fn handle_flush_internal(State(state): State<AppState>) -> (StatusCode, String) {
-    match state.cluster.flush_self().await {
-        Ok(_) => (StatusCode::OK, String::new()),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
-}
-
-/// Start an HTTP server exposing the database at `/query`.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let subscriber = FmtSubscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Server(args) => run_server(args).await?,
+        Command::Flush { target } => {
+            let mut client = CassClient::connect(target).await?;
+            client.flush(FlushRequest {}).await?;
+        }
+        Command::Panic { target } => {
+            let mut client = CassClient::connect(target).await?;
+            let resp = client.panic(PanicRequest {}).await?;
+            println!("healthy: {}", resp.into_inner().healthy);
+        }
+        Command::Repl { nodes } => repl(nodes).await?,
+    }
+    Ok(())
+}
+
+async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = args.data_dir.clone();
     let storage: DynStorage = match args.storage {
-        StorageKind::Local => Arc::new(LocalStorage::new(&args.data_dir)),
+        StorageKind::Local => Arc::new(LocalStorage::new(&data_dir)),
         StorageKind::S3 => {
             let bucket = args.bucket.ok_or_else(|| {
                 std::io::Error::new(
@@ -171,80 +223,85 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.vnodes,
         args.rf,
     ));
-    let metrics = Arc::new(Metrics::new());
-    let state = AppState {
-        cluster,
-        metrics: metrics.clone(),
-        data_dir: args.data_dir.clone(),
+
+    tl_metrics::try_init_settings(tl_metrics::GlobalSettings {
+        registry: prometheus::default_registry().clone(),
+        ..Default::default()
+    })
+    .ok();
+
+    let svc = CassService {
+        cluster: cluster.clone(),
     };
-
-    let app = Router::new()
-        .route("/query", post(handle_query))
-        .route("/internal", post(handle_internal))
-        .route("/health", get(handle_health))
-        .route("/flush", post(handle_flush))
-        .route("/flush_internal", post(handle_flush_internal))
-        .route("/panic", post(handle_panic))
-        .route("/metrics", get(handle_metrics))
-        .with_state(state.clone())
-        .layer(middleware::from_fn_with_state(state, common_log));
-
     let url = Url::parse(&args.node_addr)?;
     let port = url.port().unwrap_or(80);
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    println!("Cass server listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    let metrics_addr = SocketAddr::from(([0, 0, 0, 0], port + 1000));
+
+    let metrics_layer = MetricsLayer::new();
+
+    let cluster_metrics = cluster.clone();
+    let data_dir_metrics = data_dir.clone();
+    tokio::spawn(async move {
+        let make_svc = make_service_fn(move |_| {
+            let cluster = cluster_metrics.clone();
+            let data_dir = data_dir_metrics.clone();
+            async move {
+                Ok::<_, Infallible>(service_fn(move |_req: HttpRequest<HttpBody>| {
+                    let cluster = cluster.clone();
+                    let data_dir = data_dir.clone();
+                    async move {
+                        for (peer, alive) in cluster.peer_health().await {
+                            NODE_HEALTH
+                                .with_label_values(&[peer.as_str()])
+                                .set(if alive { 1.0 } else { 0.0 });
+                        }
+                        let self_addr = cluster.self_addr().to_string();
+                        let self_alive = cluster.self_healthy().await;
+                        NODE_HEALTH
+                            .with_label_values(&[self_addr.as_str()])
+                            .set(if self_alive { 1.0 } else { 0.0 });
+                        let mut sys = System::new_all();
+                        sys.refresh_memory();
+                        sys.refresh_cpu();
+                        let ram = sys.used_memory() as f64 * 1024.0;
+                        let cpu = sys.global_cpu_info().cpu_usage() as f64;
+                        RAM_USAGE.set(ram);
+                        CPU_USAGE.set(cpu);
+                        let disk = sstable_disk_usage(&data_dir) as f64;
+                        SSTABLE_DISK_USAGE.set(disk);
+
+                        let body = tl_metrics::encode_to_string().unwrap_or_default();
+                        let response = HttpResponse::builder()
+                            .header(
+                                CONTENT_TYPE,
+                                HeaderValue::from_static("text/plain; version=0.0.4"),
+                            )
+                            .body(HttpBody::from(body))
+                            .unwrap();
+                        Ok::<_, Infallible>(response)
+                    }
+                }))
+            }
+        });
+
+        if let Err(e) = HyperServer::bind(&metrics_addr).serve(make_svc).await {
+            eprintln!("metrics server error: {e}");
+        }
+    });
+
+    info!("Cass gRPC server listening on {addr}");
+    let trace_layer = TraceLayer::new_for_grpc()
+        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+        .on_request(DefaultOnRequest::new().level(Level::INFO))
+        .on_response(DefaultOnResponse::new().level(Level::INFO));
+    Server::builder()
+        .layer(metrics_layer)
+        .layer(trace_layer)
+        .add_service(CassServer::new(svc))
+        .serve(addr)
+        .await?;
     Ok(())
-}
-async fn handle_health(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let status = if state.cluster.self_healthy().await {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, Json(state.cluster.health_info()))
-}
-
-async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    for (peer, alive) in state.cluster.peer_health().await {
-        state
-            .metrics
-            .health
-            .with_label_values(&[&peer])
-            .set(if alive { 1 } else { 0 });
-    }
-    let self_addr = state.cluster.self_addr();
-    let self_alive = state.cluster.self_healthy().await;
-    state
-        .metrics
-        .health
-        .with_label_values(&[self_addr])
-        .set(if self_alive { 1 } else { 0 });
-
-    let mut sys = System::new_all();
-    sys.refresh_memory();
-    sys.refresh_cpu();
-    let ram = sys.used_memory() as f64 * 1024.0;
-    let cpu = sys.global_cpu_info().cpu_usage() as f64;
-    state.metrics.ram.set(ram);
-    state.metrics.cpu.set(cpu);
-    let disk = sstable_disk_usage(&state.data_dir) as f64;
-    state.metrics.sstable.set(disk);
-
-    let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
-    let mut buffer = Vec::new();
-    encoder.encode(&metric_families, &mut buffer).unwrap();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(axum::http::header::CONTENT_TYPE, encoder.format_type())
-        .body(String::from_utf8(buffer).unwrap())
-        .unwrap()
 }
 
 fn sstable_disk_usage(dir: &str) -> u64 {
@@ -267,58 +324,60 @@ fn sstable_disk_usage(dir: &str) -> u64 {
     visit(Path::new(dir))
 }
 
-async fn common_log(
-    State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    let version = match req.version() {
-        Version::HTTP_10 => "HTTP/1.0",
-        Version::HTTP_11 => "HTTP/1.1",
-        Version::HTTP_2 => "HTTP/2.0",
-        Version::HTTP_3 => "HTTP/3.0",
-        _ => "HTTP/?",
-    };
-    let start = Instant::now();
-    let response = next.run(req).await;
-    let status = response.status().as_u16();
-    let length = response
-        .headers()
-        .get(axum::http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("-");
-    let now = Utc::now().format("%d/%b/%Y:%H:%M:%S %z");
-    // Write the log line atomically so concurrent requests don't interleave
-    // and produce stray blank lines in aggregated logs.
-    {
-        use std::io::{self, Write};
-        let line = format!(
-            "{} - - [{}] \"{} {} {}\" {} {}\n",
-            addr.ip(),
-            now,
-            method,
-            uri.path(),
-            version,
-            status,
-            length
-        );
-        let _ = io::stdout().write_all(line.as_bytes());
+async fn repl(nodes: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    use rustyline::{Editor, history::DefaultHistory};
+    let rl = Arc::new(Mutex::new(Editor::<(), DefaultHistory>::new()?));
+    loop {
+        let rl_clone = rl.clone();
+        let line = tokio::task::spawn_blocking(move || {
+            let mut rl = rl_clone.lock().unwrap();
+            let line = rl.readline("> ");
+            if let Ok(ref l) = line {
+                let _ = rl.add_history_entry(l.as_str());
+            }
+            line
+        })
+        .await??;
+
+        let sql = line.trim();
+        if sql.is_empty() {
+            continue;
+        }
+
+        let mut last_err: Option<Status> = None;
+        for node in &nodes {
+            match CassClient::connect(node.clone()).await {
+                Ok(mut client) => match client
+                    .query(QueryRequest {
+                        sql: sql.to_string(),
+                    })
+                    .await
+                {
+                    Ok(resp) => {
+                        let resp = resp.into_inner();
+                        match resp.payload {
+                            Some(query_response::Payload::Rows(rs)) => print_rows(&rs.rows),
+                            Some(query_response::Payload::Mutation(m)) => {
+                                println!("{} {} {}", m.op, m.count, m.unit);
+                            }
+                            Some(query_response::Payload::Tables(t)) => {
+                                for tbl in &t.tables {
+                                    println!("{}", tbl);
+                                }
+                                println!("({} tables)", t.tables.len());
+                            }
+                            _ => println!(""),
+                        }
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                },
+                Err(e) => last_err = Some(Status::unknown(e.to_string())),
+            }
+        }
+        if let Some(err) = last_err {
+            eprintln!("query failed: {}", err.message());
+        }
     }
-    let status_str = status.to_string();
-    let path = uri.path().to_string();
-    let elapsed = start.elapsed().as_secs_f64();
-    state
-        .metrics
-        .req_count
-        .with_label_values(&[method.as_str(), path.as_str(), &status_str])
-        .inc();
-    state
-        .metrics
-        .req_duration
-        .with_label_values(&[method.as_str(), path.as_str(), &status_str])
-        .observe(elapsed);
-    response
 }

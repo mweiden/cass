@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{Client, StatusCode};
+use cass::rpc::{HealthRequest, QueryRequest, cass_client::CassClient};
 use serde_json::Value;
 
 #[tokio::test]
@@ -14,6 +14,7 @@ async fn health_endpoint_reports_tokens() {
     let bin = env!("CARGO_BIN_EXE_cass");
     let mut child = Command::new(bin)
         .args([
+            "server",
             "--data-dir",
             dir.path().to_str().unwrap(),
             "--node-addr",
@@ -28,28 +29,20 @@ async fn health_endpoint_reports_tokens() {
         .spawn()
         .unwrap();
 
-    let client = Client::new();
     for _ in 0..20 {
-        if client
-            .get(format!("{}/health", base))
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
-        {
+        if CassClient::connect(base.to_string()).await.is_ok() {
             break;
         }
         thread::sleep(Duration::from_millis(100));
     }
 
+    let mut client = CassClient::connect(base.to_string()).await.unwrap();
     let body = client
-        .get(format!("{}/health", base))
-        .send()
+        .health(HealthRequest {})
         .await
         .unwrap()
-        .text()
-        .await
-        .unwrap();
+        .into_inner()
+        .info;
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(v["node"], base);
     assert_eq!(v["tokens"].as_array().unwrap().len(), 4);
@@ -67,6 +60,7 @@ async fn errors_when_not_enough_healthy_replicas() {
 
     let mut child1 = Command::new(bin)
         .args([
+            "server",
             "--data-dir",
             dir1.path().to_str().unwrap(),
             "--node-addr",
@@ -82,6 +76,7 @@ async fn errors_when_not_enough_healthy_replicas() {
         .unwrap();
     let mut child2 = Command::new(bin)
         .args([
+            "server",
             "--data-dir",
             dir2.path().to_str().unwrap(),
             "--node-addr",
@@ -96,46 +91,36 @@ async fn errors_when_not_enough_healthy_replicas() {
         .spawn()
         .unwrap();
 
-    let client = Client::new();
     for _ in 0..20 {
-        let ok1 = client
-            .post(format!("{}/query", base1))
-            .body("")
-            .send()
-            .await
-            .is_ok();
-        let ok2 = client
-            .post(format!("{}/query", base2))
-            .body("")
-            .send()
-            .await
-            .is_ok();
+        let ok1 = CassClient::connect(base1.to_string()).await.is_ok();
+        let ok2 = CassClient::connect(base2.to_string()).await.is_ok();
         if ok1 && ok2 {
             break;
         }
         thread::sleep(Duration::from_millis(100));
     }
 
-    client
-        .post(format!("{}/query", base1))
-        .body("CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))")
-        .send()
-        .await
-        .unwrap();
+    let mut c1 = CassClient::connect(base1.to_string()).await.unwrap();
+    c1.query(QueryRequest {
+        sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+    })
+    .await
+    .unwrap();
 
     child2.kill().unwrap();
 
-    thread::sleep(Duration::from_secs(9));
+    thread::sleep(Duration::from_secs(1));
 
-    let res = client
-        .post(format!("{}/query", base1))
-        .body("INSERT INTO kv (id, val) VALUES ('x','1')")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    let body = res.text().await.unwrap();
-    assert!(body.contains("not enough healthy replicas"));
+    let res = c1
+        .query(QueryRequest {
+            sql: "INSERT INTO kv (id, val) VALUES ('x','1')".into(),
+        })
+        .await;
+    assert!(
+        res.unwrap_err()
+            .message()
+            .contains("not enough healthy replicas")
+    );
 
     child1.kill().unwrap();
 }

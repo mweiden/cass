@@ -8,6 +8,10 @@ pub mod storage;
 pub mod wal;
 pub mod zonemap;
 
+pub mod rpc {
+    tonic::include_proto!("cass");
+}
+
 use base64::Engine;
 pub use query::SqlEngine;
 use std::sync::Arc;

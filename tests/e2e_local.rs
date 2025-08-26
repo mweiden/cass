@@ -1,8 +1,8 @@
 use cass::{
     Database, SqlEngine,
+    query::QueryOutput,
     storage::{Storage, local::LocalStorage},
 };
-use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -22,8 +22,11 @@ async fn e2e_insert_select() {
     let res = engine
         .execute(&db, "SELECT val FROM kv WHERE id='foo'")
         .await
-        .unwrap()
         .unwrap();
-    let val: Value = serde_json::from_slice(&res).unwrap();
-    assert_eq!(val, json!([{ "val": "bar" }]));
+    match res {
+        QueryOutput::Rows(rows) => {
+            assert_eq!(rows[0].get("val"), Some(&"bar".to_string()));
+        }
+        _ => panic!("unexpected"),
+    }
 }

@@ -6,6 +6,7 @@ services:
       - /tmp/cass-data1:/data
     command:
       - "cass"
+      - "server"
       - "--node-addr"
       - "http://cass1:8080"
       - "--peer"
@@ -29,6 +30,7 @@ services:
       - /tmp/cass-data2:/data
     command:
       - "cass"
+      - "server"
       - "--node-addr"
       - "http://cass2:8080"
       - "--peer"
@@ -52,6 +54,7 @@ services:
       - /tmp/cass-data3:/data
     command:
       - "cass"
+      - "server"
       - "--node-addr"
       - "http://cass3:8080"
       - "--peer"
@@ -75,6 +78,7 @@ services:
       - /tmp/cass-data4:/data
     command:
       - "cass"
+      - "server"
       - "--node-addr"
       - "http://cass4:8080"
       - "--peer"
@@ -98,6 +102,7 @@ services:
       - /tmp/cass-data5:/data
     command:
       - "cass"
+      - "server"
       - "--node-addr"
       - "http://cass5:8080"
       - "--peer"

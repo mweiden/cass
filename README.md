@@ -5,14 +5,13 @@ Toy/experimental clone of [Apache Cassandra](https://en.wikipedia.org/wiki/Apach
 
 ## Features
 
-- **HTTP API:** with basic SQL syntax
+- **gRPC API and CLI** for submitting SQL queries
 - **Data Structure:** Stores data in a [log-structured merge tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree)
 - **Storage:** Column-oriented SSTable placeholders with bloom filters and zone maps to speed up queries; persist to local or S3 AWS backends
 - **Durability / Recovery:** Sharded write-ahead logs for durability and in-memory tables for parallel ingestion
 - **Deployment:** Dockerfile and docker-compose for containerized deployment and local testing
 - **Scalability:** Horizontally scalable
 - **Gossip:** Cluster membership and liveness detection via gossip with health checks
-- **Logging:** HTTP requests logged in common log format
 
 ## Design tradeoffs
 
@@ -53,7 +52,7 @@ CREATE TABLE t (
 
 ```bash
 cargo test            # run unit tests
-cargo run             # start the HTTP query service on port 8080
+cargo run -- server  # start the gRPC server on port 8080
 ```
 
 ### Contributing
@@ -95,7 +94,7 @@ AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 
 ## Example / Docker Compose Cluster
 
-With the server running you can insert and query data over HTTP. The provided `docker-compose.yml` starts a five-node cluster using local
+With the server running you can insert and query data using gRPC. The provided `docker-compose.yml` starts a five-node cluster using local
 storage with a replication factor of three where you can try this out.
 
 Start the cluster:
@@ -103,36 +102,47 @@ Start the cluster:
 ```bash
 docker compose up
 ```
-
-Insert via one node and query from the others:
+Connect using the built-in REPL and run some queries:
 
 ```bash
-curl -X POST localhost:8080/query -d "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))"
-curl -X POST localhost:8080/query -d "INSERT INTO kv VALUES ('hello','world')"
-# => {"op":"INSERT","unit":"row","count":1}
-curl -X POST localhost:8081/query -d "SELECT val FROM kv WHERE id = 'hello'"
-# You can run the following requests to illustrate that each node proxies requests to the replicas owning the parition key
-curl -X POST localhost:8082/query -d "SELECT val FROM kv WHERE id = 'hello'"
-curl -X POST localhost:8083/query -d "SELECT val FROM kv WHERE id = 'hello'"
-curl -X POST localhost:8084/query -d "SELECT val FROM kv WHERE id = 'hello'"
+$ cass repl http://localhost:8080
+
+> CREATE TABLE orders (customer_id TEXT, order_id TEXT, order_date TEXT, PRIMARY KEY(customer_id, order_id))
+CREATE TABLE 1 table
+> INSERT INTO orders VALUES ('nike', 'abc123', '2025-08-25')
+INSERT 1 row
+> INSERT INTO orders VALUES ('nike', 'def456', '2025-08-26')
+INSERT 1 row
+> SELECT * FROM orders WHERE customer_id = 'nike'
+customer_id | order_date | order_id
+nike | 2025-08-25 | abc123
+nike | 2025-08-26 | def456
+(2 rows)
+> SELECT COUNT(1) FROM orders WHERE customer_id = 'nike'
+count
+2
+(1 rows)
+> SELECT * FROM orders WHERE customer_id = 'nike' AND order_id = 'abc123'
+customer_id | order_date | order_id
+nike | 2025-08-25 | abc123
+(1 rows)
 ```
 
-## Maintenance Endpoints
+## Maintenance Commands
 
-The server exposes a couple of helper endpoints useful during testing:
+The CLI exposes helper commands useful during testing:
 
-- `POST /flush` instructs every node in the cluster to flush its in-memory
-  memtable to an on-disk SSTable.
-- `POST /panic` forces the node receiving the request to report itself as
-  unhealthy for 60 seconds. Outside of panic mode a node is considered
-  unhealthy when its local storage has less than 5% free space remaining.
-  The `node_health` Prometheus gauge exposes the current status (`1` for
-  healthy, `0` for unhealthy).
+- `cass flush <node>` instructs the specified node to broadcast a flush to all
+  peers.
+- `cass panic <node>` forces the target node to report itself as unhealthy for
+  60 seconds.
 
 ## Monitoring
 
-Each node exposes Prometheus metrics at `/metrics`. The provided
-`docker-compose.yml` also starts Prometheus and Grafana. After running
+Each node exposes Prometheus metrics on the gRPC port plus 1000 at
+`/metrics` (for example, if the server listens on `8080`, metrics are
+available on `9080`). The provided `docker-compose.yml` also starts
+Prometheus and Grafana. After running
 
 ```bash
 docker compose up
@@ -140,11 +150,9 @@ docker compose up
 
 visit <http://localhost:3000> and sign in with the default
 `admin`/`admin` credentials. The Grafana instance is preconfigured with the
-Prometheus data source so you can explore metrics such as HTTP request
+Prometheus data source so you can explore metrics such as gRPC request
 counts, peer health, RAM and CPU usage, and SSTable disk usage.
 
 There is also a preconfigured dashboard with basic metrics from all instances. Screenshot below:
 
 <img width="1257" height="821" alt="Screenshot 2025-08-17 at 11 48 28 PM" src="https://github.com/user-attachments/assets/cbaf71aa-c726-4c6a-a1eb-422060aecd0a" />
-
-

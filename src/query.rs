@@ -1,6 +1,5 @@
 //! Minimal SQL execution engine for the key-value store.
 
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::convert::TryInto;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +16,24 @@ use crate::{
     Database,
     schema::{TableSchema, decode_row, encode_row},
 };
+
+/// Structured results produced by the SQL engine.
+pub enum QueryOutput {
+    /// Mutation summary with operation, unit, and affected count.
+    Mutation {
+        op: String,
+        unit: String,
+        count: usize,
+    },
+    /// Row set for queries like SELECT.
+    Rows(Vec<BTreeMap<String, String>>),
+    /// Internal representation of rows with key and timestamp for replication.
+    Meta(Vec<(String, u64, String)>),
+    /// List of table names for SHOW TABLES.
+    Tables(Vec<String>),
+    /// No result to return.
+    None,
+}
 
 fn split_ts(bytes: &[u8]) -> (u64, &[u8]) {
     if bytes.len() < 8 {
@@ -59,7 +76,7 @@ impl SqlEngine {
     }
 
     /// Execute `sql` against the provided [`Database`].
-    pub async fn execute(&self, db: &Database, sql: &str) -> Result<Option<Vec<u8>>, QueryError> {
+    pub async fn execute(&self, db: &Database, sql: &str) -> Result<QueryOutput, QueryError> {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_else(|_| std::time::Duration::from_secs(0))
@@ -75,9 +92,9 @@ impl SqlEngine {
         sql: &str,
         ts: u64,
         meta: bool,
-    ) -> Result<Option<Vec<u8>>, QueryError> {
+    ) -> Result<QueryOutput, QueryError> {
         let stmts = self.parse(sql)?;
-        let mut result = None;
+        let mut result = QueryOutput::None;
         for stmt in stmts {
             result = self.execute_stmt(db, stmt, ts, meta).await?;
         }
@@ -91,14 +108,15 @@ impl SqlEngine {
         stmt: Statement,
         ts: u64,
         meta: bool,
-    ) -> Result<Option<Vec<u8>>, QueryError> {
+    ) -> Result<QueryOutput, QueryError> {
         match stmt {
             Statement::Insert(insert) => {
                 let count = self.exec_insert(db, insert, ts).await?;
-                let out = json!({"op":"INSERT","unit":"row","count":count});
-                let bytes =
-                    serde_json::to_vec(&out).map_err(|e| QueryError::Other(e.to_string()))?;
-                Ok(Some(bytes))
+                Ok(QueryOutput::Mutation {
+                    op: "INSERT".to_string(),
+                    unit: "row".to_string(),
+                    count,
+                })
             }
             Statement::Update {
                 table,
@@ -109,17 +127,19 @@ impl SqlEngine {
                 let count = self
                     .exec_update(db, table, assignments, selection, ts)
                     .await?;
-                let out = json!({"op":"UPDATE","unit":"row","count":count});
-                let bytes =
-                    serde_json::to_vec(&out).map_err(|e| QueryError::Other(e.to_string()))?;
-                Ok(Some(bytes))
+                Ok(QueryOutput::Mutation {
+                    op: "UPDATE".to_string(),
+                    unit: "row".to_string(),
+                    count,
+                })
             }
             Statement::Delete(delete) => {
                 let count = self.exec_delete(db, delete, ts).await?;
-                let out = json!({"op":"DELETE","unit":"row","count":count});
-                let bytes =
-                    serde_json::to_vec(&out).map_err(|e| QueryError::Other(e.to_string()))?;
-                Ok(Some(bytes))
+                Ok(QueryOutput::Mutation {
+                    op: "DELETE".to_string(),
+                    unit: "row".to_string(),
+                    count,
+                })
             }
             Statement::CreateTable(ct) => {
                 let ns = object_name_to_ns(&ct.name).ok_or(QueryError::Unsupported)?;
@@ -129,10 +149,11 @@ impl SqlEngine {
                 let schema = schema_from_create(&ct).ok_or(QueryError::Unsupported)?;
                 save_schema(db, &ns, &schema).await;
                 register_table(db, &ns).await;
-                let out = json!({"op":"CREATE TABLE","unit":"table","count":1});
-                let bytes =
-                    serde_json::to_vec(&out).map_err(|e| QueryError::Other(e.to_string()))?;
-                Ok(Some(bytes))
+                Ok(QueryOutput::Mutation {
+                    op: "CREATE TABLE".to_string(),
+                    unit: "table".to_string(),
+                    count: 1,
+                })
             }
             Statement::ShowTables { .. } => self.exec_show_tables(db).await,
             Statement::Drop {
@@ -145,10 +166,11 @@ impl SqlEngine {
                     db.clear_ns(&ns).await;
                     db.delete_ns("_tables", &ns).await;
                     db.delete_ns("_schemas", &ns).await;
-                    let out = json!({"op":"DROP TABLE","unit":"table","count":1});
-                    let bytes =
-                        serde_json::to_vec(&out).map_err(|e| QueryError::Other(e.to_string()))?;
-                    Ok(Some(bytes))
+                    Ok(QueryOutput::Mutation {
+                        op: "DROP TABLE".to_string(),
+                        unit: "table".to_string(),
+                        count: 1,
+                    })
                 } else {
                     Err(QueryError::Unsupported)
                 }
@@ -266,7 +288,7 @@ impl SqlEngine {
         db: &Database,
         q: Box<Query>,
         meta: bool,
-    ) -> Result<Option<Vec<u8>>, QueryError> {
+    ) -> Result<QueryOutput, QueryError> {
         match *q.body {
             SetExpr::Select(select) => {
                 self.exec_select(db, *select, q.order_by, q.limit_clause, meta)
@@ -284,7 +306,7 @@ impl SqlEngine {
         _order: Option<OrderBy>,
         _limit: Option<LimitClause>,
         meta: bool,
-    ) -> Result<Option<Vec<u8>>, QueryError> {
+    ) -> Result<QueryOutput, QueryError> {
         if select.from.len() != 1 {
             return Err(QueryError::Unsupported);
         }
@@ -294,7 +316,7 @@ impl SqlEngine {
         // handle COUNT(*) with optional WHERE filtering
         if select.projection.len() == 1 {
             if let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0] {
-                if func.name.to_string().to_lowercase() == "count" {
+                if func.name.to_string().eq_ignore_ascii_case("count") {
                     let selection = select.selection.clone();
                     return self.exec_count(db, &ns, &schema, selection).await;
                 }
@@ -312,7 +334,7 @@ impl SqlEngine {
         ns: &str,
         schema: &TableSchema,
         selection: Option<Expr>,
-    ) -> Result<Option<Vec<u8>>, QueryError> {
+    ) -> Result<QueryOutput, QueryError> {
         let cond_map = if let Some(expr) = selection {
             where_to_map(&expr)
         } else {
@@ -356,9 +378,9 @@ impl SqlEngine {
                 }
             }
         }
-        let out = json!([{ "count": count }]);
-        let bytes = serde_json::to_vec(&out).map_err(|e| QueryError::Other(e.to_string()))?;
-        Ok(Some(bytes))
+        let mut row = BTreeMap::new();
+        row.insert("count".to_string(), count.to_string());
+        Ok(QueryOutput::Rows(vec![row]))
     }
 
     /// Simplified `SELECT` handler for schema-aware tables.
@@ -369,7 +391,7 @@ impl SqlEngine {
         schema: &TableSchema,
         select: Select,
         meta: bool,
-    ) -> Result<Option<Vec<u8>>, QueryError> {
+    ) -> Result<QueryOutput, QueryError> {
         let Select {
             projection,
             selection,
@@ -383,56 +405,95 @@ impl SqlEngine {
             BTreeMap::new()
         };
         let key_cols = schema.key_columns();
-        let keys = build_keys(&key_cols, &cond_multi);
-        if keys.is_empty() {
+        let mut prefix_len = 0;
+        for col in &key_cols {
+            if cond_multi.contains_key(col) {
+                prefix_len += 1;
+            } else {
+                break;
+            }
+        }
+        if prefix_len == 0 {
             return Err(QueryError::Unsupported);
         }
 
-        let mut out_rows = Vec::new();
-        let mut meta_lines = Vec::new();
-        for key in keys {
-            if let Some(row_bytes) = db.get_ns(ns, &key).await {
-                let (ts, data) = split_ts(&row_bytes);
-                if data.is_empty() {
-                    if meta {
-                        meta_lines.push(format!("{key}\t{ts}\t"));
+        let mut out_rows: Vec<BTreeMap<String, String>> = Vec::new();
+        let mut meta_rows: Vec<(String, u64, String)> = Vec::new();
+
+        if prefix_len == key_cols.len() {
+            let keys = build_keys(&key_cols, &cond_multi);
+            for key in keys {
+                if let Some(row_bytes) = db.get_ns(ns, &key).await {
+                    let (ts, data) = split_ts(&row_bytes);
+                    if data.is_empty() {
+                        if meta {
+                            meta_rows.push((key.clone(), ts, String::new()));
+                        }
+                        continue;
                     }
-                    continue;
+                    let mut row_map = decode_row(data);
+                    for (col, part) in key_cols.iter().zip(key.split('|')) {
+                        row_map.insert(col.clone(), part.to_string());
+                    }
+                    let sel_map = project_row(&row_map, &cols, wildcard);
+                    if meta {
+                        let val = String::from_utf8_lossy(&encode_row(&sel_map)).into_owned();
+                        meta_rows.push((key.clone(), ts, val));
+                    } else {
+                        out_rows.push(sel_map);
+                    }
                 }
-                let mut row_map = decode_row(data);
-                for (col, part) in key_cols.iter().zip(key.split('|')) {
-                    row_map.insert(col.clone(), part.to_string());
-                }
-                let sel_map = project_row(&row_map, &cols, wildcard);
-                if meta {
-                    let val = String::from_utf8_lossy(&encode_row(&sel_map)).into_owned();
-                    meta_lines.push(format!("{key}\t{ts}\t{val}"));
-                } else {
-                    out_rows.push(serde_json::Value::Object(
-                        sel_map
-                            .into_iter()
-                            .map(|(k, v)| (k, serde_json::Value::String(v)))
-                            .collect(),
-                    ));
+            }
+        } else {
+            let prefix_cols = &key_cols[..prefix_len];
+            let prefixes = build_keys(prefix_cols, &cond_multi);
+            let rows = db.scan_ns(ns).await;
+            for (k, bytes) in rows {
+                for prefix in &prefixes {
+                    if k == *prefix || k.starts_with(&format!("{}|", prefix)) {
+                        let (ts, data) = split_ts(&bytes);
+                        if data.is_empty() {
+                            if meta {
+                                meta_rows.push((k.clone(), ts, String::new()));
+                            }
+                            break;
+                        }
+                        let mut row_map = decode_row(data);
+                        for (col, part) in key_cols.iter().zip(k.split('|')) {
+                            row_map.insert(col.clone(), part.to_string());
+                        }
+                        if cond_multi
+                            .iter()
+                            .all(|(c, v)| row_map.get(c).map_or(false, |val| v.contains(val)))
+                        {
+                            let sel_map = project_row(&row_map, &cols, wildcard);
+                            if meta {
+                                let val =
+                                    String::from_utf8_lossy(&encode_row(&sel_map)).into_owned();
+                                meta_rows.push((k.clone(), ts, val));
+                            } else {
+                                out_rows.push(sel_map);
+                            }
+                        }
+                        break;
+                    }
                 }
             }
         }
 
         if meta {
-            if meta_lines.is_empty() {
-                Ok(None)
+            if meta_rows.is_empty() {
+                Ok(QueryOutput::None)
             } else {
-                Ok(Some(meta_lines.join("\n").into_bytes()))
+                Ok(QueryOutput::Meta(meta_rows))
             }
         } else {
-            let bytes =
-                serde_json::to_vec(&out_rows).map_err(|e| QueryError::Other(e.to_string()))?;
-            Ok(Some(bytes))
+            Ok(QueryOutput::Rows(out_rows))
         }
     }
 
-    /// Return a JSON list of registered table names.
-    async fn exec_show_tables(&self, db: &Database) -> Result<Option<Vec<u8>>, QueryError> {
+    /// Return a list of registered table names.
+    async fn exec_show_tables(&self, db: &Database) -> Result<QueryOutput, QueryError> {
         let mut tables: Vec<String> = db
             .scan_ns("_tables")
             .await
@@ -440,8 +501,7 @@ impl SqlEngine {
             .map(|(k, _)| k)
             .collect();
         tables.sort();
-        let bytes = serde_json::to_vec(&tables).map_err(|e| QueryError::Other(e.to_string()))?;
-        Ok(Some(bytes))
+        Ok(QueryOutput::Tables(tables))
     }
 
     /// Extract partition key values from `sql` for routing and replication.
@@ -452,9 +512,11 @@ impl SqlEngine {
     ) -> Result<Vec<String>, QueryError> {
         let stmts = self.parse(sql)?;
         let mut keys = Vec::new();
+        let mut needs_key = false;
         for stmt in stmts {
             match stmt {
                 Statement::Insert(insert) => {
+                    needs_key = true;
                     let ns = match &insert.table {
                         sqlparser::ast::TableObject::TableName(name) => {
                             object_name_to_ns(name).ok_or(QueryError::Unsupported)?
@@ -485,6 +547,7 @@ impl SqlEngine {
                 Statement::Update {
                     table, selection, ..
                 } => {
+                    needs_key = true;
                     let ns = table_factor_to_ns(&table.relation).ok_or(QueryError::Unsupported)?;
                     let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
                     if let Some(expr) = selection {
@@ -493,6 +556,7 @@ impl SqlEngine {
                     }
                 }
                 Statement::Delete(delete) => {
+                    needs_key = true;
                     let table = match &delete.from {
                         FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
                     };
@@ -508,6 +572,7 @@ impl SqlEngine {
                     }
                 }
                 Statement::Query(q) => {
+                    needs_key = true;
                     if let SetExpr::Select(select) = *q.body {
                         if select.from.len() != 1 {
                             return Err(QueryError::Unsupported);
@@ -523,6 +588,11 @@ impl SqlEngine {
                 }
                 _ => {}
             }
+        }
+        if needs_key && keys.is_empty() {
+            return Err(QueryError::Other(
+                "partition key must be fully specified".into(),
+            ));
         }
         Ok(keys)
     }

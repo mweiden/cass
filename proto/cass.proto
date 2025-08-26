@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+package cass;
+
+service Cass {
+  rpc Query (QueryRequest) returns (QueryResponse);
+  rpc Internal (QueryRequest) returns (QueryResponse);
+  rpc Flush (FlushRequest) returns (FlushResponse);
+  rpc FlushInternal (FlushRequest) returns (FlushResponse);
+  rpc Panic (PanicRequest) returns (PanicResponse);
+  rpc Health (HealthRequest) returns (HealthResponse);
+}
+
+message QueryRequest {
+  string sql = 1;
+}
+
+message QueryResponse {
+  oneof payload {
+    ResultSet rows = 1;
+    MutationResult mutation = 2;
+    ShowTablesResult tables = 3;
+    MetaResult meta = 4;
+  }
+}
+
+message ResultSet {
+  repeated Row rows = 1;
+}
+
+message Row {
+  map<string, string> columns = 1;
+}
+
+message MutationResult {
+  string op = 1;
+  string unit = 2;
+  uint64 count = 3;
+}
+
+message ShowTablesResult {
+  repeated string tables = 1;
+}
+
+message MetaResult {
+  repeated MetaRow rows = 1;
+}
+
+message MetaRow {
+  string key = 1;
+  uint64 ts = 2;
+  string value = 3;
+}
+
+message FlushRequest {}
+message FlushResponse {}
+
+message PanicRequest {}
+message PanicResponse { bool healthy = 1; }
+
+message HealthRequest {}
+message HealthResponse { string info = 1; }

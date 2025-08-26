@@ -45,7 +45,6 @@ impl Storage for Arc<dyn Storage> {
         (**self).local_path()
     }
 
-
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
         (**self).list(prefix).await
     }

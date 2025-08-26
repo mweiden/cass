@@ -11,19 +11,29 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync", 
 thiserror = "1"
 base64 = "0.21"
 rust-s3 = { version = "0.36.0-beta.2", default-features = false, features = ["tokio-rustls-tls"] }
-axum = "0.7"
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 murmur3 = "0.5"
 futures = "0.3"
-chrono = "0.4"
-prometheus = "0.13"
+prost = "0.13"
+tonic = { version = "0.12", features = ["transport"] }
+url = "2"
 sysinfo = "0.30"
-prost = "0.12"
+hyper = { version = "0.14", features = ["full"] }
+tonic_prometheus_layer = "0.1"
+prometheus = "0.13"
+once_cell = "1"
+rustyline = "12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower-http = { version = "0.6", features = ["trace"] }
 
 [dev-dependencies]
 tempfile = "3"
 s3s = "0.12.0-minio-preview.3"
 s3s-fs = "0.12.0-minio-preview.3"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
