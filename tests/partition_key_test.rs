@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use cass::rpc::{QueryRequest, cass_client::CassClient};
+use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
 
 #[tokio::test]
 async fn select_requires_partition_key() {
@@ -60,6 +60,33 @@ async fn select_requires_partition_key() {
         })
         .await;
     assert!(res.unwrap_err().message().contains("partition key"));
+
+    let rows = client
+        .query(QueryRequest {
+            sql: "SELECT * FROM orders WHERE customer_id = 'nike'".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    if let Some(query_response::Payload::Rows(rs)) = rows.payload {
+        assert_eq!(rs.rows.len(), 2);
+    } else {
+        panic!("unexpected response");
+    }
+
+    let cnt = client
+        .query(QueryRequest {
+            sql: "SELECT COUNT(*) FROM orders WHERE customer_id = 'nike'".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    if let Some(query_response::Payload::Rows(rs)) = cnt.payload {
+        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows[0].columns.get("count"), Some(&"2".to_string()));
+    } else {
+        panic!("unexpected count response");
+    }
 
     child.kill().unwrap();
 }

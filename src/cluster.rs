@@ -20,7 +20,7 @@ use crate::{
     storage::StorageError,
 };
 use serde_json::{Value, json};
-use sqlparser::ast::{ObjectType, Statement};
+use sqlparser::ast::{Expr, ObjectType, SelectItem, SetExpr, Statement};
 use sysinfo::Disks;
 use tokio::{sync::RwLock, time::sleep};
 
@@ -333,10 +333,22 @@ impl Cluster {
         // broadcast to every node and whether it is a write.
         let mut broadcast = false;
         let mut is_write = false;
+        let mut is_count = false;
         let mut first_stmt: Option<Statement> = None;
         if let Ok(stmts) = engine.parse(sql) {
             if let Some(st) = stmts.first() {
                 first_stmt = Some(st.clone());
+            }
+            if let Some(Statement::Query(q)) = first_stmt.as_ref() {
+                if let SetExpr::Select(s) = &*q.body {
+                    if s.projection.len() == 1 {
+                        if let SelectItem::UnnamedExpr(Expr::Function(func)) = &s.projection[0] {
+                            if func.name.to_string().eq_ignore_ascii_case("count") {
+                                is_count = true;
+                            }
+                        }
+                    }
+                }
             }
             broadcast = stmts.iter().all(|s| {
                 matches!(
@@ -409,6 +421,7 @@ impl Cluster {
         let mut arr_rows: Vec<BTreeMap<String, String>> = Vec::new();
         let mut last_err: Option<QueryError> = None;
         let mut row_count: u64 = 0;
+        let mut count_val: Option<u64> = None;
 
         let sql_string = sql.to_string();
         let tasks: Vec<_> = healthy
@@ -460,7 +473,17 @@ impl Cluster {
                         table_set.insert(t);
                     }
                 }
-                Ok(QueryOutput::Rows(r)) => arr_rows.extend(r),
+                Ok(QueryOutput::Rows(r)) => {
+                    if is_count {
+                        if count_val.is_none() {
+                            if let Some(c) = r.get(0).and_then(|m| m.get("count")) {
+                                count_val = c.parse::<u64>().ok();
+                            }
+                        }
+                    } else {
+                        arr_rows.extend(r);
+                    }
+                }
                 Ok(QueryOutput::None) => {}
                 Err(e) => last_err = Some(e),
             }
@@ -494,6 +517,11 @@ impl Cluster {
         } else if let Some(Statement::ShowTables { .. }) = first_stmt {
             let tables: Vec<String> = table_set.into_iter().collect();
             Ok(output_to_proto(QueryOutput::Tables(tables)))
+        } else if is_count {
+            let total = count_val.unwrap_or(0);
+            let mut row = BTreeMap::new();
+            row.insert("count".to_string(), total.to_string());
+            Ok(output_to_proto(QueryOutput::Rows(vec![row])))
         } else if !rows.is_empty() || !arr_rows.is_empty() {
             for (_k, (_ts, val)) in rows {
                 if !val.is_empty() {

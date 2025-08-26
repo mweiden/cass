@@ -125,6 +125,21 @@ async fn union_and_lww_across_replicas() {
         _ => panic!("unexpected"),
     }
 
+    let cnt = c1
+        .query(QueryRequest {
+            sql: "SELECT COUNT(*) FROM kv WHERE id = 'a'".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    match cnt.payload {
+        Some(query_response::Payload::Rows(rs)) => {
+            assert_eq!(rs.rows.len(), 1);
+            assert_eq!(rs.rows[0].columns.get("count"), Some(&"2".to_string()));
+        }
+        _ => panic!("unexpected count"),
+    }
+
     let ack = c1
         .query(QueryRequest {
             sql: "INSERT INTO kv (id, val) VALUES ('x','1'),('y','2')".into(),

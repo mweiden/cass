@@ -316,7 +316,7 @@ impl SqlEngine {
         // handle COUNT(*) with optional WHERE filtering
         if select.projection.len() == 1 {
             if let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0] {
-                if func.name.to_string().to_lowercase() == "count" {
+                if func.name.to_string().eq_ignore_ascii_case("count") {
                     let selection = select.selection.clone();
                     return self.exec_count(db, &ns, &schema, selection).await;
                 }
@@ -405,32 +405,78 @@ impl SqlEngine {
             BTreeMap::new()
         };
         let key_cols = schema.key_columns();
-        let keys = build_keys(&key_cols, &cond_multi);
-        if keys.is_empty() {
+        let mut prefix_len = 0;
+        for col in &key_cols {
+            if cond_multi.contains_key(col) {
+                prefix_len += 1;
+            } else {
+                break;
+            }
+        }
+        if prefix_len == 0 {
             return Err(QueryError::Unsupported);
         }
 
         let mut out_rows: Vec<BTreeMap<String, String>> = Vec::new();
         let mut meta_rows: Vec<(String, u64, String)> = Vec::new();
-        for key in keys {
-            if let Some(row_bytes) = db.get_ns(ns, &key).await {
-                let (ts, data) = split_ts(&row_bytes);
-                if data.is_empty() {
-                    if meta {
-                        meta_rows.push((key.clone(), ts, String::new()));
+
+        if prefix_len == key_cols.len() {
+            let keys = build_keys(&key_cols, &cond_multi);
+            for key in keys {
+                if let Some(row_bytes) = db.get_ns(ns, &key).await {
+                    let (ts, data) = split_ts(&row_bytes);
+                    if data.is_empty() {
+                        if meta {
+                            meta_rows.push((key.clone(), ts, String::new()));
+                        }
+                        continue;
                     }
-                    continue;
+                    let mut row_map = decode_row(data);
+                    for (col, part) in key_cols.iter().zip(key.split('|')) {
+                        row_map.insert(col.clone(), part.to_string());
+                    }
+                    let sel_map = project_row(&row_map, &cols, wildcard);
+                    if meta {
+                        let val = String::from_utf8_lossy(&encode_row(&sel_map)).into_owned();
+                        meta_rows.push((key.clone(), ts, val));
+                    } else {
+                        out_rows.push(sel_map);
+                    }
                 }
-                let mut row_map = decode_row(data);
-                for (col, part) in key_cols.iter().zip(key.split('|')) {
-                    row_map.insert(col.clone(), part.to_string());
-                }
-                let sel_map = project_row(&row_map, &cols, wildcard);
-                if meta {
-                    let val = String::from_utf8_lossy(&encode_row(&sel_map)).into_owned();
-                    meta_rows.push((key.clone(), ts, val));
-                } else {
-                    out_rows.push(sel_map);
+            }
+        } else {
+            let prefix_cols = &key_cols[..prefix_len];
+            let prefixes = build_keys(prefix_cols, &cond_multi);
+            let rows = db.scan_ns(ns).await;
+            for (k, bytes) in rows {
+                for prefix in &prefixes {
+                    if k == *prefix || k.starts_with(&format!("{}|", prefix)) {
+                        let (ts, data) = split_ts(&bytes);
+                        if data.is_empty() {
+                            if meta {
+                                meta_rows.push((k.clone(), ts, String::new()));
+                            }
+                            break;
+                        }
+                        let mut row_map = decode_row(data);
+                        for (col, part) in key_cols.iter().zip(k.split('|')) {
+                            row_map.insert(col.clone(), part.to_string());
+                        }
+                        if cond_multi
+                            .iter()
+                            .all(|(c, v)| row_map.get(c).map_or(false, |val| v.contains(val)))
+                        {
+                            let sel_map = project_row(&row_map, &cols, wildcard);
+                            if meta {
+                                let val =
+                                    String::from_utf8_lossy(&encode_row(&sel_map)).into_owned();
+                                meta_rows.push((k.clone(), ts, val));
+                            } else {
+                                out_rows.push(sel_map);
+                            }
+                        }
+                        break;
+                    }
                 }
             }
         }
