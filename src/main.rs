@@ -58,13 +58,33 @@ fn print_rows(rows: &[RpcRow]) {
         .collect();
     cols.sort();
     cols.dedup();
-    println!("{}", cols.join(" | "));
-    for row in rows {
-        let mut vals: Vec<String> = Vec::new();
-        for c in &cols {
-            vals.push(row.columns.get(c).cloned().unwrap_or_default());
+
+    let index_width = rows.len().to_string().len();
+    let col_widths: Vec<usize> = cols
+        .iter()
+        .map(|c| {
+            let max_val = rows
+                .iter()
+                .map(|r| r.columns.get(c).map(|v| v.len()).unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            std::cmp::max(c.len(), max_val)
+        })
+        .collect();
+
+    let mut header = format!("{:>width$}", "", width = index_width);
+    for (c, w) in cols.iter().zip(col_widths.iter()) {
+        header.push_str(&format!(" {:<width$}", c, width = w));
+    }
+    println!("{}", header);
+
+    for (i, row) in rows.iter().enumerate() {
+        let mut line = format!("{:>width$}", i, width = index_width);
+        for (c, w) in cols.iter().zip(col_widths.iter()) {
+            let val = row.columns.get(c).cloned().unwrap_or_default();
+            line.push_str(&format!(" {:<width$}", val, width = w));
         }
-        println!("{}", vals.join(" | "));
+        println!("{}", line);
     }
     println!("({} rows)", rows.len());
 }

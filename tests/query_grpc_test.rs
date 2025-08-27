@@ -6,19 +6,18 @@ use common::CassProcess;
 
 #[tokio::test]
 async fn grpc_query_roundtrip() {
-    let _ = std::fs::remove_dir_all("/tmp/cass-data");
+    let tmp_dir = tempfile::tempdir().unwrap();
 
     let _child = CassProcess::spawn(["server"]);
 
-    let base = "http://127.0.0.1:8080".to_string();
     for _ in 0..10 {
-        if CassClient::connect(base.clone()).await.is_ok() {
+        if CassClient::connect(base).await.is_ok() {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
 
-    let mut client = CassClient::connect(base.clone()).await.unwrap();
+    let mut client = CassClient::connect(base).await.unwrap();
     client
         .query(QueryRequest {
             sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),

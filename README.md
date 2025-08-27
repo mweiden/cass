@@ -114,17 +114,17 @@ INSERT 1 row
 > INSERT INTO orders VALUES ('nike', 'def456', '2025-08-26')
 INSERT 1 row
 > SELECT * FROM orders WHERE customer_id = 'nike'
-customer_id | order_date | order_id
-nike | 2025-08-25 | abc123
-nike | 2025-08-26 | def456
+  customer_id order_date  order_id
+0 nike        2025-08-25  abc123
+1 nike        2025-08-26  def456
 (2 rows)
 > SELECT COUNT(1) FROM orders WHERE customer_id = 'nike'
-count
-2
+ count
+0 2
 (1 rows)
 > SELECT * FROM orders WHERE customer_id = 'nike' AND order_id = 'abc123'
-customer_id | order_date | order_id
-nike | 2025-08-25 | abc123
+  customer_id order_date  order_id
+0 nike        2025-08-25  abc123
 (1 rows)
 ```
 
