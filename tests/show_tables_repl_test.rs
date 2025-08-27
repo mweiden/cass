@@ -1,19 +1,13 @@
 use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
-use std::{
-    process::{Command, Stdio},
-    thread,
-    time::Duration,
-};
+use std::{thread, time::Duration};
+
+mod common;
+use common::CassProcess;
 
 #[tokio::test]
 async fn show_tables_via_grpc() {
     let _ = std::fs::remove_dir_all("/tmp/cass-data");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cass"))
-        .arg("server")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn server");
+    let _child = CassProcess::spawn(["server"]);
 
     let base = "http://127.0.0.1:8080".to_string();
     for _ in 0..10 {
@@ -44,6 +38,4 @@ async fn show_tables_via_grpc() {
         }
         _ => panic!("unexpected"),
     }
-
-    child.kill().unwrap();
 }

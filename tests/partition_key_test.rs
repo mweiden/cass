@@ -1,30 +1,23 @@
-use std::{
-    process::{Command, Stdio},
-    thread,
-    time::Duration,
-};
+use std::{thread, time::Duration};
 
 use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
+
+mod common;
+use common::CassProcess;
 
 #[tokio::test]
 async fn select_requires_partition_key() {
     let base = "http://127.0.0.1:18105";
     let dir = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_cass");
-    let mut child = Command::new(bin)
-        .args([
-            "server",
-            "--data-dir",
-            dir.path().to_str().unwrap(),
-            "--node-addr",
-            base,
-            "--rf",
-            "1",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let _child = CassProcess::spawn([
+        "server",
+        "--data-dir",
+        dir.path().to_str().unwrap(),
+        "--node-addr",
+        base,
+        "--rf",
+        "1",
+    ]);
 
     for _ in 0..20 {
         if CassClient::connect(base.to_string()).await.is_ok() {
@@ -87,6 +80,4 @@ async fn select_requires_partition_key() {
     } else {
         panic!("unexpected count response");
     }
-
-    child.kill().unwrap();
 }
