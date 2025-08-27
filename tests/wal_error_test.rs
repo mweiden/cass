@@ -19,6 +19,10 @@ impl Storage for BadStorage {
         Ok(b"bad\t@@\n".to_vec())
     }
 
+    async fn append(&self, _path: &str, _data: &[u8]) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     async fn list(&self, _prefix: &str) -> Result<Vec<String>, StorageError> {
         Ok(Vec::new())
     }

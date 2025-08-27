@@ -1,6 +1,7 @@
 use super::{Storage, StorageError};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncWriteExt;
 
 pub struct LocalStorage {
     root: PathBuf,
@@ -26,6 +27,20 @@ impl Storage for LocalStorage {
     async fn get(&self, path: &str) -> Result<Vec<u8>, StorageError> {
         let p = self.root.join(path);
         Ok(tokio::fs::read(p).await?)
+    }
+
+    async fn append(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {
+        let p = self.root.join(path);
+        if let Some(parent) = p.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .await?;
+        file.write_all(data).await?;
+        Ok(())
     }
 
     fn local_path(&self) -> Option<&Path> {

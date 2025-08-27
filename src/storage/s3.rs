@@ -53,6 +53,13 @@ impl Storage for S3Storage {
         Ok(resp.bytes().to_vec())
     }
 
+    async fn append(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {
+        // S3 does not support appends; fall back to read-modify-write.
+        let mut existing = self.get(path).await.unwrap_or_default();
+        existing.extend_from_slice(data);
+        self.put(path, existing).await
+    }
+
     async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
         let results = self
             .bucket

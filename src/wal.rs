@@ -63,10 +63,11 @@ impl Wal {
     /// backend.
     pub async fn append(&self, data: &[u8]) -> std::io::Result<()> {
         let mut buf = self.buf.lock().await;
+        let start = buf.len();
         buf.extend_from_slice(data);
         buf.push(b'\n');
         self.storage
-            .put(&self.path, buf.clone())
+            .append(&self.path, &buf[start..])
             .await
             .map_err(map_err)?;
         Ok(())
