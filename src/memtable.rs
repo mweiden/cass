@@ -52,17 +52,9 @@ impl MemTable {
 
     /// Delete every key that begins with `prefix`.
     pub async fn delete_prefix(&self, prefix: &str) {
-        let mut data = self.data.write().await;
-        // Collect matching keys first to avoid holding references while
-        // mutating the map.
-        let keys: Vec<String> = data
-            .keys()
-            .filter(|k| k.starts_with(prefix))
-            .cloned()
-            .collect();
-        // Remove each key individually.
-        for k in keys {
-            data.remove(&k);
-        }
+        self.data
+            .write()
+            .await
+            .retain(|k, _| !k.starts_with(prefix));
     }
 }
