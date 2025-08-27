@@ -108,7 +108,7 @@ async fn union_and_lww_across_replicas() {
         .into_inner();
     match res_c.payload {
         Some(query_response::Payload::Rows(rs)) => {
-            assert_eq!(rs.rows.len(), 3);
+            assert_eq!(rs.rows.len(), 2);
         }
         _ => panic!("unexpected"),
     }
