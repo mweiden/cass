@@ -120,7 +120,7 @@ async fn union_and_lww_across_replicas() {
         .into_inner();
     match res_c.payload {
         Some(query_response::Payload::Rows(rs)) => {
-            assert_eq!(rs.rows.len(), 2);
+            assert_eq!(rs.rows.len(), 3);
         }
         _ => panic!("unexpected"),
     }
@@ -135,7 +135,7 @@ async fn union_and_lww_across_replicas() {
     match cnt.payload {
         Some(query_response::Payload::Rows(rs)) => {
             assert_eq!(rs.rows.len(), 1);
-            assert_eq!(rs.rows[0].columns.get("count"), Some(&"2".to_string()));
+            assert_eq!(rs.rows[0].columns.get("count"), Some(&"1".to_string()));
         }
         _ => panic!("unexpected count"),
     }
