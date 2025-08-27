@@ -179,14 +179,45 @@ impl Database {
     }
 
     /// Scan all key/value pairs for a namespace, stripping the prefix.
+    ///
+    /// Results from the in-memory memtable and any on-disk [`SsTable`]s are
+    /// merged together with later values (memtable/newer SSTables) overriding
+    /// earlier ones. Returned entries are deduplicated and ordered by key.
     pub async fn scan_ns(&self, ns: &str) -> Vec<(String, Vec<u8>)> {
+        use base64::Engine;
+        use std::collections::BTreeMap;
+
         let prefix = format!("{}:", ns);
-        self.memtable
-            .scan()
-            .await
-            .into_iter()
-            .filter_map(|(k, v)| k.strip_prefix(&prefix).map(|rest| (rest.to_string(), v)))
-            .collect()
+        let mut map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+
+        // load from on-disk SSTables first so newer data overwrites older
+        let tables = self.sstables.read().await;
+        for table in tables.iter() {
+            if let Ok(raw) = self.storage.get(&table.path).await {
+                for line in raw.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                    if let Some(pos) = line.iter().position(|b| *b == b'\t') {
+                        if let Ok(key) = std::str::from_utf8(&line[..pos]) {
+                            if let Some(rest) = key.strip_prefix(&prefix) {
+                                if let Ok(val) = base64::engine::general_purpose::STANDARD
+                                    .decode(&line[pos + 1..])
+                                {
+                                    map.insert(rest.to_string(), val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // finally overlay entries from the memtable
+        for (k, v) in self.memtable.scan().await.into_iter() {
+            if let Some(rest) = k.strip_prefix(&prefix) {
+                map.insert(rest.to_string(), v);
+            }
+        }
+
+        map.into_iter().collect()
     }
 
     /// Clear all data for a namespace.
