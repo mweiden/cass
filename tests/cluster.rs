@@ -27,6 +27,19 @@ async fn replicas_for_returns_unique_nodes() {
 }
 
 #[tokio::test]
+async fn replicas_for_is_deterministic() {
+    let self_addr = "http://127.0.0.1:1500".to_string();
+    let peer1 = "http://127.0.0.1:1501".to_string();
+    let peer2 = "http://127.0.0.1:1502".to_string();
+    let cluster = build_cluster(vec![peer1, peer2], 3, 3, &self_addr).await;
+    let reps1 = cluster.replicas_for("consistency");
+    let reps2 = cluster.replicas_for("consistency");
+    assert_eq!(reps1, reps2);
+    let set: HashSet<_> = reps1.iter().cloned().collect();
+    assert_eq!(set.len(), reps1.len());
+}
+
+#[tokio::test]
 async fn is_alive_false_when_stale() {
     let self_addr = "http://127.0.0.1:2000".to_string();
     let peer = "http://127.0.0.1:2001".to_string();

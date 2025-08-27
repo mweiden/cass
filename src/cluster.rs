@@ -169,20 +169,13 @@ impl Cluster {
         let mut cursor = Cursor::new(key.as_bytes());
         let token = murmur3_32(&mut cursor, 0).unwrap_or(0);
         let mut reps = Vec::new();
-        for (_k, node) in self.ring.range(token..) {
-            if !reps.contains(node) {
+        let mut seen = HashSet::new();
+        for (_k, node) in self.ring.range(token..).chain(self.ring.range(..)) {
+            if seen.insert(node.clone()) {
                 reps.push(node.clone());
-            }
-            if reps.len() == self.rf {
-                return reps;
-            }
-        }
-        for (_k, node) in &self.ring {
-            if !reps.contains(node) {
-                reps.push(node.clone());
-            }
-            if reps.len() == self.rf {
-                break;
+                if reps.len() == self.rf {
+                    break;
+                }
             }
         }
         reps
