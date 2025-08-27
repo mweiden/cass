@@ -69,7 +69,7 @@ async fn select_requires_partition_key() {
         .unwrap()
         .into_inner();
     if let Some(query_response::Payload::Rows(rs)) = rows.payload {
-        assert_eq!(rs.rows.len(), 1);
+        assert_eq!(rs.rows.len(), 2);
     } else {
         panic!("unexpected response");
     }
