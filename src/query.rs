@@ -360,8 +360,8 @@ impl SqlEngine {
                 }
             }
         } else {
-            let rows = db.scan_ns(ns).await;
-            for (k, bytes) in rows {
+            // Scan the namespace which now includes both in-memory and on-disk rows.
+            for (k, bytes) in db.scan_ns(ns).await.into_iter() {
                 let (_, data) = split_ts(&bytes);
                 if data.is_empty() {
                     continue;
@@ -447,8 +447,9 @@ impl SqlEngine {
         } else {
             let prefix_cols = &key_cols[..prefix_len];
             let prefixes = build_keys(prefix_cols, &cond_multi);
-            let rows = db.scan_ns(ns).await;
-            for (k, bytes) in rows {
+            // Expanded scan returns rows from both the memtable and on-disk tables
+            // which are then filtered by the prefix conditions.
+            for (k, bytes) in db.scan_ns(ns).await.into_iter() {
                 for prefix in &prefixes {
                     if k == *prefix || k.starts_with(&format!("{}|", prefix)) {
                         let (ts, data) = split_ts(&bytes);
