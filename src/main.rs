@@ -332,7 +332,7 @@ fn sstable_disk_usage(dir: &str) -> u64 {
                 let p = entry.path();
                 if p.is_dir() {
                     size += visit(&p);
-                } else if p.extension().and_then(|e| e.to_str()) == Some("sst") {
+                } else if p.extension().and_then(|e| e.to_str()) == Some("tbl") {
                     if let Ok(meta) = entry.metadata() {
                         size += meta.len();
                     }
