@@ -6,6 +6,11 @@ pub trait Storage: Send + Sync {
     async fn put(&self, path: &str, data: Vec<u8>) -> Result<(), StorageError>;
     async fn get(&self, path: &str) -> Result<Vec<u8>, StorageError>;
 
+    /// Append `data` to the object at `path` without rewriting the existing
+    /// contents. Backends may implement this efficiently or fall back to
+    /// reading and rewriting the entire object.
+    async fn append(&self, path: &str, data: &[u8]) -> Result<(), StorageError>;
+
     fn local_path(&self) -> Option<&Path> {
         None
     }
@@ -21,6 +26,10 @@ impl Storage for Box<dyn Storage> {
 
     async fn get(&self, path: &str) -> Result<Vec<u8>, StorageError> {
         (**self).get(path).await
+    }
+
+    async fn append(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {
+        (**self).append(path, data).await
     }
 
     fn local_path(&self) -> Option<&Path> {
@@ -39,6 +48,10 @@ impl Storage for Arc<dyn Storage> {
 
     async fn get(&self, path: &str) -> Result<Vec<u8>, StorageError> {
         (**self).get(path).await
+    }
+
+    async fn append(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {
+        (**self).append(path, data).await
     }
 
     fn local_path(&self) -> Option<&Path> {
