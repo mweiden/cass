@@ -1,9 +1,8 @@
 use cass::rpc::{PanicRequest, QueryRequest, cass_client::CassClient, query_response};
-use std::{
-    process::{Command, Stdio},
-    thread,
-    time::Duration,
-};
+use std::{thread, time::Duration};
+
+mod common;
+use common::CassProcess;
 
 #[tokio::test]
 async fn show_tables_with_unhealthy_replica() {
@@ -11,41 +10,30 @@ async fn show_tables_with_unhealthy_replica() {
     let base2 = "http://127.0.0.1:18082";
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
-    let bin = env!("CARGO_BIN_EXE_cass");
 
-    let mut child1 = Command::new(bin)
-        .args([
-            "server",
-            "--data-dir",
-            dir1.path().to_str().unwrap(),
-            "--node-addr",
-            base1,
-            "--peer",
-            base2,
-            "--rf",
-            "2",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let _child1 = CassProcess::spawn([
+        "server",
+        "--data-dir",
+        dir1.path().to_str().unwrap(),
+        "--node-addr",
+        base1,
+        "--peer",
+        base2,
+        "--rf",
+        "2",
+    ]);
 
-    let mut child2 = Command::new(bin)
-        .args([
-            "server",
-            "--data-dir",
-            dir2.path().to_str().unwrap(),
-            "--node-addr",
-            base2,
-            "--peer",
-            base1,
-            "--rf",
-            "2",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child2 = CassProcess::spawn([
+        "server",
+        "--data-dir",
+        dir2.path().to_str().unwrap(),
+        "--node-addr",
+        base2,
+        "--peer",
+        base1,
+        "--rf",
+        "2",
+    ]);
 
     for _ in 0..20 {
         let ok1 = CassClient::connect(base1.to_string()).await.is_ok();
@@ -83,6 +71,5 @@ async fn show_tables_with_unhealthy_replica() {
         _ => panic!("unexpected"),
     }
 
-    child1.kill().unwrap();
-    child2.kill().unwrap();
+    child2.kill();
 }

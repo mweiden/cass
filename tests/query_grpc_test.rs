@@ -1,30 +1,20 @@
 use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
-use std::{
-    process::{Command, Stdio},
-    thread,
-    time::Duration,
-};
+use std::{thread, time::Duration};
+
+mod common;
+use common::CassProcess;
 
 #[tokio::test]
 async fn grpc_query_roundtrip() {
     let tmp_dir = tempfile::tempdir().unwrap();
-
-    let bin = env!("CARGO_BIN_EXE_cass");
     let base = "http://127.0.0.1:8080";
-    let mut child = Command::new(bin)
-        .args([
-            "server",
-            "--data-dir",
-            tmp_dir.path().to_str().unwrap(),
-            "--node-addr",
-            base,
-            "--rf",
-            "1",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
+    let _child = CassProcess::spawn([
+        "server",
+        "--node-addr",
+        base,
+        "--data-dir",
+        tmp_dir.path().to_str().unwrap(),
+    ]);
 
     for _ in 0..10 {
         if CassClient::connect(base).await.is_ok() {
@@ -77,6 +67,4 @@ async fn grpc_query_roundtrip() {
         }
         _ => panic!("unexpected count response"),
     }
-
-    child.kill().unwrap();
 }
