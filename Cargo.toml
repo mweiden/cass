@@ -27,13 +27,19 @@ rustyline = "12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tower-http = { version = "0.6", features = ["trace"] }
+memmap2 = "0.9"
 
 [dev-dependencies]
 tempfile = "3"
 s3s = "0.12.0-minio-preview.3"
 s3s-fs = "0.12.0-minio-preview.3"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+criterion = "0.5"
 
 [build-dependencies]
 tonic-build = "0.12"
 protoc-bin-vendored = "3"
+
+[[bench]]
+name = "lookup"
+harness = false
