@@ -156,3 +156,13 @@ counts, peer health, RAM and CPU usage, and SSTable disk usage.
 There is also a preconfigured dashboard with basic metrics from all instances. Screenshot below:
 
 <img width="1257" height="821" alt="Screenshot 2025-08-17 at 11 48 28 PM" src="https://github.com/user-attachments/assets/cbaf71aa-c726-4c6a-a1eb-422060aecd0a" />
+
+## Performance Benchmarking
+
+The repository includes a simple harness for comparing write and read throughput of `cass` against a reference Apache Cassandra node.
+
+```bash
+scripts/perf_compare.sh         # runs both databases and stores metrics in ./perf-results
+```
+
+The script uses the example program `perf_client` to drive load against `cass` and `cassandra-stress` for the Apache Cassandra container. Prometheus metrics from `cass` and `nodetool` statistics from Cassandra are written to the `perf-results` directory for analysis.
