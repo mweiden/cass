@@ -3,7 +3,7 @@ use cass::cluster::Cluster;
 use cass::storage::local::LocalStorage;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 async fn build_cluster(peers: Vec<String>, vnodes: usize, rf: usize, self_addr: &str) -> Cluster {
@@ -46,7 +46,13 @@ async fn is_alive_false_when_stale() {
     let cluster = build_cluster(vec![peer.clone()], 1, 1, &self_addr).await;
     assert!(cluster.is_alive(&self_addr).await);
     assert!(cluster.is_alive(&peer).await);
-    tokio::time::sleep(Duration::from_secs(9)).await;
+    let start = Instant::now();
+    while cluster.is_alive(&peer).await {
+        if start.elapsed() > Duration::from_secs(3) {
+            panic!("peer did not become unhealthy in time");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(!cluster.is_alive(&peer).await);
 }
 
@@ -67,7 +73,13 @@ async fn panic_makes_self_unhealthy_temporarily() {
     assert!(cluster.is_alive(&self_addr).await);
     cluster.panic_for(Duration::from_secs(1)).await;
     assert!(!cluster.is_alive(&self_addr).await);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let start = Instant::now();
+    while !cluster.is_alive(&self_addr).await {
+        if start.elapsed() > Duration::from_secs(3) {
+            panic!("node did not recover in time");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     assert!(cluster.is_alive(&self_addr).await);
 }
 

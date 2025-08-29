@@ -1,5 +1,6 @@
 use cass::rpc::{PanicRequest, QueryRequest, cass_client::CassClient, query_response};
-use std::{thread, time::Duration};
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
 
 mod common;
 use common::CassProcess;
@@ -41,7 +42,7 @@ async fn show_tables_with_unhealthy_replica() {
         if ok1 && ok2 {
             break;
         }
-        thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100)).await;
     }
 
     let mut c1 = CassClient::connect(base1.to_string()).await.unwrap();
@@ -55,20 +56,24 @@ async fn show_tables_with_unhealthy_replica() {
 
     // Mark the second node unhealthy and allow gossip to propagate
     c2.panic(PanicRequest {}).await.unwrap();
-    thread::sleep(Duration::from_secs(2));
-
-    let res = c1
-        .query(QueryRequest {
-            sql: "SHOW TABLES".into(),
-        })
-        .await
-        .unwrap()
-        .into_inner();
-    match res.payload {
-        Some(query_response::Payload::Tables(t)) => {
-            assert_eq!(t.tables, vec!["kv".to_string()]);
+    let start = Instant::now();
+    loop {
+        let res = c1
+            .query(QueryRequest {
+                sql: "SHOW TABLES".into(),
+            })
+            .await;
+        if let Ok(resp) = res {
+            let inner = resp.into_inner();
+            if let Some(query_response::Payload::Tables(t)) = inner.payload {
+                assert_eq!(t.tables, vec!["kv".to_string()]);
+                break;
+            }
         }
-        _ => panic!("unexpected"),
+        if start.elapsed() > Duration::from_secs(2) {
+            panic!("SHOW TABLES did not succeed in time");
+        }
+        sleep(Duration::from_millis(50)).await;
     }
 
     child2.kill();

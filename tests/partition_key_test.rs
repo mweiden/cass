@@ -1,4 +1,5 @@
-use std::{thread, time::Duration};
+use std::time::Duration;
+use tokio::time::sleep;
 
 use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
 
@@ -23,7 +24,7 @@ async fn select_requires_partition_key() {
         if CassClient::connect(base.to_string()).await.is_ok() {
             break;
         }
-        thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100)).await;
     }
 
     let mut client = CassClient::connect(base.to_string()).await.unwrap();
