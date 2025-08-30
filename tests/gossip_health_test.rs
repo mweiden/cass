@@ -1,4 +1,5 @@
-use std::{thread, time::Duration};
+use std::time::{Duration, Instant};
+use tokio::time::sleep;
 
 use cass::rpc::{HealthRequest, QueryRequest, cass_client::CassClient};
 use serde_json::Value;
@@ -26,7 +27,7 @@ async fn health_endpoint_reports_tokens() {
         if CassClient::connect(base.to_string()).await.is_ok() {
             break;
         }
-        thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100)).await;
     }
 
     let mut client = CassClient::connect(base.to_string()).await.unwrap();
@@ -77,7 +78,7 @@ async fn errors_when_not_enough_healthy_replicas() {
         if ok1 && ok2 {
             break;
         }
-        thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100)).await;
     }
 
     let mut c1 = CassClient::connect(base1.to_string()).await.unwrap();
@@ -89,18 +90,22 @@ async fn errors_when_not_enough_healthy_replicas() {
 
     child2.kill();
 
-    thread::sleep(Duration::from_secs(1));
-
-    let res = c1
-        .query(QueryRequest {
-            sql: "INSERT INTO kv (id, val) VALUES ('x','1')".into(),
-        })
-        .await;
-    assert!(
-        res.unwrap_err()
-            .message()
-            .contains("not enough healthy replicas")
-    );
+    let start = Instant::now();
+    loop {
+        let res = c1
+            .query(QueryRequest {
+                sql: "INSERT INTO kv (id, val) VALUES ('x','1')".into(),
+            })
+            .await;
+        if let Err(e) = res {
+            assert!(e.message().contains("not enough healthy replicas"));
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(2) {
+            panic!("replica did not report unhealthy in time");
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 
     child1.kill();
 }

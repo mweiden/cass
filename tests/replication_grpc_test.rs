@@ -1,4 +1,5 @@
-use std::{thread, time::Duration};
+use std::time::Duration;
+use tokio::time::sleep;
 
 use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
 
@@ -42,7 +43,7 @@ async fn union_and_lww_across_replicas() {
         if ok1 && ok2 {
             break;
         }
-        thread::sleep(Duration::from_millis(100));
+        sleep(Duration::from_millis(100)).await;
     }
 
     let mut c1 = CassClient::connect(base1.to_string()).await.unwrap();

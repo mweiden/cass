@@ -1,5 +1,6 @@
 use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
-use std::{thread, time::Duration};
+use std::time::Duration;
+use tokio::time::sleep;
 
 mod common;
 use common::CassProcess;
@@ -20,7 +21,7 @@ async fn grpc_query_roundtrip() {
         if CassClient::connect(base).await.is_ok() {
             break;
         }
-        thread::sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(50)).await;
     }
 
     let mut client = CassClient::connect(base).await.unwrap();
