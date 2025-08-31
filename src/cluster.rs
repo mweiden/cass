@@ -98,6 +98,13 @@ pub struct Cluster {
     panic_until: Arc<RwLock<Option<Instant>>>,
 }
 
+struct QueryMeta {
+    broadcast: bool,
+    is_write: bool,
+    is_count: bool,
+    first_stmt: Option<Statement>,
+}
+
 impl Cluster {
     /// Create a new cluster coordinator.
     pub fn new(
@@ -308,42 +315,55 @@ impl Cluster {
     pub async fn execute(&self, sql: &str, forwarded: bool) -> Result<QueryResponse, QueryError> {
         let engine = SqlEngine::new();
         if forwarded {
-            let (ts, real_sql) = if let Some(rest) = sql.strip_prefix("--ts:") {
-                if let Some(pos) = rest.find('\n') {
-                    let ts = rest[..pos].parse().unwrap_or(0);
-                    (ts, &rest[pos + 1..])
-                } else {
-                    (0, sql)
-                }
-            } else {
-                (0, sql)
-            };
+            let (ts, real_sql) = Self::parse_forwarded(sql);
             let out = engine.execute_with_ts(&self.db, real_sql, ts, true).await?;
             return Ok(output_to_proto(out));
         }
 
-        // Determine if the statement is a schema mutation that should be
-        // broadcast to every node and whether it is a write.
-        let mut broadcast = false;
-        let mut is_write = false;
-        let mut is_count = false;
-        let mut first_stmt: Option<Statement> = None;
+        let meta = Self::analyze_sql(&engine, sql);
+        let ts = Self::timestamp_for(meta.is_write);
+        let replicas = self.target_replicas(&engine, sql, meta.broadcast).await?;
+        let healthy = self.healthy_nodes(replicas).await;
+        if !meta.broadcast && healthy.len() < self.rf {
+            return Err(QueryError::Other("not enough healthy replicas".into()));
+        }
+        let results = self.run_on_nodes(healthy, sql.to_string(), ts).await;
+        self.merge_results(results, meta)
+    }
+
+    fn parse_forwarded(sql: &str) -> (u64, &str) {
+        if let Some(rest) = sql.strip_prefix("--ts:") {
+            if let Some(pos) = rest.find('\n') {
+                let ts = rest[..pos].parse().unwrap_or(0);
+                return (ts, &rest[pos + 1..]);
+            }
+        }
+        (0, sql)
+    }
+
+    fn analyze_sql(engine: &SqlEngine, sql: &str) -> QueryMeta {
+        let mut meta = QueryMeta {
+            broadcast: false,
+            is_write: false,
+            is_count: false,
+            first_stmt: None,
+        };
         if let Ok(stmts) = engine.parse(sql) {
             if let Some(st) = stmts.first() {
-                first_stmt = Some(st.clone());
+                meta.first_stmt = Some(st.clone());
             }
-            if let Some(Statement::Query(q)) = first_stmt.as_ref() {
+            if let Some(Statement::Query(q)) = meta.first_stmt.as_ref() {
                 if let SetExpr::Select(s) = &*q.body {
                     if s.projection.len() == 1 {
                         if let SelectItem::UnnamedExpr(Expr::Function(func)) = &s.projection[0] {
                             if func.name.to_string().eq_ignore_ascii_case("count") {
-                                is_count = true;
+                                meta.is_count = true;
                             }
                         }
                     }
                 }
             }
-            broadcast = stmts.iter().all(|s| {
+            meta.broadcast = stmts.iter().all(|s| {
                 matches!(
                     s,
                     Statement::CreateTable(_)
@@ -354,7 +374,7 @@ impl Cluster {
                         | Statement::ShowTables { .. }
                 )
             });
-            is_write = stmts.iter().any(|s| {
+            meta.is_write = stmts.iter().any(|s| {
                 matches!(
                     s,
                     Statement::Insert(_)
@@ -368,61 +388,64 @@ impl Cluster {
                 )
             });
         }
+        meta
+    }
 
-        let ts = if is_write {
+    fn timestamp_for(write: bool) -> u64 {
+        if write {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+                .unwrap_or_else(|_| Duration::from_secs(0))
                 .as_micros() as u64
         } else {
             0
-        };
+        }
+    }
 
-        // Work out the target replica set.
-        let mut replicas: HashSet<String> = HashSet::new();
+    async fn target_replicas(
+        &self,
+        engine: &SqlEngine,
+        sql: &str,
+        broadcast: bool,
+    ) -> Result<Vec<String>, QueryError> {
         if broadcast {
-            replicas.extend(self.ring.values().cloned());
-        } else {
-            let keys = match engine.partition_keys(&self.db, sql).await {
-                Ok(k) => k,
-                Err(e) => return Err(e),
-            };
-            for key in keys {
-                for node in self.replicas_for(&key) {
-                    replicas.insert(node);
-                }
-            }
-            if replicas.is_empty() {
-                replicas.insert(self.self_addr.clone());
+            return Ok(self.ring.values().cloned().collect());
+        }
+        let keys = engine.partition_keys(&self.db, sql).await?;
+        let mut replicas: HashSet<String> = HashSet::new();
+        for key in keys {
+            for node in self.replicas_for(&key) {
+                replicas.insert(node);
             }
         }
+        if replicas.is_empty() {
+            replicas.insert(self.self_addr.clone());
+        }
+        Ok(replicas.into_iter().collect())
+    }
 
-        let mut replicas: Vec<String> = replicas.into_iter().collect();
-        let mut healthy: Vec<String> = Vec::new();
-        for node in replicas.drain(..) {
+    async fn healthy_nodes(&self, replicas: Vec<String>) -> Vec<String> {
+        let mut healthy = Vec::new();
+        for node in replicas {
             if self.is_alive(&node).await {
                 healthy.push(node);
             }
         }
-        if !broadcast && healthy.len() < self.rf {
-            return Err(QueryError::Other("not enough healthy replicas".into()));
-        }
+        healthy
+    }
 
-        // Collect results from all replicas, performing last-write-wins per key.
-        let mut rows: BTreeMap<String, (u64, String)> = BTreeMap::new();
-        let mut table_set: BTreeSet<String> = BTreeSet::new();
-        let mut arr_rows: Vec<BTreeMap<String, String>> = Vec::new();
-        let mut last_err: Option<QueryError> = None;
-        let mut row_count: u64 = 0;
-        let mut count_val: Option<u64> = None;
-
-        let sql_string = sql.to_string();
-        let tasks: Vec<_> = healthy
+    async fn run_on_nodes(
+        &self,
+        nodes: Vec<String>,
+        sql: String,
+        ts: u64,
+    ) -> Vec<Result<QueryOutput, QueryError>> {
+        let tasks: Vec<_> = nodes
             .into_iter()
             .map(|node| {
                 let db = self.db.clone();
                 let self_addr = self.self_addr.clone();
-                let sql_clone = sql_string.clone();
+                let sql_clone = sql.clone();
                 async move {
                     if node == self_addr {
                         let engine = SqlEngine::new();
@@ -445,8 +468,22 @@ impl Cluster {
                 }
             })
             .collect();
+        join_all(tasks).await
+    }
 
-        for resp in join_all(tasks).await {
+    fn merge_results(
+        &self,
+        results: Vec<Result<QueryOutput, QueryError>>,
+        meta: QueryMeta,
+    ) -> Result<QueryResponse, QueryError> {
+        let mut rows: BTreeMap<String, (u64, String)> = BTreeMap::new();
+        let mut table_set: BTreeSet<String> = BTreeSet::new();
+        let mut arr_rows: Vec<BTreeMap<String, String>> = Vec::new();
+        let mut last_err: Option<QueryError> = None;
+        let mut row_count: u64 = 0;
+        let mut count_val: Option<u64> = None;
+
+        for resp in results {
             match resp {
                 Ok(QueryOutput::Meta(meta_rows)) => {
                     for (key, ts, val) in meta_rows {
@@ -467,7 +504,7 @@ impl Cluster {
                     }
                 }
                 Ok(QueryOutput::Rows(r)) => {
-                    if is_count {
+                    if meta.is_count {
                         if count_val.is_none() {
                             if let Some(c) = r.get(0).and_then(|m| m.get("count")) {
                                 count_val = c.parse::<u64>().ok();
@@ -482,8 +519,8 @@ impl Cluster {
             }
         }
 
-        if is_write {
-            let count = match first_stmt {
+        if meta.is_write {
+            let count = match meta.first_stmt {
                 Some(Statement::CreateTable(_))
                 | Some(Statement::Drop {
                     object_type: ObjectType::Table,
@@ -491,7 +528,7 @@ impl Cluster {
                 }) => 1,
                 _ => row_count as usize,
             };
-            let (op, unit) = match first_stmt {
+            let (op, unit) = match meta.first_stmt {
                 Some(Statement::Insert(_)) => ("INSERT", "row"),
                 Some(Statement::Update { .. }) => ("UPDATE", "row"),
                 Some(Statement::Delete(_)) => ("DELETE", "row"),
@@ -502,28 +539,36 @@ impl Cluster {
                 }) => ("DROP TABLE", "table"),
                 _ => ("UNKNOWN", ""),
             };
-            Ok(output_to_proto(QueryOutput::Mutation {
+            return Ok(output_to_proto(QueryOutput::Mutation {
                 op: op.to_string(),
                 unit: unit.to_string(),
                 count,
-            }))
-        } else if let Some(Statement::ShowTables { .. }) = first_stmt {
+            }));
+        }
+
+        if matches!(meta.first_stmt, Some(Statement::ShowTables { .. })) {
             let tables: Vec<String> = table_set.into_iter().collect();
-            Ok(output_to_proto(QueryOutput::Tables(tables)))
-        } else if is_count {
+            return Ok(output_to_proto(QueryOutput::Tables(tables)));
+        }
+
+        if meta.is_count {
             let total = count_val.unwrap_or(0);
             let mut row = BTreeMap::new();
             row.insert("count".to_string(), total.to_string());
-            Ok(output_to_proto(QueryOutput::Rows(vec![row])))
-        } else if !rows.is_empty() || !arr_rows.is_empty() {
+            return Ok(output_to_proto(QueryOutput::Rows(vec![row])));
+        }
+
+        if !rows.is_empty() || !arr_rows.is_empty() {
             for (_k, (_ts, val)) in rows {
                 if !val.is_empty() {
                     let map = decode_row(val.as_bytes());
                     arr_rows.push(map);
                 }
             }
-            Ok(output_to_proto(QueryOutput::Rows(arr_rows)))
-        } else if let Some(err) = last_err {
+            return Ok(output_to_proto(QueryOutput::Rows(arr_rows)));
+        }
+
+        if let Some(err) = last_err {
             Err(err)
         } else {
             Ok(output_to_proto(QueryOutput::Rows(Vec::new())))
