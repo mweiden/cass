@@ -175,6 +175,19 @@ impl SqlEngine {
                     Err(QueryError::Unsupported)
                 }
             }
+            Statement::Truncate { table_names, .. } => {
+                if let Some(target) = table_names.first() {
+                    let ns = object_name_to_ns(&target.name).ok_or(QueryError::Unsupported)?;
+                    db.clear_ns(&ns).await;
+                    Ok(QueryOutput::Mutation {
+                        op: "TRUNCATE".to_string(),
+                        unit: "table".to_string(),
+                        count: 1,
+                    })
+                } else {
+                    Err(QueryError::Unsupported)
+                }
+            }
             Statement::Query(q) => self.exec_query(db, q, meta).await,
             _ => Err(QueryError::Unsupported),
         }

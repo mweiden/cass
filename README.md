@@ -30,8 +30,8 @@ The built-in SQL engine understands a small subset of SQL:
 - `SELECT` with optional `WHERE` filters, `ORDER BY`, `GROUP BY`,
   `DISTINCT`, simple aggregate functions (`COUNT`, `MIN`, `MAX`, `SUM`)
   and `LIMIT`
-- Table management statements such as `CREATE TABLE`, `DROP TABLE` and
-  `SHOW TABLES`
+- Table management statements such as `CREATE TABLE`, `DROP TABLE`,
+  `TRUNCATE TABLE`, and `SHOW TABLES`
 
 Note on creating [partition and clustering keys](https://cassandra.apache.org/doc/4.0/cassandra/data_modeling/intro.html#partitions):
 the first column in `PRIMARY KEY(...)` will be the partition key, subsequent columns will be indexed as clustering keys.
