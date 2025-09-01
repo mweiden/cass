@@ -16,11 +16,11 @@ use tonic::Request;
 use crate::{
     Database, SqlEngine,
     query::{QueryError, QueryOutput},
-    schema::decode_row,
+    schema::{TableSchema, decode_row},
     storage::StorageError,
 };
 use serde_json::{Value, json};
-use sqlparser::ast::{Expr, ObjectType, SelectItem, SetExpr, Statement};
+use sqlparser::ast::{Expr, ObjectName, ObjectType, SelectItem, SetExpr, Statement, TableFactor};
 use sysinfo::Disks;
 use tokio::{sync::RwLock, time::sleep};
 
@@ -93,9 +93,11 @@ pub struct Cluster {
     db: Arc<Database>,
     ring: BTreeMap<u32, String>,
     rf: usize,
+    read_consistency: usize,
     self_addr: String,
     health: Arc<RwLock<HashMap<String, Instant>>>,
     panic_until: Arc<RwLock<Option<Instant>>>,
+    hints: Arc<RwLock<HashMap<String, Vec<(u64, String)>>>>,
 }
 
 struct QueryMeta {
@@ -103,6 +105,7 @@ struct QueryMeta {
     is_write: bool,
     is_count: bool,
     first_stmt: Option<Statement>,
+    ns: Option<String>,
 }
 
 impl Cluster {
@@ -113,6 +116,7 @@ impl Cluster {
         mut peers: Vec<String>,
         vnodes: usize,
         rf: usize,
+        read_consistency: usize,
     ) -> Self {
         peers.push(self_addr.clone());
         let mut ring = BTreeMap::new();
@@ -166,9 +170,11 @@ impl Cluster {
             db,
             ring,
             rf: rf.max(1),
+            read_consistency: read_consistency.max(1),
             self_addr,
             health,
             panic_until,
+            hints: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -323,12 +329,31 @@ impl Cluster {
         let meta = Self::analyze_sql(&engine, sql);
         let ts = Self::timestamp_for(meta.is_write);
         let replicas = self.target_replicas(&engine, sql, meta.broadcast).await?;
-        let healthy = self.healthy_nodes(replicas).await;
-        if !meta.broadcast && healthy.len() < self.rf {
-            return Err(QueryError::Other("not enough healthy replicas".into()));
+        let healthy = self.healthy_nodes(replicas.clone()).await;
+        let unhealthy: Vec<String> = replicas
+            .iter()
+            .filter(|n| !healthy.contains(n))
+            .cloned()
+            .collect();
+        if !meta.broadcast {
+            if meta.is_write {
+                if healthy.is_empty() {
+                    return Err(QueryError::Other("no healthy replicas".into()));
+                }
+                if !unhealthy.is_empty() {
+                    self.store_hints(&unhealthy, sql.to_string(), ts).await;
+                }
+            } else if healthy.len() < self.read_consistency {
+                return Err(QueryError::Other("not enough healthy replicas".into()));
+            }
         }
-        let results = self.run_on_nodes(healthy, sql.to_string(), ts).await;
-        self.merge_results(results, meta)
+        let results = self
+            .run_on_nodes(healthy.clone(), sql.to_string(), ts)
+            .await;
+        if !meta.is_write && !meta.broadcast {
+            self.read_repair(&meta, &results, replicas, unhealthy).await;
+        }
+        self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta)
     }
 
     fn parse_forwarded(sql: &str) -> (u64, &str) {
@@ -347,10 +372,44 @@ impl Cluster {
             is_write: false,
             is_count: false,
             first_stmt: None,
+            ns: None,
         };
         if let Ok(stmts) = engine.parse(sql) {
             if let Some(st) = stmts.first() {
                 meta.first_stmt = Some(st.clone());
+                meta.ns = match st {
+                    Statement::Insert(insert) => {
+                        if let sqlparser::ast::TableObject::TableName(name) = &insert.table {
+                            Self::object_name_to_ns(name)
+                        } else {
+                            None
+                        }
+                    }
+                    Statement::Update { table, .. } => Self::table_factor_to_ns(&table.relation),
+                    Statement::Delete(delete) => {
+                        use sqlparser::ast::FromTable;
+                        let table = match &delete.from {
+                            FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+                        };
+                        if table.len() == 1 {
+                            Self::table_factor_to_ns(&table[0].relation)
+                        } else {
+                            None
+                        }
+                    }
+                    Statement::Query(q) => {
+                        if let SetExpr::Select(s) = &*q.body {
+                            if !s.from.is_empty() {
+                                Self::table_factor_to_ns(&s.from[0].relation)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
             }
             if let Some(Statement::Query(q)) = meta.first_stmt.as_ref() {
                 if let SetExpr::Select(s) = &*q.body {
@@ -428,6 +487,7 @@ impl Cluster {
         let mut healthy = Vec::new();
         for node in replicas {
             if self.is_alive(&node).await {
+                self.apply_hints(&node).await;
                 healthy.push(node);
             }
         }
@@ -439,7 +499,7 @@ impl Cluster {
         nodes: Vec<String>,
         sql: String,
         ts: u64,
-    ) -> Vec<Result<QueryOutput, QueryError>> {
+    ) -> Vec<(String, Result<QueryOutput, QueryError>)> {
         let tasks: Vec<_> = nodes
             .into_iter()
             .map(|node| {
@@ -447,7 +507,7 @@ impl Cluster {
                 let self_addr = self.self_addr.clone();
                 let sql_clone = sql.clone();
                 async move {
-                    if node == self_addr {
+                    let res = if node == self_addr {
                         let engine = SqlEngine::new();
                         engine.execute_with_ts(&db, &sql_clone, ts, true).await
                     } else {
@@ -464,11 +524,126 @@ impl Cluster {
                                 .map_err(|e| QueryError::Other(e.to_string())),
                             Err(e) => Err(QueryError::Other(e.to_string())),
                         }
-                    }
+                    };
+                    (node, res)
                 }
             })
             .collect();
         join_all(tasks).await
+    }
+
+    async fn store_hints(&self, nodes: &[String], sql: String, ts: u64) {
+        if nodes.is_empty() {
+            return;
+        }
+        let mut map = self.hints.write().await;
+        for n in nodes {
+            map.entry(n.clone()).or_default().push((ts, sql.clone()));
+        }
+    }
+
+    async fn apply_hints(&self, node: &str) {
+        let hints = {
+            let mut map = self.hints.write().await;
+            map.remove(node)
+        };
+        if let Some(hints) = hints {
+            for (ts, sql) in hints {
+                let res = self
+                    .run_on_nodes(vec![node.to_string()], sql.clone(), ts)
+                    .await;
+                if res.first().map(|(_, r)| r.is_err()).unwrap_or(true) {
+                    let mut map = self.hints.write().await;
+                    map.entry(node.to_string()).or_default().push((ts, sql));
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn read_repair(
+        &self,
+        meta: &QueryMeta,
+        results: &[(String, Result<QueryOutput, QueryError>)],
+        replicas: Vec<String>,
+        unhealthy: Vec<String>,
+    ) {
+        let ns = match &meta.ns {
+            Some(ns) => ns.clone(),
+            None => return,
+        };
+        let Some(schema) = Self::get_schema(&self.db, &ns).await else {
+            return;
+        };
+        let mut latest: BTreeMap<String, (u64, String)> = BTreeMap::new();
+        for (_node, res) in results.iter() {
+            if let Ok(QueryOutput::Meta(rows)) = res {
+                for (k, ts, v) in rows {
+                    match latest.get(k) {
+                        Some((cur, _)) if *cur >= *ts => {}
+                        _ => {
+                            latest.insert(k.clone(), (*ts, v.clone()));
+                        }
+                    }
+                }
+            }
+        }
+        let healthy: Vec<String> = replicas
+            .into_iter()
+            .filter(|n| !unhealthy.contains(n))
+            .collect();
+        for (key, (ts, val)) in latest {
+            let mut row_map = decode_row(val.as_bytes());
+            for (col, part) in schema.key_columns().iter().zip(key.split('|')) {
+                row_map.insert(col.clone(), part.to_string());
+            }
+            let cols = schema.columns.clone();
+            let vals = cols
+                .iter()
+                .map(|c| format!("'{}'", row_map.get(c).cloned().unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let insert_sql = format!(
+                "INSERT INTO {} ({}) VALUES ({});",
+                ns,
+                cols.join(", "),
+                vals
+            );
+            if !unhealthy.is_empty() {
+                self.store_hints(&unhealthy, insert_sql.clone(), ts).await;
+            }
+            let _ = self.run_on_nodes(healthy.clone(), insert_sql, ts).await;
+        }
+    }
+
+    async fn get_schema(db: &Database, table: &str) -> Option<TableSchema> {
+        db.get_ns("_schemas", table).await.and_then(|v| {
+            let (_, data) = Self::split_ts(&v);
+            serde_json::from_slice(data).ok()
+        })
+    }
+
+    fn split_ts(bytes: &[u8]) -> (u64, &[u8]) {
+        if bytes.len() < 8 {
+            return (0, bytes);
+        }
+        let mut ts_bytes = [0u8; 8];
+        ts_bytes.copy_from_slice(&bytes[..8]);
+        (u64::from_be_bytes(ts_bytes), &bytes[8..])
+    }
+
+    fn object_name_to_ns(name: &ObjectName) -> Option<String> {
+        name.0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(|i| i.value.to_lowercase())
+    }
+
+    fn table_factor_to_ns(tf: &TableFactor) -> Option<String> {
+        match tf {
+            TableFactor::Table { name, .. } => Self::object_name_to_ns(name),
+            _ => None,
+        }
     }
 
     fn merge_results(
