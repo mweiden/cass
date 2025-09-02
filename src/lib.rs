@@ -160,8 +160,20 @@ impl Database {
 
     /// Insert a key/value pair into the provided namespace with explicit timestamp.
     pub async fn insert_ns_ts(&self, ns: &str, key: String, value: Vec<u8>, ts: u64) {
+        use base64::Engine;
         let namespaced = format!("{}:{}", ns, key);
-        self.insert_ts(namespaced, value, ts).await;
+        let mut buf = ts.to_be_bytes().to_vec();
+        buf.extend_from_slice(&value);
+        let enc = base64::engine::general_purpose::STANDARD.encode(&buf);
+        self.insert_ts(namespaced.clone(), value, ts).await;
+
+        let coord = {
+            let map = self.lwt_coordinators.lock().await;
+            map.get(&namespaced).cloned()
+        };
+        if let Some(coord) = coord {
+            coord.set_committed(Some(&enc)).await;
+        }
     }
 
     /// Insert a key/value pair into the provided namespace using the current time.
@@ -218,6 +230,13 @@ impl Database {
     pub async fn delete_ns(&self, ns: &str, key: &str) {
         let namespaced = format!("{}:{}", ns, key);
         self.memtable.delete(&namespaced).await;
+        let coord = {
+            let map = self.lwt_coordinators.lock().await;
+            map.get(&namespaced).cloned()
+        };
+        if let Some(coord) = coord {
+            coord.set_committed(None).await;
+        }
     }
 
     /// Scan all key/value pairs for a namespace, stripping the prefix.
