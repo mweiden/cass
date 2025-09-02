@@ -40,6 +40,11 @@ impl Replica {
         self.committed = Some(value.to_string());
         self.accepted = None;
     }
+
+    async fn set_committed(&mut self, value: Option<&str>) {
+        self.committed = value.map(|v| v.to_string());
+        self.accepted = None;
+    }
 }
 
 /// Coordinator for running a lightweight transaction across a set of replicas.
@@ -134,5 +139,14 @@ impl Coordinator {
             vals.push(guard.committed.clone());
         }
         vals
+    }
+
+    /// Update the committed value across all replicas without running a
+    /// compare-and-set operation.
+    pub async fn set_committed(&self, value: Option<&str>) {
+        for r in &self.replicas {
+            let mut guard = r.lock().await;
+            guard.set_committed(value).await;
+        }
     }
 }

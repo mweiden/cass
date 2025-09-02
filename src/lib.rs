@@ -15,6 +15,7 @@ pub mod rpc {
 
 use base64::Engine;
 pub use query::SqlEngine;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,7 @@ pub struct Database {
     max_memtable_size: usize,
     next_id: std::sync::atomic::AtomicUsize,
     wal: wal::Wal,
+    lwt_coordinators: tokio::sync::Mutex<HashMap<String, Arc<lwt::Coordinator>>>,
 }
 
 impl Database {
@@ -77,6 +79,7 @@ impl Database {
             max_memtable_size: 1024,
             next_id: std::sync::atomic::AtomicUsize::new(next_id),
             wal,
+            lwt_coordinators: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -157,8 +160,20 @@ impl Database {
 
     /// Insert a key/value pair into the provided namespace with explicit timestamp.
     pub async fn insert_ns_ts(&self, ns: &str, key: String, value: Vec<u8>, ts: u64) {
+        use base64::Engine;
         let namespaced = format!("{}:{}", ns, key);
-        self.insert_ts(namespaced, value, ts).await;
+        let mut buf = ts.to_be_bytes().to_vec();
+        buf.extend_from_slice(&value);
+        let enc = base64::engine::general_purpose::STANDARD.encode(&buf);
+        self.insert_ts(namespaced.clone(), value, ts).await;
+
+        let coord = {
+            let map = self.lwt_coordinators.lock().await;
+            map.get(&namespaced).cloned()
+        };
+        if let Some(coord) = coord {
+            coord.set_committed(Some(&enc)).await;
+        }
     }
 
     /// Insert a key/value pair into the provided namespace using the current time.
@@ -187,8 +202,17 @@ impl Database {
         let expected_val = expected
             .as_ref()
             .map(|e| base64::engine::general_purpose::STANDARD.encode(e));
-        let lwt = lwt::Coordinator::new(3);
-        if lwt.compare_and_set(expected_val.as_deref(), &new_val).await {
+        let namespaced = format!("{}:{}", ns, &key);
+        let coord = {
+            let mut map = self.lwt_coordinators.lock().await;
+            map.entry(namespaced)
+                .or_insert_with(|| Arc::new(lwt::Coordinator::new(3)))
+                .clone()
+        };
+        if coord
+            .compare_and_set(expected_val.as_deref(), &new_val)
+            .await
+        {
             self.insert_ns_ts(ns, key, value, ts).await;
             true
         } else {
@@ -206,6 +230,13 @@ impl Database {
     pub async fn delete_ns(&self, ns: &str, key: &str) {
         let namespaced = format!("{}:{}", ns, key);
         self.memtable.delete(&namespaced).await;
+        let coord = {
+            let map = self.lwt_coordinators.lock().await;
+            map.get(&namespaced).cloned()
+        };
+        if let Some(coord) = coord {
+            coord.set_committed(None).await;
+        }
     }
 
     /// Scan all key/value pairs for a namespace, stripping the prefix.
