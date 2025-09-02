@@ -94,6 +94,14 @@ AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
 `AWS_REGION` controls the region (default `us-east-1`).
 
 
+## AWS Deployment with Terraform
+
+A reusable Terraform module for deploying `cass` to an Amazon EKS cluster with
+S3 storage is available under `terraform/modules/cass-eks`. The module provisions
+an EKS cluster, an S3 bucket, and a Kubernetes deployment configured to use S3 as
+the storage backend. See the module's README for usage instructions.
+
+
 ## Example / Docker Compose Cluster
 
 With the server running you can insert and query data using gRPC. The provided `docker-compose.yml` starts a five-node cluster using local
