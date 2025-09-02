@@ -13,6 +13,7 @@ Toy/experimental clone of [Apache Cassandra](https://en.wikipedia.org/wiki/Apach
 - **Scalability:** Horizontally scalable
 - **Gossip:** Cluster membership and liveness detection via gossip with health checks
 - **Consistency:** Tunable read replica count with hinted handoff and read repair
+- **Lightweight Transactions:** Paxos-based compare-and-set conditional updates for linearizable row-level operations
 
 ## Design tradeoffs
 
@@ -31,6 +32,7 @@ The built-in SQL engine understands a small subset of SQL:
 - `SELECT` with optional `WHERE` filters, `ORDER BY`, `GROUP BY`,
   `DISTINCT`, simple aggregate functions (`COUNT`, `MIN`, `MAX`, `SUM`)
   and `LIMIT`
+- Conditional writes via `INSERT ... IF NOT EXISTS` and `UPDATE ... IF column=value`
 - Table management statements such as `CREATE TABLE`, `DROP TABLE`,
   `TRUNCATE TABLE`, and `SHOW TABLES`
 
