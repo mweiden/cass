@@ -35,6 +35,8 @@ pub enum QueryOutput {
     None,
 }
 
+/// Split the leading 8-byte timestamp from a buffer, returning the timestamp and
+/// the remaining slice.
 fn split_ts(bytes: &[u8]) -> (u64, &[u8]) {
     if bytes.len() < 8 {
         return (0, bytes);
@@ -914,6 +916,8 @@ fn cast_simple(val: &str, data_type: &DataType) -> Option<String> {
 mod tests {
     use sqlparser::ast::{DataType, Expr, Ident, ObjectName, ObjectNamePart, TableFactor, Value};
 
+    /// `split_ts` returns zero and the original slice when the buffer is shorter
+    /// than eight bytes.
     #[test]
     fn split_ts_handles_short_buffers() {
         let buf = [1u8, 2u8, 3u8];
@@ -922,6 +926,7 @@ mod tests {
         assert_eq!(rest, &buf);
     }
 
+    /// `split_ts` extracts the timestamp and remaining bytes from the buffer.
     #[test]
     fn split_ts_parses_timestamp_and_rest() {
         let ts_val: u64 = 42;

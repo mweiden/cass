@@ -12,6 +12,7 @@ Toy/experimental clone of [Apache Cassandra](https://en.wikipedia.org/wiki/Apach
 - **Deployment:** Dockerfile and docker-compose for containerized deployment and local testing
 - **Scalability:** Horizontally scalable
 - **Gossip:** Cluster membership and liveness detection via gossip with health checks
+- **Consistency:** Tunable read replica count with hinted handoff and read repair
 
 ## Design tradeoffs
 
@@ -53,6 +54,7 @@ CREATE TABLE t (
 ```bash
 cargo test            # run unit tests
 cargo run -- server  # start the gRPC server on port 8080
+cargo run -- server --read-consistency 1  # only one healthy replica required for reads
 ```
 
 ### Contributing

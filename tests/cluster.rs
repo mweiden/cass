@@ -10,7 +10,7 @@ async fn build_cluster(peers: Vec<String>, vnodes: usize, rf: usize, self_addr: 
     let dir = tempdir().unwrap();
     let storage = Arc::new(LocalStorage::new(dir.path()));
     let db = Arc::new(Database::new(storage, "wal.log").await.unwrap());
-    Cluster::new(db, self_addr.to_string(), peers, vnodes, rf)
+    Cluster::new(db, self_addr.to_string(), peers, vnodes, rf, rf)
 }
 
 #[tokio::test]
@@ -89,7 +89,7 @@ async fn flush_all_flushes_memtable() {
     let storage = Arc::new(LocalStorage::new(dir.path()));
     let db = Arc::new(Database::new(storage, "wal.log").await.unwrap());
     let self_addr = "http://127.0.0.1:5000".to_string();
-    let cluster = Cluster::new(db.clone(), self_addr, Vec::new(), 1, 1);
+    let cluster = Cluster::new(db.clone(), self_addr, Vec::new(), 1, 1, 1);
     db.insert("k".into(), b"v".to_vec()).await;
     assert_eq!(db.memtable().len().await, 1);
     cluster.flush_all().await.unwrap();
