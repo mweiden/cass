@@ -15,6 +15,7 @@ pub mod rpc {
 
 use base64::Engine;
 pub use query::SqlEngine;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,6 +28,7 @@ pub struct Database {
     max_memtable_size: usize,
     next_id: std::sync::atomic::AtomicUsize,
     wal: wal::Wal,
+    lwt_coordinators: tokio::sync::Mutex<HashMap<String, Arc<lwt::Coordinator>>>,
 }
 
 impl Database {
@@ -77,6 +79,7 @@ impl Database {
             max_memtable_size: 1024,
             next_id: std::sync::atomic::AtomicUsize::new(next_id),
             wal,
+            lwt_coordinators: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -187,8 +190,17 @@ impl Database {
         let expected_val = expected
             .as_ref()
             .map(|e| base64::engine::general_purpose::STANDARD.encode(e));
-        let lwt = lwt::Coordinator::new(3);
-        if lwt.compare_and_set(expected_val.as_deref(), &new_val).await {
+        let namespaced = format!("{}:{}", ns, &key);
+        let coord = {
+            let mut map = self.lwt_coordinators.lock().await;
+            map.entry(namespaced)
+                .or_insert_with(|| Arc::new(lwt::Coordinator::new(3)))
+                .clone()
+        };
+        if coord
+            .compare_and_set(expected_val.as_deref(), &new_val)
+            .await
+        {
             self.insert_ns_ts(ns, key, value, ts).await;
             true
         } else {

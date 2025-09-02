@@ -253,10 +253,9 @@ impl SqlEngine {
             let (key, data) = build_row(&schema, &cols, &row).ok_or(QueryError::Unsupported)?;
             if let Some(cond) = &if_clause {
                 if cond.eq_ignore_ascii_case("NOT EXISTS") {
-                    if db.get_ns(&ns, &key).await.is_none() {
-                        if db.cas_ns_ts(&ns, key, None, data, ts).await {
-                            count += 1;
-                        }
+                    let current = db.get_ns(&ns, &key).await;
+                    if current.is_none() && db.cas_ns_ts(&ns, key, current, data, ts).await {
+                        count += 1;
                     }
                 } else {
                     return Err(QueryError::Unsupported);
@@ -322,7 +321,7 @@ impl SqlEngine {
             if current.get(&col) != Some(&val) {
                 return Ok(0);
             }
-            if db.cas_ns_ts(&ns, key, None, data, ts).await {
+            if db.cas_ns_ts(&ns, key, Some(bytes), data, ts).await {
                 Ok(1)
             } else {
                 Ok(0)
