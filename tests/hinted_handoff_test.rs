@@ -6,6 +6,7 @@ use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
 mod common;
 use common::CassProcess;
 
+/// Hints are replayed once a previously failed node rejoins the cluster.
 #[tokio::test]
 async fn hinted_handoff_replays_when_node_recovers() {
     let base1 = "http://127.0.0.1:18111";

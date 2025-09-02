@@ -6,6 +6,7 @@ use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
 mod common;
 use common::CassProcess;
 
+/// A read triggers repair of replicas with stale data.
 #[tokio::test]
 async fn read_repairs_stale_replicas() {
     let base1 = "http://127.0.0.1:18121";

@@ -7,6 +7,7 @@ use serde_json::Value;
 mod common;
 use common::CassProcess;
 
+/// The health endpoint reports the node's tokens.
 #[tokio::test]
 async fn health_endpoint_reports_tokens() {
     let base = "http://127.0.0.1:18085";
@@ -42,6 +43,7 @@ async fn health_endpoint_reports_tokens() {
     assert_eq!(v["tokens"].as_array().unwrap().len(), 4);
 }
 
+/// Queries fail when the required number of healthy replicas is not met.
 #[tokio::test]
 async fn errors_when_not_enough_healthy_replicas() {
     let base1 = "http://127.0.0.1:18091";
@@ -115,6 +117,7 @@ async fn errors_when_not_enough_healthy_replicas() {
     child1.kill();
 }
 
+/// Lowering the read consistency allows queries to succeed with fewer healthy replicas.
 #[tokio::test]
 async fn read_succeeds_with_lower_consistency() {
     let base1 = "http://127.0.0.1:18101";

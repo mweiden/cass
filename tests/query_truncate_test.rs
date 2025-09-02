@@ -2,6 +2,7 @@ use cass::storage::{Storage, local::LocalStorage};
 use cass::{Database, SqlEngine, query::QueryOutput};
 use std::sync::Arc;
 
+/// `TRUNCATE TABLE` deletes all rows while preserving the table definition.
 #[tokio::test]
 async fn truncate_table_removes_rows() {
     let tmp = tempfile::tempdir().unwrap();

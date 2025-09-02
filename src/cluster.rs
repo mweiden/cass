@@ -532,6 +532,7 @@ impl Cluster {
         join_all(tasks).await
     }
 
+    /// Record failed writes as hints for later delivery.
     async fn store_hints(&self, nodes: &[String], sql: String, ts: u64) {
         if nodes.is_empty() {
             return;
@@ -542,6 +543,7 @@ impl Cluster {
         }
     }
 
+    /// Attempt to deliver any stored hints to `node`.
     async fn apply_hints(&self, node: &str) {
         let hints = {
             let mut map = self.hints.write().await;
@@ -561,6 +563,8 @@ impl Cluster {
         }
     }
 
+    /// Reconcile divergent replicas by sending the freshest values to healthy nodes
+    /// and hinting any that are down.
     async fn read_repair(
         &self,
         meta: &QueryMeta,
@@ -616,6 +620,7 @@ impl Cluster {
         }
     }
 
+    /// Retrieve the [`TableSchema`] for `table` from the internal schema store.
     async fn get_schema(db: &Database, table: &str) -> Option<TableSchema> {
         db.get_ns("_schemas", table).await.and_then(|v| {
             let (_, data) = Self::split_ts(&v);
@@ -623,6 +628,8 @@ impl Cluster {
         })
     }
 
+    /// Split the leading 8-byte timestamp from a buffer, returning the timestamp
+    /// and the remaining bytes.
     fn split_ts(bytes: &[u8]) -> (u64, &[u8]) {
         if bytes.len() < 8 {
             return (0, bytes);
