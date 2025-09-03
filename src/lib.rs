@@ -180,24 +180,28 @@ impl Database {
         value: Vec<u8>,
         ts: u64,
     ) -> bool {
-        // If an expected value is provided, ensure the current stored value
-        // matches it. When `expected` is `None` the caller has already
-        // verified any preconditions (e.g. `IF NOT EXISTS`) and we simply
-        // apply the mutation.
-        if let Some(exp) = expected {
-            match self.get_ns(ns, &key).await {
-                Some(cur) => {
-                    let cur_val = if cur.len() > 8 { &cur[8..] } else { &[][..] };
-                    if cur_val != exp.as_slice() {
-                        return false;
-                    }
-                }
-                None => return false,
-            }
-        }
+        use base64::engine::general_purpose::STANDARD;
 
-        self.insert_ns_ts(ns, key, value, ts).await;
-        true
+        let namespaced = format!("{}:{}", ns, key);
+        let mut data = ts.to_be_bytes().to_vec();
+        data.extend_from_slice(&value);
+        if self
+            .memtable
+            .compare_and_set(&namespaced, expected, data.clone())
+            .await
+        {
+            let mut rec = namespaced.clone().into_bytes();
+            rec.push(b'\t');
+            let enc = STANDARD.encode(&data);
+            rec.extend_from_slice(enc.as_bytes());
+            let _ = self.wal.append(&rec).await;
+            if self.memtable.len().await >= self.max_memtable_size {
+                let _ = self.flush().await;
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Retrieve a value from the given namespace.
