@@ -45,6 +45,18 @@ fn split_ts(bytes: &[u8]) -> (u64, &[u8]) {
     (ts, &bytes[8..])
 }
 
+/// Split a trailing `IF` clause from the provided SQL if present.
+fn split_if_clause(sql: &str) -> (String, Option<String>) {
+    let upper = sql.to_ascii_uppercase();
+    if let Some(pos) = upper.rfind(" IF ") {
+        let base = sql[..pos].trim().to_string();
+        let cond = sql[pos + 4..].trim().to_string();
+        (base, Some(cond))
+    } else {
+        (sql.to_string(), None)
+    }
+}
+
 /// Errors that can occur when parsing or executing a query.
 #[derive(thiserror::Error, Debug)]
 pub enum QueryError {
@@ -95,12 +107,21 @@ impl SqlEngine {
         ts: u64,
         meta: bool,
     ) -> Result<QueryOutput, QueryError> {
-        let stmts = self.parse(sql)?;
-        let mut result = QueryOutput::None;
-        for stmt in stmts {
-            result = self.execute_stmt(db, stmt, ts, meta).await?;
+        let (base_sql, if_clause) = split_if_clause(sql);
+        let stmts = self.parse(&base_sql)?;
+        if stmts.len() == 1 {
+            self.execute_stmt(db, stmts.into_iter().next().unwrap(), ts, meta, if_clause)
+                .await
+        } else {
+            if if_clause.is_some() {
+                return Err(QueryError::Unsupported);
+            }
+            let mut result = QueryOutput::None;
+            for stmt in stmts {
+                result = self.execute_stmt(db, stmt, ts, meta, None).await?;
+            }
+            Ok(result)
         }
-        Ok(result)
     }
 
     /// Execute a single parsed SQL [`Statement`].
@@ -110,10 +131,11 @@ impl SqlEngine {
         stmt: Statement,
         ts: u64,
         meta: bool,
+        if_clause: Option<String>,
     ) -> Result<QueryOutput, QueryError> {
         match stmt {
             Statement::Insert(insert) => {
-                let count = self.exec_insert(db, insert, ts).await?;
+                let count = self.exec_insert(db, insert, ts, if_clause).await?;
                 Ok(QueryOutput::Mutation {
                     op: "INSERT".to_string(),
                     unit: "row".to_string(),
@@ -127,7 +149,7 @@ impl SqlEngine {
                 ..
             } => {
                 let count = self
-                    .exec_update(db, table, assignments, selection, ts)
+                    .exec_update(db, table, assignments, selection, ts, if_clause)
                     .await?;
                 Ok(QueryOutput::Mutation {
                     op: "UPDATE".to_string(),
@@ -201,6 +223,7 @@ impl SqlEngine {
         db: &Database,
         insert: Insert,
         ts: u64,
+        if_clause: Option<String>,
     ) -> Result<usize, QueryError> {
         let ns = match &insert.table {
             sqlparser::ast::TableObject::TableName(name) => {
@@ -228,8 +251,20 @@ impl SqlEngine {
         let mut count = 0;
         for row in values.rows {
             let (key, data) = build_row(&schema, &cols, &row).ok_or(QueryError::Unsupported)?;
-            db.insert_ns_ts(&ns, key, data, ts).await;
-            count += 1;
+            if let Some(cond) = &if_clause {
+                if cond.eq_ignore_ascii_case("NOT EXISTS") {
+                    if db.get_ns(&ns, &key).await.is_none() {
+                        if db.cas_ns_ts(&ns, key, None, data, ts).await {
+                            count += 1;
+                        }
+                    }
+                } else {
+                    return Err(QueryError::Unsupported);
+                }
+            } else {
+                db.insert_ns_ts(&ns, key, data, ts).await;
+                count += 1;
+            }
         }
         Ok(count)
     }
@@ -242,6 +277,7 @@ impl SqlEngine {
         assignments: Vec<Assignment>,
         selection: Option<Expr>,
         ts: u64,
+        if_clause: Option<String>,
     ) -> Result<usize, QueryError> {
         let ns = table_factor_to_ns(&table.relation).ok_or(QueryError::Unsupported)?;
         let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
@@ -249,8 +285,9 @@ impl SqlEngine {
         let cond = selection.ok_or(QueryError::Unsupported)?;
         let cond_map = where_to_map(&cond);
         let key = build_single_key(&schema, &cond_map).ok_or(QueryError::Unsupported)?;
-        let mut row_map = if let Some(bytes) = db.get_ns(&ns, &key).await {
-            let (_, data) = split_ts(&bytes);
+        let existing = db.get_ns(&ns, &key).await;
+        let mut row_map = if let Some(bytes) = &existing {
+            let (_, data) = split_ts(bytes);
             decode_row(data)
         } else {
             BTreeMap::new()
@@ -269,8 +306,31 @@ impl SqlEngine {
             }
         }
         let data = encode_row(&row_map);
-        db.insert_ns_ts(&ns, key, data, ts).await;
-        Ok(1)
+        if let Some(cond) = if_clause {
+            let parts: Vec<&str> = cond.split('=').collect();
+            if parts.len() != 2 {
+                return Err(QueryError::Unsupported);
+            }
+            let col = parts[0].trim().to_lowercase();
+            let val = parts[1].trim().trim_matches('\'').to_string();
+            let bytes = match existing {
+                Some(b) => b,
+                None => return Ok(0),
+            };
+            let (_, cur_data) = split_ts(&bytes);
+            let current = decode_row(cur_data);
+            if current.get(&col) != Some(&val) {
+                return Ok(0);
+            }
+            if db.cas_ns_ts(&ns, key, None, data, ts).await {
+                Ok(1)
+            } else {
+                Ok(0)
+            }
+        } else {
+            db.insert_ns_ts(&ns, key, data, ts).await;
+            Ok(1)
+        }
     }
 
     /// Handle a `DELETE` statement for a single key.

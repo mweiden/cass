@@ -9,6 +9,10 @@ service Cass {
   rpc FlushInternal (FlushRequest) returns (FlushResponse);
   rpc Panic (PanicRequest) returns (PanicResponse);
   rpc Health (HealthRequest) returns (HealthResponse);
+  rpc LwtPrepare (LwtPrepareRequest) returns (LwtPrepareResponse);
+  rpc LwtPropose (LwtProposeRequest) returns (LwtProposeResponse);
+  rpc LwtCommit (LwtCommitRequest) returns (LwtCommitResponse);
+  rpc LwtRead (LwtReadRequest) returns (LwtReadResponse);
 }
 
 message QueryRequest {
@@ -60,3 +64,21 @@ message PanicResponse { bool healthy = 1; }
 
 message HealthRequest {}
 message HealthResponse { string info = 1; }
+
+message LwtPrepareRequest { string key = 1; uint64 ballot = 2; }
+message LwtPrepareResponse {
+  bool ok = 1;
+  uint64 promised = 2;
+  uint64 accepted_ballot = 3;
+  string accepted_value = 4;
+  string committed_value = 5;
+}
+
+message LwtProposeRequest { string key = 1; uint64 ballot = 2; string value = 3; }
+message LwtProposeResponse { bool ok = 1; uint64 promised = 2; }
+
+message LwtCommitRequest { string key = 1; string value = 2; }
+message LwtCommitResponse {}
+
+message LwtReadRequest { string key = 1; }
+message LwtReadResponse { string value = 1; }

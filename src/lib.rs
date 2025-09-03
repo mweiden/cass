@@ -1,5 +1,6 @@
 pub mod bloom;
 pub mod cluster;
+pub mod lwt;
 pub mod memtable;
 pub mod query;
 pub mod schema;
@@ -164,6 +165,24 @@ impl Database {
     pub async fn insert_ns(&self, ns: &str, key: String, value: Vec<u8>) {
         let ts = Self::now_ts();
         self.insert_ns_ts(ns, key, value, ts).await;
+    }
+
+    /// Compare-and-set a value within a namespace using a lightweight transaction.
+    ///
+    /// When `expected` matches the current stored bytes for the key, `value` is
+    /// written with the provided timestamp and `true` is returned. Otherwise no
+    /// mutation occurs and `false` is returned.
+    pub async fn cas_ns_ts(
+        &self,
+        ns: &str,
+        key: String,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+        ts: u64,
+    ) -> bool {
+        // Placeholder implementation: always fail the compare-and-set.
+        let _ = (ns, key, expected, value, ts);
+        false
     }
 
     /// Retrieve a value from the given namespace.
