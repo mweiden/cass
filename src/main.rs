@@ -9,8 +9,11 @@ use std::{
 use cass::{
     Database,
     cluster::Cluster,
+    lwt::ReplicaStore,
     rpc::{
-        FlushRequest, FlushResponse, HealthRequest, HealthResponse, PanicRequest, PanicResponse,
+        FlushRequest, FlushResponse, HealthRequest, HealthResponse, LwtCommitRequest,
+        LwtCommitResponse, LwtPrepareRequest, LwtPrepareResponse, LwtProposeRequest,
+        LwtProposeResponse, LwtReadRequest, LwtReadResponse, PanicRequest, PanicResponse,
         QueryRequest, QueryResponse, Row as RpcRow,
         cass_client::CassClient,
         cass_server::{Cass, CassServer},
@@ -137,6 +140,7 @@ enum StorageKind {
 #[derive(Clone)]
 struct CassService {
     cluster: Arc<Cluster>,
+    store: Arc<ReplicaStore>,
 }
 
 #[tonic::async_trait]
@@ -194,6 +198,67 @@ impl Cass for CassService {
         Ok(Response::new(HealthResponse {
             info: self.cluster.health_info().to_string(),
         }))
+    }
+
+    async fn lwt_prepare(
+        &self,
+        req: Request<LwtPrepareRequest>,
+    ) -> Result<Response<LwtPrepareResponse>, Status> {
+        let r = req.into_inner();
+        match self.store.prepare(&r.key, r.ballot).await {
+            Ok((accepted, committed)) => {
+                let (ab, av) = accepted.unwrap_or((0, String::new()));
+                Ok(Response::new(LwtPrepareResponse {
+                    ok: true,
+                    promised: r.ballot,
+                    accepted_ballot: ab,
+                    accepted_value: av,
+                    committed_value: committed.unwrap_or_default(),
+                }))
+            }
+            Err(promised) => Ok(Response::new(LwtPrepareResponse {
+                ok: false,
+                promised,
+                accepted_ballot: 0,
+                accepted_value: String::new(),
+                committed_value: String::new(),
+            })),
+        }
+    }
+
+    async fn lwt_propose(
+        &self,
+        req: Request<LwtProposeRequest>,
+    ) -> Result<Response<LwtProposeResponse>, Status> {
+        let r = req.into_inner();
+        match self.store.accept(&r.key, r.ballot, &r.value).await {
+            Ok(()) => Ok(Response::new(LwtProposeResponse {
+                ok: true,
+                promised: r.ballot,
+            })),
+            Err(promised) => Ok(Response::new(LwtProposeResponse {
+                ok: false,
+                promised,
+            })),
+        }
+    }
+
+    async fn lwt_commit(
+        &self,
+        req: Request<LwtCommitRequest>,
+    ) -> Result<Response<LwtCommitResponse>, Status> {
+        let r = req.into_inner();
+        self.store.commit(&r.key, &r.value).await;
+        Ok(Response::new(LwtCommitResponse {}))
+    }
+
+    async fn lwt_read(
+        &self,
+        req: Request<LwtReadRequest>,
+    ) -> Result<Response<LwtReadResponse>, Status> {
+        let r = req.into_inner();
+        let val = self.store.read(&r.key).await.unwrap_or_default();
+        Ok(Response::new(LwtReadResponse { value: val }))
     }
 }
 
@@ -253,8 +318,10 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
     })
     .ok();
 
+    let store = Arc::new(ReplicaStore::default());
     let svc = CassService {
         cluster: cluster.clone(),
+        store: store.clone(),
     };
     let url = Url::parse(&args.node_addr)?;
     let port = url.port().unwrap_or(80);
