@@ -45,6 +45,34 @@ impl MemTable {
         self.data.read().await.len()
     }
 
+    /// Atomically compare the existing value for `key` with `expected` and set
+    /// it to `value` if they match.
+    pub async fn compare_and_set(
+        &self,
+        key: &str,
+        expected: Option<Vec<u8>>,
+        value: Vec<u8>,
+    ) -> bool {
+        let mut map = self.data.write().await;
+        match expected {
+            Some(exp) => match map.get(key) {
+                Some(cur) if *cur == exp => {
+                    map.insert(key.to_string(), value);
+                    true
+                }
+                _ => false,
+            },
+            None => {
+                if map.contains_key(key) {
+                    false
+                } else {
+                    map.insert(key.to_string(), value);
+                    true
+                }
+            }
+        }
+    }
+
     /// Remove all entries from the table.
     pub async fn clear(&self) {
         self.data.write().await.clear();

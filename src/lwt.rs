@@ -128,9 +128,13 @@ impl Coordinator {
             }
         }
         let mut proposal = new_value.to_string();
+        let mut highest_ballot = 0u64;
         for (accepted, _) in &promises {
-            if let Some((_b, v)) = accepted {
-                proposal = v.clone();
+            if let Some((b, v)) = accepted {
+                if *b > highest_ballot {
+                    highest_ballot = *b;
+                    proposal = v.clone();
+                }
             }
         }
 

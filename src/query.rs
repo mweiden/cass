@@ -322,7 +322,7 @@ impl SqlEngine {
             if current.get(&col) != Some(&val) {
                 return Ok(0);
             }
-            if db.cas_ns_ts(&ns, key, None, data, ts).await {
+            if db.cas_ns_ts(&ns, key, Some(bytes), data, ts).await {
                 Ok(1)
             } else {
                 Ok(0)

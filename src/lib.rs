@@ -180,9 +180,28 @@ impl Database {
         value: Vec<u8>,
         ts: u64,
     ) -> bool {
-        // Placeholder implementation: always fail the compare-and-set.
-        let _ = (ns, key, expected, value, ts);
-        false
+        use base64::engine::general_purpose::STANDARD;
+
+        let namespaced = format!("{}:{}", ns, key);
+        let mut data = ts.to_be_bytes().to_vec();
+        data.extend_from_slice(&value);
+        if self
+            .memtable
+            .compare_and_set(&namespaced, expected, data.clone())
+            .await
+        {
+            let mut rec = namespaced.clone().into_bytes();
+            rec.push(b'\t');
+            let enc = STANDARD.encode(&data);
+            rec.extend_from_slice(enc.as_bytes());
+            let _ = self.wal.append(&rec).await;
+            if self.memtable.len().await >= self.max_memtable_size {
+                let _ = self.flush().await;
+            }
+            true
+        } else {
+            false
+        }
     }
 
     /// Retrieve a value from the given namespace.
