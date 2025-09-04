@@ -136,6 +136,13 @@ enum StorageKind {
     S3,
 }
 
+#[derive(Copy, Clone, ValueEnum)]
+enum Consistency {
+    One,
+    Quorum,
+    All,
+}
+
 #[derive(Clone)]
 struct CassService {
     cluster: Arc<Cluster>,
@@ -286,7 +293,7 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
         }
     };
     let db = Arc::new(Database::new(storage, "wal.log").await?);
-    let cluster = Arc::new(Cluster::new(
+    let cluster = Arc::new(Cluster::new_with_consistency(
         db.clone(),
         args.node_addr.clone(),
         args.peer.clone(),
