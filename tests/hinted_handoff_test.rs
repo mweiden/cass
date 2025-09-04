@@ -25,7 +25,7 @@ async fn hinted_handoff_replays_when_node_recovers() {
         "--rf",
         "2",
         "--read-consistency",
-        "1",
+        "one",
     ]);
     let mut child2 = CassProcess::spawn([
         "server",
@@ -38,7 +38,7 @@ async fn hinted_handoff_replays_when_node_recovers() {
         "--rf",
         "2",
         "--read-consistency",
-        "1",
+        "one",
     ]);
 
     for _ in 0..20 {
@@ -76,7 +76,7 @@ async fn hinted_handoff_replays_when_node_recovers() {
         "--rf",
         "2",
         "--read-consistency",
-        "1",
+        "one",
     ]);
 
     for _ in 0..20 {

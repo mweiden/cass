@@ -126,8 +126,9 @@ struct ServerArgs {
     rf: usize,
     #[arg(long, default_value_t = 8)]
     vnodes: usize,
-    #[arg(long)]
-    read_consistency: Option<usize>,
+    /// Server-level read consistency: ONE, QUORUM, ALL
+    #[arg(long, value_enum)]
+    read_consistency: Option<Consistency>,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -299,7 +300,11 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
         args.peer.clone(),
         args.vnodes,
         args.rf,
-        args.read_consistency.unwrap_or(args.rf),
+        match args.read_consistency.unwrap_or(Consistency::Quorum) {
+            Consistency::One => 1,
+            Consistency::Quorum => (args.rf.max(1) / 2 + 1),
+            Consistency::All => args.rf.max(1),
+        },
     ));
 
     tl_metrics::try_init_settings(tl_metrics::GlobalSettings {

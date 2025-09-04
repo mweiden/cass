@@ -22,7 +22,7 @@ async fn lwt_update_on_orders_distributed_all_read_consistency() {
         "--rf",
         "2",
         "--read-consistency",
-        "2",
+        "all",
     ]);
     let _c2 = CassProcess::spawn([
         "server",
@@ -35,7 +35,7 @@ async fn lwt_update_on_orders_distributed_all_read_consistency() {
         "--rf",
         "2",
         "--read-consistency",
-        "2",
+        "all",
     ]);
 
     for _ in 0..40 {

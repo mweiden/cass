@@ -136,7 +136,7 @@ async fn read_succeeds_with_lower_consistency() {
         "--rf",
         "2",
         "--read-consistency",
-        "1",
+        "one",
     ]);
     let mut child2 = CassProcess::spawn([
         "server",
@@ -149,7 +149,7 @@ async fn read_succeeds_with_lower_consistency() {
         "--rf",
         "2",
         "--read-consistency",
-        "1",
+        "one",
     ]);
 
     for _ in 0..20 {

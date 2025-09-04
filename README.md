@@ -87,7 +87,7 @@ Notes:
 ```bash
 cargo test            # run unit tests
 cargo run -- server  # start the gRPC server on port 8080
-cargo run -- server --read-consistency 1  # only one healthy replica required for reads
+cargo run -- server --read-consistency one  # only one healthy replica required for reads
 ```
 
 ### Contributing
@@ -175,6 +175,30 @@ INSERT 1 row
 0 false     2025-08-27
 (1 rows)
 ```
+
+## Consistency, Hinted Handoff, and Read Repair
+
+Cass uses a coordinator-per-request model similar to Cassandra. Each statement
+is routed to the partition's replicas using a Murmur3-based ring. The
+coordinator enforces consistency and repairs divergence opportunistically:
+
+ - Read consistency: configured per server with `--read-consistency {one|quorum|all}`.
+   If there are not enough healthy replicas for the chosen level, the read fails.
+
+- Hinted handoff: if a write targets replicas that are currently unhealthy, the
+  coordinator writes to the healthy replicas and stores a “hint” for each
+  unreachable replica (original SQL and timestamp). When a replica becomes
+  healthy again, the coordinator replays the hints to bring it up to date. Hints
+  are in-memory and best-effort (non-durable across coordinator restarts).
+
+- Read repair: for non-broadcast reads, the coordinator gathers results from
+  healthy replicas, merges by last-write-wins (timestamp), and returns the
+  freshest value. If divergence is detected, it proactively repairs healthy
+  stale replicas by sending the freshest value to them, and records hints for
+  any replicas that are still down.
+
+Tip: you can use `cass panic <node>` to temporarily mark a node as unhealthy and
+observe hinted handoff and subsequent repair behavior when it recovers.
 
 ## Maintenance Commands
 
