@@ -37,6 +37,22 @@ async fn insert_if_not_exists() {
         QueryOutput::Rows(rows) => assert_eq!(rows[0].get("[applied]"), Some(&"false".to_string())),
         _ => panic!("unexpected"),
     }
+
+    // After flushing the memtable, the row only exists on disk. A subsequent
+    // conditional insert should still detect the existing data and refuse to
+    // overwrite it.
+    db.flush().await.unwrap();
+    let res = engine
+        .execute(
+            &db,
+            "INSERT INTO kv (id, val) VALUES ('a','1') IF NOT EXISTS",
+        )
+        .await
+        .unwrap();
+    match res {
+        QueryOutput::Rows(rows) => assert_eq!(rows[0].get("[applied]"), Some(&"false".to_string())),
+        _ => panic!("unexpected"),
+    }
 }
 
 #[tokio::test]
