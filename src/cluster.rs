@@ -104,7 +104,6 @@ pub struct Cluster {
     panic_until: Arc<RwLock<Option<Instant>>>,
     hints: Arc<RwLock<HashMap<String, Vec<(u64, String)>>>>,
     lwt: Arc<RwLock<HashMap<String, PaxosSlot>>>,
-    lwt_consistency: ConsistencyLevel,
 }
 
 struct QueryMeta {
@@ -150,15 +149,7 @@ impl Cluster {
         rf: usize,
         read_consistency: usize,
     ) -> Self {
-        Self::new_with_consistency(
-            db,
-            self_addr,
-            peers,
-            vnodes,
-            rf,
-            read_consistency,
-            ConsistencyLevel::Quorum,
-        )
+        Self::new_with_consistency(db, self_addr, peers, vnodes, rf, read_consistency)
     }
 
     /// Create a cluster with explicit LWT consistency.
@@ -169,7 +160,6 @@ impl Cluster {
         vnodes: usize,
         rf: usize,
         read_consistency: usize,
-        lwt_consistency: ConsistencyLevel,
     ) -> Self {
         peers.push(self_addr.clone());
         let mut ring = BTreeMap::new();
@@ -237,7 +227,6 @@ impl Cluster {
             panic_until,
             hints: Arc::new(RwLock::new(HashMap::new())),
             lwt: Arc::new(RwLock::new(HashMap::new())),
-            lwt_consistency,
         }
     }
 
@@ -572,7 +561,7 @@ impl Cluster {
         let replicas = self.target_replicas(engine, sql, false).await?;
         let healthy = self.healthy_nodes(replicas.clone()).await;
         let rf = self.rf.max(1);
-        let required = self.lwt_consistency.required(rf);
+        let required = ConsistencyLevel::Quorum.required(rf);
         if healthy.len() < required {
             return Err(QueryError::Other("not enough healthy replicas".into()));
         }

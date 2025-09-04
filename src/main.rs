@@ -8,7 +8,7 @@ use std::{
 
 use cass::{
     Database,
-    cluster::{Cluster, ConsistencyLevel as ClLevel},
+    cluster::Cluster,
     rpc::{
         FlushRequest, FlushResponse, HealthRequest, HealthResponse, LwtCommitRequest,
         LwtCommitResponse, LwtPrepareRequest, LwtPrepareResponse, LwtProposeRequest,
@@ -128,9 +128,6 @@ struct ServerArgs {
     vnodes: usize,
     #[arg(long)]
     read_consistency: Option<usize>,
-    /// Server-level consistency for LWT phases: ONE, QUORUM, ALL
-    #[arg(long, value_enum)]
-    lwt_consistency: Option<Consistency>,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -296,11 +293,6 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
         }
     };
     let db = Arc::new(Database::new(storage, "wal.log").await?);
-    let cl = match args.lwt_consistency.unwrap_or(Consistency::Quorum) {
-        Consistency::One => ClLevel::One,
-        Consistency::Quorum => ClLevel::Quorum,
-        Consistency::All => ClLevel::All,
-    };
     let cluster = Arc::new(Cluster::new_with_consistency(
         db.clone(),
         args.node_addr.clone(),
@@ -308,7 +300,6 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
         args.vnodes,
         args.rf,
         args.read_consistency.unwrap_or(args.rf),
-        cl,
     ));
 
     tl_metrics::try_init_settings(tl_metrics::GlobalSettings {
