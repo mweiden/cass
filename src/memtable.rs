@@ -20,6 +20,22 @@ impl MemTable {
         self.data.write().await.insert(key, value);
     }
 
+    /// Insert `key` with `value` only if it does not already exist.
+    ///
+    /// Returns `true` if the value was inserted, `false` if the key was
+    /// already present. This helper enables simple compare-and-set semantics
+    /// for lightweight transactions where we need to ensure a row is only
+    /// written once.
+    pub async fn insert_if_absent(&self, key: String, value: Vec<u8>) -> bool {
+        let mut map = self.data.write().await;
+        if map.contains_key(&key) {
+            false
+        } else {
+            map.insert(key, value);
+            true
+        }
+    }
+
     /// Retrieve the value for `key` if it exists.
     pub async fn get(&self, key: &str) -> Option<Vec<u8>> {
         self.data.read().await.get(key).cloned()

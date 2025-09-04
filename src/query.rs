@@ -35,6 +35,18 @@ pub enum QueryOutput {
     None,
 }
 
+/// Condition for Cassandra-style lightweight transactions.
+///
+/// Currently only supports checking for absence of a row or comparing column
+/// equality. Additional variants can be added in the future as the SQL dialect
+/// expands.
+enum LwtCondition {
+    /// Proceed only if the targeted row does not yet exist.
+    NotExists,
+    /// Proceed only if the specified columns equal the provided values.
+    Equals(BTreeMap<String, String>),
+}
+
 /// Split the leading 8-byte timestamp from a buffer, returning the timestamp and
 /// the remaining slice.
 fn split_ts(bytes: &[u8]) -> (u64, &[u8]) {
@@ -95,10 +107,34 @@ impl SqlEngine {
         ts: u64,
         meta: bool,
     ) -> Result<QueryOutput, QueryError> {
-        let stmts = self.parse(sql)?;
+        let mut lwt_cond = None;
+        let mut base_sql = sql.to_string();
+        let lower = sql.to_lowercase();
+        if let Some(idx) = lower.rfind(" if ") {
+            let cond_str = sql[idx + 4..].trim();
+            base_sql = sql[..idx].trim().to_string();
+            if cond_str.eq_ignore_ascii_case("not exists") {
+                lwt_cond = Some(LwtCondition::NotExists);
+            } else {
+                let cond_sql = format!("SELECT * FROM tmp WHERE {}", cond_str);
+                if let Ok(mut stmts) = Parser::parse_sql(&self.dialect, &cond_sql) {
+                    if let Some(Statement::Query(q)) = stmts.pop() {
+                        if let SetExpr::Select(select) = *q.body {
+                            if let Some(expr) = select.selection {
+                                let map = where_to_map(&expr);
+                                lwt_cond = Some(LwtCondition::Equals(map));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let stmts = self.parse(&base_sql)?;
         let mut result = QueryOutput::None;
         for stmt in stmts {
-            result = self.execute_stmt(db, stmt, ts, meta).await?;
+            result = self
+                .execute_stmt(db, stmt, ts, meta, lwt_cond.as_ref())
+                .await?;
         }
         Ok(result)
     }
@@ -110,30 +146,18 @@ impl SqlEngine {
         stmt: Statement,
         ts: u64,
         meta: bool,
+        cond: Option<&LwtCondition>,
     ) -> Result<QueryOutput, QueryError> {
         match stmt {
-            Statement::Insert(insert) => {
-                let count = self.exec_insert(db, insert, ts).await?;
-                Ok(QueryOutput::Mutation {
-                    op: "INSERT".to_string(),
-                    unit: "row".to_string(),
-                    count,
-                })
-            }
+            Statement::Insert(insert) => self.exec_insert(db, insert, ts, cond).await,
             Statement::Update {
                 table,
                 assignments,
                 selection,
                 ..
             } => {
-                let count = self
-                    .exec_update(db, table, assignments, selection, ts)
-                    .await?;
-                Ok(QueryOutput::Mutation {
-                    op: "UPDATE".to_string(),
-                    unit: "row".to_string(),
-                    count,
-                })
+                self.exec_update(db, table, assignments, selection, ts, cond)
+                    .await
             }
             Statement::Delete(delete) => {
                 let count = self.exec_delete(db, delete, ts).await?;
@@ -201,7 +225,8 @@ impl SqlEngine {
         db: &Database,
         insert: Insert,
         ts: u64,
-    ) -> Result<usize, QueryError> {
+        cond: Option<&LwtCondition>,
+    ) -> Result<QueryOutput, QueryError> {
         let ns = match &insert.table {
             sqlparser::ast::TableObject::TableName(name) => {
                 object_name_to_ns(name).ok_or(QueryError::Unsupported)?
@@ -225,13 +250,29 @@ impl SqlEngine {
             schema.columns.clone()
         };
 
-        let mut count = 0;
-        for row in values.rows {
-            let (key, data) = build_row(&schema, &cols, &row).ok_or(QueryError::Unsupported)?;
-            db.insert_ns_ts(&ns, key, data, ts).await;
-            count += 1;
+        if let Some(LwtCondition::NotExists) = cond {
+            if values.rows.len() != 1 {
+                return Err(QueryError::Unsupported);
+            }
+            let (key, data) =
+                build_row(&schema, &cols, &values.rows[0]).ok_or(QueryError::Unsupported)?;
+            let applied = db.insert_ns_if_absent_ts(&ns, key, data, ts).await;
+            let mut row = BTreeMap::new();
+            row.insert("[applied]".to_string(), applied.to_string());
+            Ok(QueryOutput::Rows(vec![row]))
+        } else {
+            let mut count = 0;
+            for row in values.rows {
+                let (key, data) = build_row(&schema, &cols, &row).ok_or(QueryError::Unsupported)?;
+                db.insert_ns_ts(&ns, key, data, ts).await;
+                count += 1;
+            }
+            Ok(QueryOutput::Mutation {
+                op: "INSERT".to_string(),
+                unit: "row".to_string(),
+                count,
+            })
         }
-        Ok(count)
     }
 
     /// Handle an `UPDATE` statement that sets the value for a single key.
@@ -242,12 +283,13 @@ impl SqlEngine {
         assignments: Vec<Assignment>,
         selection: Option<Expr>,
         ts: u64,
-    ) -> Result<usize, QueryError> {
+        cond: Option<&LwtCondition>,
+    ) -> Result<QueryOutput, QueryError> {
         let ns = table_factor_to_ns(&table.relation).ok_or(QueryError::Unsupported)?;
         let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
-        // schema-aware path
-        let cond = selection.ok_or(QueryError::Unsupported)?;
-        let cond_map = where_to_map(&cond);
+        // schema-aware path using the WHERE clause for the key
+        let where_expr = selection.ok_or(QueryError::Unsupported)?;
+        let cond_map = where_to_map(&where_expr);
         let key = build_single_key(&schema, &cond_map).ok_or(QueryError::Unsupported)?;
         let mut row_map = if let Some(bytes) = db.get_ns(&ns, &key).await {
             let (_, data) = split_ts(&bytes);
@@ -255,6 +297,32 @@ impl SqlEngine {
         } else {
             BTreeMap::new()
         };
+        if let Some(lwt) = cond {
+            match lwt {
+                LwtCondition::NotExists => {
+                    if !row_map.is_empty() {
+                        let mut row = BTreeMap::new();
+                        row.insert("[applied]".to_string(), "false".to_string());
+                        return Ok(QueryOutput::Rows(vec![row]));
+                    }
+                }
+                LwtCondition::Equals(expected) => {
+                    let success = expected
+                        .iter()
+                        .all(|(k, v)| row_map.get(k).map(|val| val == v).unwrap_or(false));
+                    if !success {
+                        let mut row = BTreeMap::new();
+                        row.insert("[applied]".to_string(), "false".to_string());
+                        for (k, _) in expected.iter() {
+                            if let Some(val) = row_map.get(k) {
+                                row.insert(k.clone(), val.clone());
+                            }
+                        }
+                        return Ok(QueryOutput::Rows(vec![row]));
+                    }
+                }
+            }
+        }
         for assign in assignments {
             if let AssignmentTarget::ColumnName(name) = assign.target {
                 if let Some(id) = name.0.first().and_then(|p| p.as_ident()) {
@@ -270,7 +338,17 @@ impl SqlEngine {
         }
         let data = encode_row(&row_map);
         db.insert_ns_ts(&ns, key, data, ts).await;
-        Ok(1)
+        if cond.is_some() {
+            let mut row = BTreeMap::new();
+            row.insert("[applied]".to_string(), "true".to_string());
+            Ok(QueryOutput::Rows(vec![row]))
+        } else {
+            Ok(QueryOutput::Mutation {
+                op: "UPDATE".to_string(),
+                unit: "row".to_string(),
+                count: 1,
+            })
+        }
     }
 
     /// Handle a `DELETE` statement for a single key.

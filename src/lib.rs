@@ -160,6 +160,24 @@ impl Database {
         self.insert_ts(namespaced, value, ts).await;
     }
 
+    /// Insert a key/value pair into the provided namespace with an explicit
+    /// timestamp only if the key does not already exist.
+    ///
+    /// Returns `true` if the key was absent and has been inserted. If the key
+    /// already exists, no mutation occurs and `false` is returned.
+    pub async fn insert_ns_if_absent_ts(
+        &self,
+        ns: &str,
+        key: String,
+        value: Vec<u8>,
+        ts: u64,
+    ) -> bool {
+        let namespaced = format!("{}:{}", ns, key);
+        let mut data = ts.to_be_bytes().to_vec();
+        data.extend_from_slice(&value);
+        self.memtable.insert_if_absent(namespaced, data).await
+    }
+
     /// Insert a key/value pair into the provided namespace using the current time.
     pub async fn insert_ns(&self, ns: &str, key: String, value: Vec<u8>) {
         let ts = Self::now_ts();

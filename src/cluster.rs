@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    convert::TryInto,
     io::Cursor,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -98,6 +99,7 @@ pub struct Cluster {
     health: Arc<RwLock<HashMap<String, Instant>>>,
     panic_until: Arc<RwLock<Option<Instant>>>,
     hints: Arc<RwLock<HashMap<String, Vec<(u64, String)>>>>,
+    lwt: Arc<RwLock<HashMap<String, PaxosSlot>>>,
 }
 
 struct QueryMeta {
@@ -106,6 +108,12 @@ struct QueryMeta {
     is_count: bool,
     first_stmt: Option<Statement>,
     ns: Option<String>,
+}
+
+struct PaxosSlot {
+    promised: u64,
+    accepted_ballot: u64,
+    accepted_value: Vec<u8>,
 }
 
 impl Cluster {
@@ -175,6 +183,7 @@ impl Cluster {
             health,
             panic_until,
             hints: Arc::new(RwLock::new(HashMap::new())),
+            lwt: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -563,6 +572,76 @@ impl Cluster {
         }
     }
 
+    /// Handle the prepare phase of a Paxos-style lightweight transaction.
+    ///
+    /// Returns whether the promise was made along with any previously
+    /// accepted ballot and value.
+    pub async fn lwt_prepare(&self, ns: &str, key: &str, ballot: u64) -> (bool, u64, Vec<u8>) {
+        let composite = format!("{}:{}", ns, key);
+        let mut map = self.lwt.write().await;
+        let slot = map.entry(composite).or_insert(PaxosSlot {
+            promised: 0,
+            accepted_ballot: 0,
+            accepted_value: Vec::new(),
+        });
+        if ballot > slot.promised {
+            slot.promised = ballot;
+            (true, slot.accepted_ballot, slot.accepted_value.clone())
+        } else {
+            (false, slot.promised, slot.accepted_value.clone())
+        }
+    }
+
+    /// Record a proposed value for the given ballot if the promise still holds.
+    pub async fn lwt_propose(&self, ns: &str, key: &str, ballot: u64, value: Vec<u8>) -> bool {
+        let composite = format!("{}:{}", ns, key);
+        let mut map = self.lwt.write().await;
+        let slot = map.entry(composite).or_insert(PaxosSlot {
+            promised: 0,
+            accepted_ballot: 0,
+            accepted_value: Vec::new(),
+        });
+        if ballot >= slot.promised {
+            slot.promised = ballot;
+            slot.accepted_ballot = ballot;
+            slot.accepted_value = value;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Read the latest accepted value for a lightweight transaction key.
+    pub async fn lwt_read(&self, ns: &str, key: &str) -> (u64, Vec<u8>) {
+        let composite = format!("{}:{}", ns, key);
+        let maybe = {
+            let map = self.lwt.read().await;
+            map.get(&composite)
+                .map(|s| (s.accepted_ballot, s.accepted_value.clone()))
+        };
+        if let Some((ballot, val)) = maybe {
+            (ballot, val)
+        } else {
+            let val = self.db.get_ns(ns, key).await.unwrap_or_default();
+            (0, val)
+        }
+    }
+
+    /// Commit the chosen value to durable storage and clear any in-memory state.
+    pub async fn lwt_commit(&self, ns: &str, key: &str, value: Vec<u8>) {
+        if !value.is_empty() {
+            if value.len() >= 8 {
+                let ts = u64::from_be_bytes(value[..8].try_into().unwrap_or([0; 8]));
+                let data = value[8..].to_vec();
+                self.db.insert_ns_ts(ns, key.to_string(), data, ts).await;
+            } else {
+                self.db.insert_ns(ns, key.to_string(), value).await;
+            }
+        }
+        let composite = format!("{}:{}", ns, key);
+        self.lwt.write().await.remove(&composite);
+    }
+
     /// Reconcile divergent replicas by sending the freshest values to healthy nodes
     /// and hinting any that are down.
     async fn read_repair(
@@ -702,6 +781,12 @@ impl Cluster {
         }
 
         if meta.is_write {
+            if !arr_rows.is_empty() {
+                // conditional writes return status rows instead of mutation counts
+                return Ok(output_to_proto(QueryOutput::Rows(vec![
+                    arr_rows[0].clone(),
+                ])));
+            }
             let count = match meta.first_stmt {
                 Some(Statement::CreateTable(_))
                 | Some(Statement::Drop {
