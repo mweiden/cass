@@ -13,6 +13,7 @@ Toy/experimental clone of [Apache Cassandra](https://en.wikipedia.org/wiki/Apach
 - **Scalability:** Horizontally scalable
 - **Gossip:** Cluster membership and liveness detection via gossip with health checks
 - **Consistency:** Tunable read replica count with hinted handoff and read repair
+- **[Lightweight Transactions](https://docs.datastax.com/en/cql-oss/3.3/cql/cql_using/useInsertLWT.html):** for compare and set operations
 
 ## Design tradeoffs
 
