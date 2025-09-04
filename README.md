@@ -13,7 +13,7 @@ Toy/experimental clone of [Apache Cassandra](https://en.wikipedia.org/wiki/Apach
 - **Scalability:** Horizontally scalable
 - **Gossip:** Cluster membership and liveness detection via gossip with health checks
 - **Consistency:** Tunable read replica count with hinted handoff and read repair
-- **[Lightweight Transactions](https://docs.datastax.com/en/cql-oss/3.3/cql/cql_using/useInsertLWT.html):** for compare and set operations
+- **Lightweight Transactions:** for compare and set operations
 
 ## Design tradeoffs
 
@@ -34,6 +34,11 @@ The built-in SQL engine understands a small subset of SQL:
   and `LIMIT`
 - Table management statements such as `CREATE TABLE`, `DROP TABLE`,
   `TRUNCATE TABLE`, and `SHOW TABLES`
+- Lightweight transactions (compare-and-set):
+  - `INSERT ... IF NOT EXISTS`
+  - `UPDATE ... IF col = value` (simple equality predicates)
+  - Returns a single row with `[applied]` and, on failure, the current values
+    for the checked columns
 
 Note on creating [partition and clustering keys](https://cassandra.apache.org/doc/4.0/cassandra/data_modeling/intro.html#partitions):
 the first column in `PRIMARY KEY(...)` will be the partition key, subsequent columns will be indexed as clustering keys.
@@ -49,6 +54,33 @@ CREATE TABLE t (
    PRIMARY KEY (id,c)
 );
 ```
+
+### Lightweight Transactions (Compare-and-Set)
+
+Cass supports [Cassandra-style lightweight
+transactions](https://docs.datastax.com/en/cql-oss/3.3/cql/cql_using/useInsertLWT.html)
+for conditional writes using a Paxos-like protocol across the partition's
+replicas. Two forms are supported:
+
+- `INSERT ... IF NOT EXISTS` — inserts only when the row does not exist.
+- `UPDATE ... IF col = value [AND col2 = value2 ...]` — applies the update only
+  if all equality predicates match the current row.
+
+Response shape mirrors Cassandra:
+
+- On success: a single row with `[applied] = true`.
+- On failure: a single row with `[applied] = false` and the current values for
+  the columns referenced in the `IF` clause.
+
+Consistency for LWT is QUORUM and does not depend on the server's read
+consistency setting. Normal reads continue to use the configured server-level
+read consistency (ONE/QUORUM/ALL via `--read-consistency`).
+
+Notes:
+
+- The `IF` clause is parsed only when it appears as a trailing clause outside
+  of quotes or comments (e.g., `-- comment`). Using the word "if" inside data
+  values or identifiers does not trigger LWT behavior.
 
 ## Development
 
