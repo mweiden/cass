@@ -49,7 +49,7 @@ enum LwtCondition {
 
 /// Split the leading 8-byte timestamp from a buffer, returning the timestamp and
 /// the remaining slice.
-fn split_ts(bytes: &[u8]) -> (u64, &[u8]) {
+pub fn split_ts(bytes: &[u8]) -> (u64, &[u8]) {
     if bytes.len() < 8 {
         return (0, bytes);
     }
@@ -89,14 +89,69 @@ impl SqlEngine {
         Parser::parse_sql(&self.dialect, sql)
     }
 
+    /// Return the index of a trailing `IF` clause that is not inside quotes/comments.
+    pub fn find_trailing_if_index(&self, sql: &str) -> Option<usize> {
+        let bytes = sql.as_bytes();
+        let mut i = 0usize;
+        let mut in_squote = false;
+        let mut in_dquote = false;
+        let mut in_line_comment = false;
+        let mut last_if: Option<usize> = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_line_comment {
+                if b == b'\n' { in_line_comment = false; }
+                i += 1; continue;
+            }
+            if in_squote {
+                if b == b'\'' {
+                    // handle escaped single quote by doubling
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
+                    in_squote = false; i += 1; continue;
+                }
+                i += 1; continue;
+            }
+            if in_dquote {
+                if b == b'"' {
+                    // handle escaped double quote by doubling
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' { i += 2; continue; }
+                    in_dquote = false; i += 1; continue;
+                }
+                i += 1; continue;
+            }
+            // not in quotes/comments
+            if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                in_line_comment = true; i += 2; continue;
+            }
+            if b == b'\'' { in_squote = true; i += 1; continue; }
+            if b == b'"' { in_dquote = true; i += 1; continue; }
+
+            // check for IF token with word boundaries (ASCII only)
+            // case-insensitive match for 'IF'
+            if (b == b'I' || b == b'i') && i + 1 < bytes.len() {
+                let b2 = bytes[i + 1];
+                if b2 == b'F' || b2 == b'f' {
+                    // check boundaries: prev non-alnum underscore, next non-alnum underscore
+                    let prev = if i == 0 { b' ' } else { bytes[i - 1] };
+                    let next = if i + 2 < bytes.len() { bytes[i + 2] } else { b' ' };
+                    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+                    if !is_word(prev) && !is_word(next) {
+                        last_if = Some(i);
+                    }
+                }
+            }
+            i += 1;
+        }
+        last_if
+    }
+
     /// Return the base SQL with any trailing lightweight-transaction predicate removed.
     ///
     /// For example, strips the trailing `IF NOT EXISTS` or `IF col='val'` from
     /// INSERT/UPDATE statements so the remaining SQL can be parsed normally for
     /// analysis, routing, and planning.
     pub fn base_sql<'a>(&self, sql: &'a str) -> String {
-        let lower = sql.to_lowercase();
-        if let Some(idx) = lower.rfind(" if ") {
+        if let Some(idx) = self.find_trailing_if_index(sql) {
             sql[..idx].trim().to_string()
         } else {
             sql.trim().to_string()
@@ -123,9 +178,8 @@ impl SqlEngine {
     ) -> Result<QueryOutput, QueryError> {
         let mut lwt_cond = None;
         let base_sql = self.base_sql(sql);
-        let lower = sql.to_lowercase();
-        if let Some(idx) = lower.rfind(" if ") {
-            let cond_str = sql[idx + 4..].trim();
+        if let Some(idx) = self.find_trailing_if_index(sql) {
+            let cond_str = sql[idx + 2..].trim_start(); // skip 'IF'
             if cond_str.eq_ignore_ascii_case("not exists") {
                 lwt_cond = Some(LwtCondition::NotExists);
             } else {
@@ -976,7 +1030,7 @@ fn where_to_map(expr: &Expr) -> BTreeMap<String, String> {
 }
 
 /// Convert an AST [`ObjectName`] into a lowercase namespace string.
-fn object_name_to_ns(name: &ObjectName) -> Option<String> {
+pub fn object_name_to_ns(name: &ObjectName) -> Option<String> {
     name.0
         .last()
         .and_then(|p| p.as_ident())
@@ -984,7 +1038,7 @@ fn object_name_to_ns(name: &ObjectName) -> Option<String> {
 }
 
 /// Extract a namespace from a [`TableFactor`].
-fn table_factor_to_ns(tf: &TableFactor) -> Option<String> {
+pub fn table_factor_to_ns(tf: &TableFactor) -> Option<String> {
     match tf {
         TableFactor::Table { name, .. } => object_name_to_ns(name),
         _ => None,
@@ -992,7 +1046,7 @@ fn table_factor_to_ns(tf: &TableFactor) -> Option<String> {
 }
 
 /// Perform a basic cast of `val` to the specified [`DataType`].
-fn cast_simple(val: &str, data_type: &DataType) -> Option<String> {
+pub fn cast_simple(val: &str, data_type: &DataType) -> Option<String> {
     match data_type {
         DataType::Int(_)
         | DataType::Integer(_)
@@ -1005,79 +1059,4 @@ fn cast_simple(val: &str, data_type: &DataType) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use sqlparser::ast::{DataType, Expr, Ident, ObjectName, ObjectNamePart, TableFactor, Value};
-
-    /// `split_ts` returns zero and the original slice when the buffer is shorter
-    /// than eight bytes.
-    #[test]
-    fn split_ts_handles_short_buffers() {
-        let buf = [1u8, 2u8, 3u8];
-        let (ts, rest) = super::split_ts(&buf);
-        assert_eq!(ts, 0);
-        assert_eq!(rest, &buf);
-    }
-
-    /// `split_ts` extracts the timestamp and remaining bytes from the buffer.
-    #[test]
-    fn split_ts_parses_timestamp_and_rest() {
-        let ts_val: u64 = 42;
-        let mut buf = ts_val.to_be_bytes().to_vec();
-        buf.extend_from_slice(b"hello");
-        let (ts, rest) = super::split_ts(&buf);
-        assert_eq!(ts, ts_val);
-        assert_eq!(rest, b"hello");
-    }
-
-    #[test]
-    fn object_name_to_ns_extracts_last_segment_lowercase() {
-        let name = ObjectName(vec![
-            ObjectNamePart::Identifier(Ident::new("Foo")),
-            ObjectNamePart::Identifier(Ident::new("Bar")),
-        ]);
-        assert_eq!(super::object_name_to_ns(&name), Some("bar".to_string()));
-    }
-
-    #[test]
-    fn object_name_to_ns_returns_none_for_empty() {
-        let name = ObjectName(vec![]);
-        assert!(super::object_name_to_ns(&name).is_none());
-    }
-
-    #[test]
-    fn table_factor_to_ns_handles_table_and_non_table() {
-        let table = TableFactor::Table {
-            name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new("users"))]),
-            alias: None,
-            args: None,
-            with_hints: vec![],
-            version: None,
-            with_ordinality: false,
-            partitions: vec![],
-            json_path: None,
-            sample: None,
-            index_hints: vec![],
-        };
-        assert_eq!(super::table_factor_to_ns(&table), Some("users".to_string()));
-
-        let func = TableFactor::TableFunction {
-            expr: Expr::Value(Value::Number("1".into(), false).into()),
-            alias: None,
-        };
-        assert!(super::table_factor_to_ns(&func).is_none());
-    }
-
-    #[test]
-    fn cast_simple_covers_types_and_errors() {
-        assert_eq!(
-            super::cast_simple("123", &DataType::Int(None)),
-            Some("123".to_string())
-        );
-        assert!(super::cast_simple("abc", &DataType::Int(None)).is_none());
-        assert_eq!(
-            super::cast_simple("hi", &DataType::Text),
-            Some("hi".to_string())
-        );
-        assert!(super::cast_simple("t", &DataType::Boolean).is_none());
-    }
-}
+mod tests {}

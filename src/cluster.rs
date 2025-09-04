@@ -507,8 +507,7 @@ impl Cluster {
         }
         // Heuristic: presence of trailing " IF ..." indicates an LWT on
         // supported statements (INSERT/UPDATE). Base SQL strips it.
-        let lower = sql.to_lowercase();
-        let has_if = lower.rfind(" if ").is_some();
+        let has_if = engine.find_trailing_if_index(sql).is_some();
         if has_if {
             if let Some(st) = &meta.first_stmt {
                 meta.is_lwt = matches!(st, Statement::Insert(_) | Statement::Update { .. });
@@ -575,11 +574,10 @@ impl Cluster {
         let stmt = stmts.pop().unwrap();
 
         // Extract conditional part
-        let lower = sql.to_lowercase();
         let mut lwt_not_exists = false;
         let mut lwt_equals: BTreeMap<String, String> = BTreeMap::new();
-        if let Some(idx) = lower.rfind(" if ") {
-            let cond_str = sql[idx + 4..].trim();
+        if let Some(idx) = engine.find_trailing_if_index(sql) {
+            let cond_str = sql[idx + 2..].trim_start();
             if cond_str.eq_ignore_ascii_case("not exists") {
                 lwt_not_exists = true;
             } else {
