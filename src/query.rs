@@ -89,6 +89,20 @@ impl SqlEngine {
         Parser::parse_sql(&self.dialect, sql)
     }
 
+    /// Return the base SQL with any trailing lightweight-transaction predicate removed.
+    ///
+    /// For example, strips the trailing `IF NOT EXISTS` or `IF col='val'` from
+    /// INSERT/UPDATE statements so the remaining SQL can be parsed normally for
+    /// analysis, routing, and planning.
+    pub fn base_sql<'a>(&self, sql: &'a str) -> String {
+        let lower = sql.to_lowercase();
+        if let Some(idx) = lower.rfind(" if ") {
+            sql[..idx].trim().to_string()
+        } else {
+            sql.trim().to_string()
+        }
+    }
+
     /// Execute `sql` against the provided [`Database`].
     pub async fn execute(&self, db: &Database, sql: &str) -> Result<QueryOutput, QueryError> {
         let ts = SystemTime::now()
@@ -108,11 +122,10 @@ impl SqlEngine {
         meta: bool,
     ) -> Result<QueryOutput, QueryError> {
         let mut lwt_cond = None;
-        let mut base_sql = sql.to_string();
+        let base_sql = self.base_sql(sql);
         let lower = sql.to_lowercase();
         if let Some(idx) = lower.rfind(" if ") {
             let cond_str = sql[idx + 4..].trim();
-            base_sql = sql[..idx].trim().to_string();
             if cond_str.eq_ignore_ascii_case("not exists") {
                 lwt_cond = Some(LwtCondition::NotExists);
             } else {
@@ -604,7 +617,8 @@ impl SqlEngine {
         db: &Database,
         sql: &str,
     ) -> Result<Vec<String>, QueryError> {
-        let stmts = self.parse(sql)?;
+        let base = self.base_sql(sql);
+        let stmts = self.parse(&base)?;
         let mut keys = Vec::new();
         let mut needs_key = false;
         for stmt in stmts {

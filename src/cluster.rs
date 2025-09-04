@@ -7,8 +7,9 @@ use std::{
 };
 
 use crate::rpc::{
-    FlushRequest, HealthRequest, MetaResult, MetaRow, MutationResult, QueryRequest, QueryResponse,
-    ResultSet, Row as RpcRow, ShowTablesResult, cass_client::CassClient, query_response,
+    FlushRequest, HealthRequest, LwtCommitRequest, LwtPrepareRequest, LwtProposeRequest,
+    LwtReadRequest, MetaResult, MetaRow, MutationResult, QueryRequest, QueryResponse, ResultSet,
+    Row as RpcRow, ShowTablesResult, cass_client::CassClient, query_response,
 };
 use futures::future::join_all;
 use murmur3::murmur3_32;
@@ -21,7 +22,10 @@ use crate::{
     storage::StorageError,
 };
 use serde_json::{Value, json};
-use sqlparser::ast::{Expr, ObjectName, ObjectType, SelectItem, SetExpr, Statement, TableFactor};
+use sqlparser::ast::{
+    Assignment, AssignmentTarget, Expr, FromTable, Insert, ObjectName, ObjectType, SelectItem,
+    SetExpr, Statement, TableFactor,
+};
 use sysinfo::Disks;
 use tokio::{sync::RwLock, time::sleep};
 
@@ -94,12 +98,13 @@ pub struct Cluster {
     db: Arc<Database>,
     ring: BTreeMap<u32, String>,
     rf: usize,
-    read_consistency: usize,
+    read_cl: ConsistencyLevel,
     self_addr: String,
     health: Arc<RwLock<HashMap<String, Instant>>>,
     panic_until: Arc<RwLock<Option<Instant>>>,
     hints: Arc<RwLock<HashMap<String, Vec<(u64, String)>>>>,
     lwt: Arc<RwLock<HashMap<String, PaxosSlot>>>,
+    lwt_consistency: ConsistencyLevel,
 }
 
 struct QueryMeta {
@@ -108,12 +113,31 @@ struct QueryMeta {
     is_count: bool,
     first_stmt: Option<Statement>,
     ns: Option<String>,
+    is_lwt: bool,
 }
 
 struct PaxosSlot {
     promised: u64,
     accepted_ballot: u64,
     accepted_value: Vec<u8>,
+}
+
+/// Server-level consistency options similar to Cassandra.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ConsistencyLevel {
+    One,
+    Quorum,
+    All,
+}
+
+impl ConsistencyLevel {
+    fn required(self, rf: usize) -> usize {
+        match self {
+            Self::One => 1,
+            Self::Quorum => rf / 2 + 1,
+            Self::All => rf.max(1),
+        }
+    }
 }
 
 impl Cluster {
@@ -125,6 +149,27 @@ impl Cluster {
         vnodes: usize,
         rf: usize,
         read_consistency: usize,
+    ) -> Self {
+        Self::new_with_consistency(
+            db,
+            self_addr,
+            peers,
+            vnodes,
+            rf,
+            read_consistency,
+            ConsistencyLevel::Quorum,
+        )
+    }
+
+    /// Create a cluster with explicit LWT consistency.
+    pub fn new_with_consistency(
+        db: Arc<Database>,
+        self_addr: String,
+        mut peers: Vec<String>,
+        vnodes: usize,
+        rf: usize,
+        read_consistency: usize,
+        lwt_consistency: ConsistencyLevel,
     ) -> Self {
         peers.push(self_addr.clone());
         let mut ring = BTreeMap::new();
@@ -174,16 +219,25 @@ impl Cluster {
             }
         });
 
+        let read_cl = if read_consistency <= 1 {
+            ConsistencyLevel::One
+        } else if read_consistency >= rf.max(1) {
+            ConsistencyLevel::All
+        } else {
+            ConsistencyLevel::Quorum
+        };
+
         Self {
             db,
             ring,
             rf: rf.max(1),
-            read_consistency: read_consistency.max(1),
+            read_cl,
             self_addr,
             health,
             panic_until,
             hints: Arc::new(RwLock::new(HashMap::new())),
             lwt: Arc::new(RwLock::new(HashMap::new())),
+            lwt_consistency,
         }
     }
 
@@ -336,6 +390,10 @@ impl Cluster {
         }
 
         let meta = Self::analyze_sql(&engine, sql);
+        if meta.is_lwt {
+            // Execute Cassandra-style LWT via Paxos across replicas
+            return self.execute_lwt(&engine, sql).await;
+        }
         let ts = Self::timestamp_for(meta.is_write);
         let replicas = self.target_replicas(&engine, sql, meta.broadcast).await?;
         let healthy = self.healthy_nodes(replicas.clone()).await;
@@ -352,7 +410,7 @@ impl Cluster {
                 if !unhealthy.is_empty() {
                     self.store_hints(&unhealthy, sql.to_string(), ts).await;
                 }
-            } else if healthy.len() < self.read_consistency {
+            } else if healthy.len() < self.read_cl.required(self.rf) {
                 return Err(QueryError::Other("not enough healthy replicas".into()));
             }
         }
@@ -382,8 +440,10 @@ impl Cluster {
             is_count: false,
             first_stmt: None,
             ns: None,
+            is_lwt: false,
         };
-        if let Ok(stmts) = engine.parse(sql) {
+        let parsed_sql = engine.base_sql(sql);
+        if let Ok(stmts) = engine.parse(&parsed_sql) {
             if let Some(st) = stmts.first() {
                 meta.first_stmt = Some(st.clone());
                 meta.ns = match st {
@@ -456,6 +516,15 @@ impl Cluster {
                 )
             });
         }
+        // Heuristic: presence of trailing " IF ..." indicates an LWT on
+        // supported statements (INSERT/UPDATE). Base SQL strips it.
+        let lower = sql.to_lowercase();
+        let has_if = lower.rfind(" if ").is_some();
+        if has_if {
+            if let Some(st) = &meta.first_stmt {
+                meta.is_lwt = matches!(st, Statement::Insert(_) | Statement::Update { .. });
+            }
+        }
         meta
     }
 
@@ -490,6 +559,355 @@ impl Cluster {
             replicas.insert(self.self_addr.clone());
         }
         Ok(replicas.into_iter().collect())
+    }
+
+    /// Execute a lightweight transaction (INSERT ... IF NOT EXISTS or UPDATE ... IF col=val)
+    /// across replicas using a Paxos-style protocol.
+    async fn execute_lwt(
+        &self,
+        engine: &SqlEngine,
+        sql: &str,
+    ) -> Result<QueryResponse, QueryError> {
+        // Determine replicas for the partition
+        let replicas = self.target_replicas(engine, sql, false).await?;
+        let healthy = self.healthy_nodes(replicas.clone()).await;
+        let rf = self.rf.max(1);
+        let required = self.lwt_consistency.required(rf);
+        if healthy.len() < required {
+            return Err(QueryError::Other("not enough healthy replicas".into()));
+        }
+
+        // Parse statement and condition
+        let base = engine.base_sql(sql);
+        let mut stmts = engine.parse(&base)?;
+        if stmts.len() != 1 {
+            return Err(QueryError::Unsupported);
+        }
+        let stmt = stmts.pop().unwrap();
+
+        // Extract conditional part
+        let lower = sql.to_lowercase();
+        let mut lwt_not_exists = false;
+        let mut lwt_equals: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(idx) = lower.rfind(" if ") {
+            let cond_str = sql[idx + 4..].trim();
+            if cond_str.eq_ignore_ascii_case("not exists") {
+                lwt_not_exists = true;
+            } else {
+                // Parse simple equality conjunctions via a synthetic WHERE clause
+                let dialect = sqlparser::dialect::GenericDialect {};
+                let cond_sql = format!("SELECT * FROM tmp WHERE {}", cond_str);
+                if let Ok(mut s) = sqlparser::parser::Parser::parse_sql(&dialect, &cond_sql) {
+                    if let Some(Statement::Query(q)) = s.pop() {
+                        if let SetExpr::Select(select) = *q.body {
+                            if let Some(expr) = select.selection {
+                                lwt_equals = Self::where_to_map(&expr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compute namespace, key, and the row mutation intent (for INSERT or UPDATE)
+        let (ns, key, assignments, insert_row_values) = match &stmt {
+            Statement::Insert(insert) => {
+                let ns = match &insert.table {
+                    sqlparser::ast::TableObject::TableName(name) =>
+                        Self::object_name_to_ns(name).ok_or(QueryError::Unsupported)?,
+                    _ => return Err(QueryError::Unsupported),
+                };
+                let schema = Self::get_schema(&self.db, &ns)
+                    .await
+                    .ok_or(QueryError::Unsupported)?;
+                let source = insert.source.clone().ok_or(QueryError::Unsupported)?;
+                let values = match *source.body {
+                    SetExpr::Values(v) => v,
+                    _ => return Err(QueryError::Unsupported),
+                };
+                if values.rows.len() != 1 {
+                    return Err(QueryError::Unsupported);
+                }
+                let cols: Vec<String> = if !insert.columns.is_empty() {
+                    insert
+                        .columns
+                        .iter()
+                        .map(|c| c.value.to_lowercase())
+                        .collect()
+                } else {
+                    schema.columns.clone()
+                };
+                let row_exprs = &values.rows[0];
+                if cols.len() != row_exprs.len() {
+                    return Err(QueryError::Unsupported);
+                }
+                let mut row_map: BTreeMap<String, String> = BTreeMap::new();
+                for (c, e) in cols.iter().zip(row_exprs.iter()) {
+                    if let Some(v) = Self::expr_to_string(e) {
+                        row_map.insert(c.clone(), v);
+                    }
+                }
+                // Build full primary key string
+                let key = Self::build_key_from_map(&schema, &row_map)?;
+                (ns, key, None, Some((schema, row_map)))
+            }
+            Statement::Update { table, assignments, selection, .. } => {
+                let ns = Self::table_factor_to_ns(&table.relation)
+                    .ok_or(QueryError::Unsupported)?;
+                let schema = Self::get_schema(&self.db, &ns)
+                    .await
+                    .ok_or(QueryError::Unsupported)?;
+                let where_expr = selection.as_ref().ok_or(QueryError::Unsupported)?;
+                let cond_map = Self::where_to_map(where_expr);
+                let key = Self::build_key_from_map(&schema, &cond_map)?;
+                (ns, key, Some((schema, assignments.clone())), None)
+            }
+            _ => return Err(QueryError::Unsupported),
+        };
+
+        // Choose a ballot and timestamp for the mutation
+        let ts = Self::timestamp_for(true);
+        let salt = {
+            let mut c = std::io::Cursor::new(self.self_addr.as_bytes());
+            murmur3_32(&mut c, 0).unwrap_or(0) as u64
+        };
+        let ballot = (ts << 16) | (salt & 0xffff);
+
+        // Prepare phase
+        let mut promised = 0usize;
+        let mut max_accepted_ballot = 0u64;
+        let mut max_accepted_value: Vec<u8> = Vec::new();
+        for node in &healthy {
+            if node == &self.self_addr {
+                let (ok, acc_b, acc_v) = self.lwt_prepare(&ns, &key, ballot).await;
+                if ok {
+                    promised += 1;
+                    if acc_b > max_accepted_ballot {
+                        max_accepted_ballot = acc_b;
+                        max_accepted_value = acc_v;
+                    }
+                }
+            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
+                if let Ok(resp) = client
+                    .lwt_prepare(tonic::Request::new(LwtPrepareRequest {
+                        namespace: ns.clone(),
+                        key: key.clone(),
+                        ballot,
+                    }))
+                    .await
+                {
+                    let r = resp.into_inner();
+                    if r.promised {
+                        promised += 1;
+                        if r.ballot > max_accepted_ballot {
+                            max_accepted_ballot = r.ballot;
+                            max_accepted_value = r.value;
+                        }
+                    }
+                }
+            }
+        }
+        if promised < required {
+            return Err(QueryError::Other("not enough healthy replicas".into()));
+        }
+
+        // Read phase
+        let mut read_ballot = max_accepted_ballot;
+        let mut read_value = max_accepted_value.clone();
+        for node in &healthy {
+            if node == &self.self_addr {
+                let (b, v) = self.lwt_read(&ns, &key).await;
+                if b > read_ballot || (b == 0 && read_ballot == 0 && read_value.is_empty() && !v.is_empty()) {
+                    read_ballot = b;
+                    read_value = v;
+                }
+            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
+                if let Ok(resp) = client
+                    .lwt_read(tonic::Request::new(LwtReadRequest {
+                        namespace: ns.clone(),
+                        key: key.clone(),
+                    }))
+                    .await
+                {
+                    let r = resp.into_inner();
+                    if r.ballot > read_ballot
+                        || (r.ballot == 0
+                            && read_ballot == 0
+                            && read_value.is_empty()
+                            && !r.value.is_empty())
+                    {
+                        read_ballot = r.ballot;
+                        read_value = r.value;
+                    }
+                }
+            }
+        }
+
+        // Evaluate condition and build proposed value
+        let mut applied = false;
+        let proposed_value: Vec<u8> = match (&stmt, lwt_not_exists) {
+            (Statement::Insert(_), true) => {
+                // Check if row exists
+                let data = Self::split_ts(&read_value).1;
+                if data.is_empty() {
+                    applied = true;
+                    let (schema, row_map) = insert_row_values.unwrap();
+                    let mut buf = ts.to_be_bytes().to_vec();
+                    buf.extend_from_slice(&crate::schema::encode_row(&row_map));
+                    buf
+                } else {
+                    Vec::new()
+                }
+            }
+            (Statement::Update { .. }, _) => {
+                let data = Self::split_ts(&read_value).1;
+                let mut current = crate::schema::decode_row(data);
+                if !lwt_equals.is_empty() {
+                    let success = lwt_equals
+                        .iter()
+                        .all(|(k, v)| current.get(k).map(|val| val == v).unwrap_or(false));
+                    if !success {
+                        applied = false;
+                        Vec::new()
+                    } else {
+                        applied = true;
+                        // apply assignments
+                        if let Some((schema, assigns)) = assignments {
+                            for assign in assigns {
+                                if let AssignmentTarget::ColumnName(name) = &assign.target {
+                                    if let Some(id) = name.0.first().and_then(|p| p.as_ident()) {
+                                        let col = id.value.to_lowercase();
+                                        if schema.partition_keys.contains(&col)
+                                            || schema.clustering_keys.contains(&col)
+                                        {
+                                            continue;
+                                        }
+                                        if let Some(val) = Self::expr_to_string(&assign.value) {
+                                            current.insert(col, val);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        let mut buf = ts.to_be_bytes().to_vec();
+                        buf.extend_from_slice(&crate::schema::encode_row(&current));
+                        buf
+                    }
+                } else {
+                    // Unsupported UPDATE condition form
+                    return Err(QueryError::Unsupported);
+                }
+            }
+            _ => return Err(QueryError::Unsupported),
+        };
+
+        // Propose phase
+        let mut accepted = 0usize;
+        for node in &healthy {
+            if node == &self.self_addr {
+                if self
+                    .lwt_propose(&ns, &key, ballot, proposed_value.clone())
+                    .await
+                {
+                    accepted += 1;
+                }
+            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
+                if let Ok(resp) = client
+                    .lwt_propose(tonic::Request::new(LwtProposeRequest {
+                        namespace: ns.clone(),
+                        key: key.clone(),
+                        ballot,
+                        value: proposed_value.clone(),
+                    }))
+                    .await
+                {
+                    if resp.into_inner().accepted {
+                        accepted += 1;
+                    }
+                }
+            }
+        }
+        if accepted < required {
+            return Err(QueryError::Other("not enough healthy replicas".into()));
+        }
+
+        // Commit phase (best effort to all healthy replicas)
+        for node in &healthy {
+            if node == &self.self_addr {
+                self.lwt_commit(&ns, &key, proposed_value.clone()).await;
+            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
+                let _ = client
+                    .lwt_commit(tonic::Request::new(LwtCommitRequest {
+                        namespace: ns.clone(),
+                        key: key.clone(),
+                        value: proposed_value.clone(),
+                    }))
+                    .await;
+            }
+        }
+
+        // Build LWT response row
+        let mut row = BTreeMap::new();
+        row.insert("[applied]".to_string(), if applied { "true" } else { "false" }.to_string());
+        if !applied && !lwt_equals.is_empty() {
+            let data = Self::split_ts(&read_value).1;
+            let current = crate::schema::decode_row(data);
+            for (k, _) in lwt_equals.iter() {
+                if let Some(v) = current.get(k) {
+                    row.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        Ok(output_to_proto(QueryOutput::Rows(vec![row])))
+    }
+
+    fn expr_to_string(expr: &Expr) -> Option<String> {
+        match expr {
+            Expr::Value(v) => match &v.value {
+                sqlparser::ast::Value::SingleQuotedString(s) => Some(s.clone()),
+                sqlparser::ast::Value::Number(n, _) => Some(n.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn where_to_map(expr: &Expr) -> BTreeMap<String, String> {
+        fn collect(e: &Expr, out: &mut BTreeMap<String, String>) {
+            match e {
+                Expr::BinaryOp { left, op, right } => {
+                    if *op == sqlparser::ast::BinaryOperator::And {
+                        collect(left, out);
+                        collect(right, out);
+                    } else if *op == sqlparser::ast::BinaryOperator::Eq {
+                        if let Expr::Identifier(id) = &**left {
+                            if let Some(val) = Cluster::expr_to_string(right) {
+                                out.insert(id.value.to_lowercase(), val);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut map = BTreeMap::new();
+        collect(expr, &mut map);
+        map
+    }
+
+    fn build_key_from_map(
+        schema: &TableSchema,
+        map: &BTreeMap<String, String>,
+    ) -> Result<String, QueryError> {
+        let mut parts = Vec::new();
+        for col in schema.key_columns() {
+            if let Some(v) = map.get(&col) {
+                parts.push(v.clone());
+            } else {
+                return Err(QueryError::Unsupported);
+            }
+        }
+        Ok(parts.join("|"))
     }
 
     async fn healthy_nodes(&self, replicas: Vec<String>) -> Vec<String> {
@@ -620,11 +1038,12 @@ impl Cluster {
                 .map(|s| (s.accepted_ballot, s.accepted_value.clone()))
         };
         if let Some((ballot, val)) = maybe {
-            (ballot, val)
-        } else {
-            let val = self.db.get_ns(ns, key).await.unwrap_or_default();
-            (0, val)
+            if ballot > 0 && !val.is_empty() {
+                return (ballot, val);
+            }
         }
+        let val = self.db.get_ns(ns, key).await.unwrap_or_default();
+        (0, val)
     }
 
     /// Commit the chosen value to durable storage and clear any in-memory state.

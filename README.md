@@ -128,6 +128,19 @@ INSERT 1 row
   customer_id order_date  order_id
 0 nike        2025-08-25  abc123
 (1 rows)
+
+# Check-and-set (lightweight transaction) examples
+> UPDATE orders SET order_date = '2025-08-27'
+    WHERE customer_id = 'nike' AND order_id = 'abc123' IF order_date = '2025-08-25'
+  [applied]
+0 true
+(1 rows)
+
+> UPDATE orders SET order_date = '2025-08-28'
+    WHERE customer_id = 'nike' AND order_id = 'abc123' IF order_date = '2025-08-25'
+  [applied] order_date
+0 false     2025-08-27
+(1 rows)
 ```
 
 ## Maintenance Commands
