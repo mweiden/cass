@@ -1,33 +1,42 @@
-# AGENTS
+# Repository Guidelines
 
-This file provides guidance for contributors working with this repository.
+## Project Structure & Module Organization
+- `src/main.rs`: HTTP query service entrypoint.
+- `src/lib.rs`: exports `Database` and ties core modules.
+- `src/memtable.rs`: in-memory write buffer before flush.
+- `src/wal.rs`: write-ahead log for durability.
+- `src/sstable.rs`: on-disk sorted string tables.
+- `src/query.rs`: minimal SQL parsing/execution.
+- `src/storage/`: async backends (local FS, S3).
+- `tests/`: unit + integration tests demonstrating usage.
+- `Dockerfile`, `docker-compose.*`: containerized dev/test helpers.
 
-## Project Overview
+## Build, Test, and Development Commands
+- Build: `cargo build` — compile the project.
+- Run locally: `cargo run` — start the HTTP service.
+- Test: `cargo test` — run unit and integration tests.
+- Format: `cargo fmt --all` — format Rust code.
+- Lint (optional but encouraged): `cargo clippy --all-targets -D warnings`.
+- Docker (example): `docker build -t cass .` then `docker run -p 8080:8080 cass`.
 
-- Experimental log-structured merge tree database written in Rust.
-- Supports async storage backends (local filesystem or S3) and a basic SQL layer.
-- Docker tooling is available for containerized development and testing.
+## Coding Style & Naming Conventions
+- Use `cargo fmt` before committing; prefer idiomatic Rust.
+- Keep functions small and focused; avoid unnecessary generics.
+- Names: modules/files `snake_case`; types/traits `PascalCase`; functions/vars `snake_case`; consts `SCREAMING_SNAKE_CASE`.
+- Error handling: prefer `Result<T, E>` with context; avoid `unwrap()` in non-test code.
 
-## Code Style
+## Testing Guidelines
+- Framework: Rust’s built-in test harness.
+- Locations: unit tests co-located with modules using `#[cfg(test)]`; integration tests in `tests/`.
+- Conventions: name tests after behavior, e.g., `flush_writes_to_sstable`.
+- Run subsets: `cargo test <name>`; add tests for bug fixes and new features.
 
-- Format Rust code using `cargo fmt` before committing.
-- Prefer idiomatic Rust patterns and keep functions small and focused.
+## Commit & Pull Request Guidelines
+- Commits: imperative mood, concise subject (≤72 chars), optional scope, e.g., `wal: prevent partial record read`.
+- PRs: clear description, link issues (`Closes #123`), rationale, testing notes, and any SQL/API changes.
+- Requirements: all tests pass, code formatted, docs updated (this file or module docs) when behavior changes.
 
-## Testing
-
-- Run `cargo test` and ensure all tests pass before submitting changes.
-
-## Documentation
-
-- Update relevant documentation when modifying behavior or adding features.
-
-## Code Navigation
-
-- `src/main.rs` starts the HTTP query service.
-- `src/lib.rs` exposes the `Database` type tying together core modules.
-- `src/memtable.rs` handles in-memory writes before flushing to disk.
-- `src/sstable.rs` implements on-disk sorted string tables.
-- `src/wal.rs` provides a write-ahead log for durability.
-- `src/query.rs` parses and executes a small subset of SQL.
-- `src/storage/` contains filesystem and S3 storage backends.
-- `tests/` includes unit and integration tests demonstrating usage.
+## Security & Configuration Tips
+- Do not commit secrets; use environment variables for backend credentials (e.g., S3).
+- Prefer local filesystem backend for development; validate S3 settings in a disposable environment.
+- Log minimally in production; avoid leaking user data in errors.
