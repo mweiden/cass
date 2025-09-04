@@ -10,7 +10,9 @@ use cass::{
     Database,
     cluster::Cluster,
     rpc::{
-        FlushRequest, FlushResponse, HealthRequest, HealthResponse, PanicRequest, PanicResponse,
+        FlushRequest, FlushResponse, HealthRequest, HealthResponse, LwtCommitRequest,
+        LwtCommitResponse, LwtPrepareRequest, LwtPrepareResponse, LwtProposeRequest,
+        LwtProposeResponse, LwtReadRequest, LwtReadResponse, PanicRequest, PanicResponse,
         QueryRequest, QueryResponse, Row as RpcRow,
         cass_client::CassClient,
         cass_server::{Cass, CassServer},
@@ -194,6 +196,52 @@ impl Cass for CassService {
         Ok(Response::new(HealthResponse {
             info: self.cluster.health_info().to_string(),
         }))
+    }
+
+    async fn lwt_prepare(
+        &self,
+        req: Request<LwtPrepareRequest>,
+    ) -> Result<Response<LwtPrepareResponse>, Status> {
+        let r = req.into_inner();
+        let (promised, ballot, value) = self
+            .cluster
+            .lwt_prepare(&r.namespace, &r.key, r.ballot)
+            .await;
+        Ok(Response::new(LwtPrepareResponse {
+            promised,
+            ballot,
+            value,
+        }))
+    }
+
+    async fn lwt_propose(
+        &self,
+        req: Request<LwtProposeRequest>,
+    ) -> Result<Response<LwtProposeResponse>, Status> {
+        let r = req.into_inner();
+        let accepted = self
+            .cluster
+            .lwt_propose(&r.namespace, &r.key, r.ballot, r.value)
+            .await;
+        Ok(Response::new(LwtProposeResponse { accepted }))
+    }
+
+    async fn lwt_read(
+        &self,
+        req: Request<LwtReadRequest>,
+    ) -> Result<Response<LwtReadResponse>, Status> {
+        let r = req.into_inner();
+        let (ballot, value) = self.cluster.lwt_read(&r.namespace, &r.key).await;
+        Ok(Response::new(LwtReadResponse { ballot, value }))
+    }
+
+    async fn lwt_commit(
+        &self,
+        req: Request<LwtCommitRequest>,
+    ) -> Result<Response<LwtCommitResponse>, Status> {
+        let r = req.into_inner();
+        self.cluster.lwt_commit(&r.namespace, &r.key, r.value).await;
+        Ok(Response::new(LwtCommitResponse {}))
     }
 }
 

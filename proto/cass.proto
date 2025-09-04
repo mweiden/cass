@@ -9,6 +9,11 @@ service Cass {
   rpc FlushInternal (FlushRequest) returns (FlushResponse);
   rpc Panic (PanicRequest) returns (PanicResponse);
   rpc Health (HealthRequest) returns (HealthResponse);
+  // Lightweight transaction phases
+  rpc LwtPrepare (LwtPrepareRequest) returns (LwtPrepareResponse);
+  rpc LwtPropose (LwtProposeRequest) returns (LwtProposeResponse);
+  rpc LwtRead (LwtReadRequest) returns (LwtReadResponse);
+  rpc LwtCommit (LwtCommitRequest) returns (LwtCommitResponse);
 }
 
 message QueryRequest {
@@ -60,3 +65,45 @@ message PanicResponse { bool healthy = 1; }
 
 message HealthRequest {}
 message HealthResponse { string info = 1; }
+
+// Requests and responses for Cassandra-style lightweight transaction phases
+message LwtPrepareRequest {
+  string namespace = 1;
+  string key = 2;
+  uint64 ballot = 3;
+}
+
+message LwtPrepareResponse {
+  bool promised = 1;
+  uint64 ballot = 2;
+  bytes value = 3;
+}
+
+message LwtProposeRequest {
+  string namespace = 1;
+  string key = 2;
+  uint64 ballot = 3;
+  bytes value = 4;
+}
+
+message LwtProposeResponse {
+  bool accepted = 1;
+}
+
+message LwtReadRequest {
+  string namespace = 1;
+  string key = 2;
+}
+
+message LwtReadResponse {
+  uint64 ballot = 1;
+  bytes value = 2;
+}
+
+message LwtCommitRequest {
+  string namespace = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message LwtCommitResponse {}
