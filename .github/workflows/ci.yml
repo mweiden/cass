@@ -20,21 +20,25 @@ jobs:
           profile: minimal
           toolchain: stable
           override: true
+      - name: Capture Rust version
+        run: echo "RUST_VERSION=$(rustc -V | cut -d' ' -f2)" >> $GITHUB_ENV
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUST_VERSION }}-
             ${{ runner.os }}-cargo-
       - name: Cache build artifacts
         uses: actions/cache@v4
         with:
           path: target
-          key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-build-${{ env.RUST_VERSION }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-build-${{ env.RUST_VERSION }}-
             ${{ runner.os }}-build-
       - name: Run tests
         if: github.ref != 'refs/heads/main'
