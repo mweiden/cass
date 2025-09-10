@@ -600,8 +600,9 @@ impl Cluster {
         let (ns, key, assignments, insert_row_values) = match &stmt {
             Statement::Insert(insert) => {
                 let ns = match &insert.table {
-                    sqlparser::ast::TableObject::TableName(name) =>
-                        Self::object_name_to_ns(name).ok_or(QueryError::Unsupported)?,
+                    sqlparser::ast::TableObject::TableName(name) => {
+                        Self::object_name_to_ns(name).ok_or(QueryError::Unsupported)?
+                    }
                     _ => return Err(QueryError::Unsupported),
                 };
                 let schema = Self::get_schema(&self.db, &ns)
@@ -638,9 +639,14 @@ impl Cluster {
                 let key = Self::build_key_from_map(&schema, &row_map)?;
                 (ns, key, None, Some((schema, row_map)))
             }
-            Statement::Update { table, assignments, selection, .. } => {
-                let ns = Self::table_factor_to_ns(&table.relation)
-                    .ok_or(QueryError::Unsupported)?;
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => {
+                let ns =
+                    Self::table_factor_to_ns(&table.relation).ok_or(QueryError::Unsupported)?;
                 let schema = Self::get_schema(&self.db, &ns)
                     .await
                     .ok_or(QueryError::Unsupported)?;
@@ -704,7 +710,9 @@ impl Cluster {
         for node in &healthy {
             if node == &self.self_addr {
                 let (b, v) = self.lwt_read(&ns, &key).await;
-                if b > read_ballot || (b == 0 && read_ballot == 0 && read_value.is_empty() && !v.is_empty()) {
+                if b > read_ballot
+                    || (b == 0 && read_ballot == 0 && read_value.is_empty() && !v.is_empty())
+                {
                     read_ballot = b;
                     read_value = v;
                 }
@@ -835,7 +843,10 @@ impl Cluster {
 
         // Build LWT response row
         let mut row = BTreeMap::new();
-        row.insert("[applied]".to_string(), if applied { "true" } else { "false" }.to_string());
+        row.insert(
+            "[applied]".to_string(),
+            if applied { "true" } else { "false" }.to_string(),
+        );
         if !applied && !lwt_equals.is_empty() {
             let data = Self::split_ts(&read_value).1;
             let current = crate::schema::decode_row(data);
@@ -1246,5 +1257,104 @@ impl Cluster {
         } else {
             Ok(output_to_proto(QueryOutput::Rows(Vec::new())))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Database;
+    use crate::storage::local::LocalStorage;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use tokio::time::Duration;
+
+    async fn test_cluster(self_addr: &str, peers: Vec<String>) -> Cluster {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(LocalStorage::new(dir.path()));
+        let db = Arc::new(Database::new(storage, "wal.log").await.unwrap());
+        Cluster::new(db, self_addr.to_string(), peers, 1, 1, 1)
+    }
+
+    #[test]
+    fn proto_to_output_round_trip() {
+        let resp = output_to_proto(QueryOutput::Mutation {
+            op: "INSERT".into(),
+            unit: "rows".into(),
+            count: 1,
+        });
+        if let QueryOutput::Mutation { op, unit, count } = proto_to_output(resp) {
+            assert_eq!(op, "INSERT");
+            assert_eq!(unit, "rows");
+            assert_eq!(count, 1);
+        } else {
+            panic!("expected mutation");
+        }
+        let resp = output_to_proto(QueryOutput::Rows(vec![BTreeMap::from([(
+            "k".into(),
+            "v".into(),
+        )])]));
+        if let QueryOutput::Rows(rs) = proto_to_output(resp) {
+            assert_eq!(rs[0].get("k"), Some(&"v".to_string()));
+        } else {
+            panic!("expected rows");
+        }
+
+        let resp = output_to_proto(QueryOutput::Meta(vec![("key".into(), 1, "val".into())]));
+        if let QueryOutput::Meta(m) = proto_to_output(resp) {
+            assert_eq!(m[0].0, "key");
+            assert_eq!(m[0].1, 1);
+            assert_eq!(m[0].2, "val");
+        } else {
+            panic!("expected meta");
+        }
+
+        let resp = output_to_proto(QueryOutput::Tables(vec!["t".into()]));
+        if let QueryOutput::Tables(t) = proto_to_output(resp) {
+            assert_eq!(t, vec!["t".to_string()]);
+        } else {
+            panic!("expected tables");
+        }
+
+        let resp = output_to_proto(QueryOutput::None);
+        assert!(matches!(proto_to_output(resp), QueryOutput::None));
+    }
+
+    #[tokio::test]
+    async fn peer_health_reports_status() {
+        let peer1 = "http://127.0.0.1:9001".to_string();
+        let peer2 = "http://127.0.0.1:9002".to_string();
+        let cluster =
+            test_cluster("http://127.0.0.1:9000", vec![peer1.clone(), peer2.clone()]).await;
+
+        {
+            let mut map = cluster.health.write().await;
+            map.insert(peer1.clone(), Instant::now());
+            map.insert(peer2.clone(), Instant::now() - Duration::from_secs(10));
+        }
+
+        let mut status = cluster.peer_health().await;
+        status.sort();
+        assert_eq!(status, vec![(peer1, true), (peer2, false)]);
+    }
+
+    #[tokio::test]
+    async fn analyze_sql_extracts_delete_ns() {
+        let engine = SqlEngine::new();
+        let meta = Cluster::analyze_sql(&engine, "DELETE FROM tbl WHERE id='1'");
+        assert_eq!(meta.ns, Some("tbl".into()));
+        assert!(meta.is_write);
+    }
+
+    #[tokio::test]
+    async fn apply_hints_preserves_on_failure() {
+        let peer = "http://127.0.0.1:9201".to_string();
+        let cluster = test_cluster("http://127.0.0.1:9200", vec![peer.clone()]).await;
+        cluster
+            .store_hints(&[peer.clone()], "INSERT INTO t (id) VALUES ('a')".into(), 1)
+            .await;
+        assert!(cluster.hints.read().await.get(&peer).is_some());
+        cluster.apply_hints(&peer).await;
+        assert!(cluster.hints.read().await.get(&peer).is_some());
     }
 }
