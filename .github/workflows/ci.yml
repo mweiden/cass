@@ -39,16 +39,18 @@ jobs:
       - name: Run tests
         if: github.ref != 'refs/heads/main'
         run: cargo test
-      - name: Install cargo-tarpaulin
+      - name: Install coverage tools
         if: github.ref == 'refs/heads/main'
-        run: cargo install cargo-tarpaulin
+        run: |
+          rustup component add llvm-tools-preview
+          cargo install cargo-llvm-cov cargo-nextest
       - name: Generate coverage report
         if: github.ref == 'refs/heads/main'
-        run: cargo tarpaulin --out Xml
+        run: cargo llvm-cov nextest --lcov --output-path lcov.info
       - name: Upload coverage reports to Codecov
         if: github.ref == 'refs/heads/main'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: mweiden/cass
-          files: cobertura.xml
+          files: lcov.info
