@@ -23,7 +23,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, Expr, FromTable, Insert, ObjectName, ObjectType, SelectItem,
+    AssignmentTarget, Expr, ObjectName, ObjectType, SelectItem,
     SetExpr, Statement, TableFactor,
 };
 use sysinfo::Disks;
@@ -144,7 +144,7 @@ impl Cluster {
     pub fn new(
         db: Arc<Database>,
         self_addr: String,
-        mut peers: Vec<String>,
+        peers: Vec<String>,
         vnodes: usize,
         rf: usize,
         read_consistency: usize,
@@ -746,7 +746,7 @@ impl Cluster {
                 let data = Self::split_ts(&read_value).1;
                 if data.is_empty() {
                     applied = true;
-                    let (schema, row_map) = insert_row_values.unwrap();
+                    let (_schema, row_map) = insert_row_values.unwrap();
                     let mut buf = ts.to_be_bytes().to_vec();
                     buf.extend_from_slice(&crate::schema::encode_row(&row_map));
                     buf
