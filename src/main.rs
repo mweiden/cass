@@ -1,8 +1,6 @@
 use std::{
     convert::Infallible,
-    fs,
     net::SocketAddr,
-    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -13,12 +11,13 @@ use cass::{
         FlushRequest, FlushResponse, HealthRequest, HealthResponse, LwtCommitRequest,
         LwtCommitResponse, LwtPrepareRequest, LwtPrepareResponse, LwtProposeRequest,
         LwtProposeResponse, LwtReadRequest, LwtReadResponse, PanicRequest, PanicResponse,
-        QueryRequest, QueryResponse, Row as RpcRow,
+        QueryRequest, QueryResponse,
         cass_client::CassClient,
         cass_server::{Cass, CassServer},
         query_response,
     },
     storage::{Storage, local::LocalStorage, s3::S3Storage},
+    util::{print_rows, sstable_disk_usage},
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hyper::{
@@ -48,48 +47,6 @@ static CPU_USAGE: Lazy<Gauge> =
 static SSTABLE_DISK_USAGE: Lazy<Gauge> = Lazy::new(|| {
     register_gauge!("sstable_disk_usage_bytes", "SSTable disk usage in bytes").unwrap()
 });
-
-fn print_rows(rows: &[RpcRow]) {
-    if rows.is_empty() {
-        println!("(0 rows)");
-        return;
-    }
-    let mut cols: Vec<String> = rows
-        .iter()
-        .flat_map(|r| r.columns.keys().cloned())
-        .collect();
-    cols.sort();
-    cols.dedup();
-
-    let index_width = rows.len().to_string().len();
-    let col_widths: Vec<usize> = cols
-        .iter()
-        .map(|c| {
-            let max_val = rows
-                .iter()
-                .map(|r| r.columns.get(c).map(|v| v.len()).unwrap_or(0))
-                .max()
-                .unwrap_or(0);
-            std::cmp::max(c.len(), max_val)
-        })
-        .collect();
-
-    let mut header = format!("{:>width$}", "", width = index_width);
-    for (c, w) in cols.iter().zip(col_widths.iter()) {
-        header.push_str(&format!(" {:<width$}", c, width = w));
-    }
-    println!("{}", header);
-
-    for (i, row) in rows.iter().enumerate() {
-        let mut line = format!("{:>width$}", i, width = index_width);
-        for (c, w) in cols.iter().zip(col_widths.iter()) {
-            let val = row.columns.get(c).cloned().unwrap_or_default();
-            line.push_str(&format!(" {:<width$}", val, width = w));
-        }
-        println!("{}", line);
-    }
-    println!("({} rows)", rows.len());
-}
 
 #[derive(Parser)]
 #[command(name = "cass")]
@@ -387,26 +344,6 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-fn sstable_disk_usage(dir: &str) -> u64 {
-    fn visit(path: &Path) -> u64 {
-        let mut size = 0;
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    size += visit(&p);
-                } else if p.extension().and_then(|e| e.to_str()) == Some("tbl") {
-                    if let Ok(meta) = entry.metadata() {
-                        size += meta.len();
-                    }
-                }
-            }
-        }
-        size
-    }
-    visit(Path::new(dir))
-}
-
 async fn repl(nodes: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     use rustyline::{Editor, history::DefaultHistory};
     let rl = Arc::new(Mutex::new(Editor::<(), DefaultHistory>::new()?));
@@ -439,7 +376,10 @@ async fn repl(nodes: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                     Ok(resp) => {
                         let resp = resp.into_inner();
                         match resp.payload {
-                            Some(query_response::Payload::Rows(rs)) => print_rows(&rs.rows),
+                            Some(query_response::Payload::Rows(rs)) => {
+                                let mut out = std::io::stdout();
+                                print_rows(&rs.rows, &mut out);
+                            }
                             Some(query_response::Payload::Mutation(m)) => {
                                 println!("{} {} {}", m.op, m.count, m.unit);
                             }

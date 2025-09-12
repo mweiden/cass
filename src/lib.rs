@@ -5,6 +5,7 @@ pub mod query;
 pub mod schema;
 pub mod sstable;
 pub mod storage;
+pub mod util;
 pub mod wal;
 pub mod zonemap;
 
