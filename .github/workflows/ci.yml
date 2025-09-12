@@ -37,18 +37,18 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-build-
       - name: Run tests
-        if: github.ref != 'refs/heads/main' && github.ref != 'refs/heads/codex/implement-code-coverage-in-ci-pipeline'
+        if: github.ref != 'refs/heads/main'
         run: cargo test
       - name: Install coverage tools
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/implement-code-coverage-in-ci-pipeline'
+        if: github.ref == 'refs/heads/main'
         run: |
           rustup component add llvm-tools-preview
           cargo install cargo-llvm-cov cargo-nextest
       - name: Generate coverage report
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/implement-code-coverage-in-ci-pipeline'
+        if: github.ref == 'refs/heads/main'
         run: cargo llvm-cov nextest --lcov --output-path lcov.info
       - name: Upload coverage reports to Codecov
-        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/implement-code-coverage-in-ci-pipeline'
+        if: github.ref == 'refs/heads/main'
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
