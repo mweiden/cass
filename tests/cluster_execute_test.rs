@@ -109,3 +109,98 @@ async fn show_tables_succeeds_with_unhealthy_peer() {
         panic!("expected table list");
     }
 }
+
+#[tokio::test]
+async fn delete_removes_row() {
+    let addr = "http://127.0.0.1:6006";
+    let cluster = build_cluster(Vec::new(), 1, 1, addr).await;
+    cluster
+        .execute(
+            "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
+            false,
+        )
+        .await
+        .unwrap();
+    cluster
+        .execute("INSERT INTO kv (id, val) VALUES ('a','x')", false)
+        .await
+        .unwrap();
+    let resp = cluster
+        .execute("DELETE FROM kv WHERE id='a'", false)
+        .await
+        .unwrap();
+    if let Some(query_response::Payload::Mutation(m)) = resp.payload {
+        assert_eq!(m.op, "DELETE");
+        assert_eq!(m.count, 1);
+    } else {
+        panic!("expected mutation response");
+    }
+    let resp = cluster
+        .execute("SELECT val FROM kv WHERE id='a'", false)
+        .await
+        .unwrap();
+    assert_eq!(first_val(resp, "val"), None);
+}
+
+#[tokio::test]
+async fn drop_table_removes_schema() {
+    let addr = "http://127.0.0.1:6007";
+    let cluster = build_cluster(Vec::new(), 1, 1, addr).await;
+    cluster
+        .execute(
+            "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
+            false,
+        )
+        .await
+        .unwrap();
+    let resp = cluster.execute("DROP TABLE kv", false).await.unwrap();
+    if let Some(query_response::Payload::Mutation(m)) = resp.payload {
+        assert_eq!(m.op, "DROP TABLE");
+        assert_eq!(m.count, 1);
+    } else {
+        panic!("expected mutation response");
+    }
+    let resp = cluster.execute("SHOW TABLES", false).await.unwrap();
+    if let Some(query_response::Payload::Tables(t)) = resp.payload {
+        assert!(t.tables.is_empty());
+    } else {
+        panic!("expected table list");
+    }
+}
+
+#[tokio::test]
+async fn select_with_in_returns_rows() {
+    let addr = "http://127.0.0.1:6008";
+    let cluster = build_cluster(Vec::new(), 1, 1, addr).await;
+    cluster
+        .execute(
+            "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
+            false,
+        )
+        .await
+        .unwrap();
+    for (id, val) in [("a", "1"), ("b", "2"), ("c", "3")].iter() {
+        cluster
+            .execute(
+                &format!("INSERT INTO kv (id, val) VALUES ('{}','{}')", id, val),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    let resp = cluster
+        .execute("SELECT val FROM kv WHERE id IN ('a','c')", false)
+        .await
+        .unwrap();
+    if let Some(query_response::Payload::Rows(rs)) = resp.payload {
+        let mut vals: Vec<String> = rs
+            .rows
+            .iter()
+            .filter_map(|r| r.columns.get("val").cloned())
+            .collect();
+        vals.sort();
+        assert_eq!(vals, vec!["1".to_string(), "3".to_string()]);
+    } else {
+        panic!("expected rows response");
+    }
+}
