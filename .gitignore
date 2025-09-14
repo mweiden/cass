@@ -29,4 +29,5 @@ target
 lcov.info
 
 # Performance testing
-perf-results
+perf-results/*.log
+perf-results/*.prom
