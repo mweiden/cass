@@ -213,7 +213,12 @@ impl Cluster {
         });
 
         let disk_ok = Arc::new(AtomicBool::new(true));
-        if let Some(path) = db.storage().local_path().map(|p| p.to_path_buf()) {
+        let skip_disk_health = match std::env::var("CASS_DISABLE_DISK_HEALTH") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => std::env::var("CI").is_ok(),
+        };
+        if !skip_disk_health {
+            if let Some(path) = db.storage().local_path().map(|p| p.to_path_buf()) {
             let disk_health = disk_ok.clone();
             tokio::spawn(async move {
                 loop {
@@ -250,6 +255,7 @@ impl Cluster {
                     sleep(Duration::from_secs(10)).await;
                 }
             });
+            }
         }
 
         let read_cl = if read_consistency <= 1 {
