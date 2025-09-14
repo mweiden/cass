@@ -1,0 +1,27 @@
+# Cassandra stress user profile for perf comparison with cass
+
+keyspace: perf_rf3
+keyspace_definition: |
+  CREATE KEYSPACE IF NOT EXISTS perf_rf3 WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};
+
+table: perf
+table_definition: |
+  CREATE TABLE IF NOT EXISTS perf_rf3.perf (
+    k int PRIMARY KEY,
+    v int
+  );
+
+columnspec:
+  - name: k
+    population: seq(1..1000000)
+  - name: v
+    population: seq(1..1000000)
+
+insert:
+  partitions: fixed(1)
+  batchtype: UNLOGGED
+
+queries:
+  select1:
+    cql: SELECT v FROM perf_rf3.perf WHERE k = ?;
+    fields: samerow

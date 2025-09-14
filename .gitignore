@@ -27,3 +27,7 @@ target
 
 # Coverage reports
 lcov.info
+
+# Performance testing
+perf-results/*.log
+perf-results/*.prom
