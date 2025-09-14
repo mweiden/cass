@@ -38,11 +38,16 @@ s3s-fs = "0.12.0-minio-preview.3"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 criterion = "0.5"
 regex = "1"
-plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf"] }
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder"] }
 
 [build-dependencies]
 tonic-build = "0.12"
 protoc-bin-vendored = "3"
+
+[features]
+# Enable TTF font support for Plotters when running the plotting example locally.
+# This is disabled by default to avoid requiring system fontconfig in CI.
+plot-ttf = ["plotters/ttf"]
 
 [[bench]]
 name = "lookup"
