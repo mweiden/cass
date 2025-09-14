@@ -3,6 +3,24 @@
 
 Toy/experimental clone of [Apache Cassandra](https://en.wikipedia.org/wiki/Apache_Cassandra) written in Rust, mostly using [OpenAI Codex](https://chatgpt.com/codex).
 
+## Table of Contents
+
+- [Features](#features)
+- [Design tradeoffs](#design-tradeoffs)
+- [Query Syntax](#query-syntax)
+  - [Lightweight Transactions (Compare-and-Set)](#lightweight-transactions-compare-and-set)
+- [Development](#development)
+  - [Contributing](#contributing)
+- [Storage Backends](#storage-backends)
+  - [Local](#local)
+  - [S3](#s3)
+- [Example / Docker Compose Cluster](#example--docker-compose-cluster)
+- [Consistency, Hinted Handoff, and Read Repair](#consistency-hinted-handoff-and-read-repair)
+- [Maintenance Commands](#maintenance-commands)
+- [Monitoring](#monitoring)
+- [Performance Benchmarking](#performance-benchmarking)
+- [Flamegraph Profiling](#flamegraph-profiling)
+
 ## Features
 
 - **gRPC API and CLI** for submitting SQL queries
@@ -244,3 +262,22 @@ Current results (in comparison to cassandra):
 ![Cass vs Cassandra throughput and latency across thread counts](perf-results/perf_comparison.png)
 
 _5 nodes, replication factor 3, read consistency QUORUM, x axis is number of threads querying_
+
+## Flamegraph Profiling
+
+Generate a CPU flamegraph for the query endpoint with a one-shot helper that runs the server under `cargo flamegraph` and drives load via the example perf client:
+
+```bash
+scripts/flamegraph_query.sh
+```
+
+Outputs an SVG under `perf-results/`, e.g. `perf-results/query_flamegraph_YYYYmmdd-HHMMSS.svg`.
+
+Notes:
+- Prereqs: `cargo install flamegraph`. On Linux, ensure `perf` is installed and accessible; on macOS, `dtrace` requires `sudo` and may require Developer Mode.
+- Tunables via env vars: `NODE` (default `http://127.0.0.1:8080`), `OPS` (default `10000`), `THREADS` (default `32`), `OUTDIR` (default `perf-results`), and `EXTRA_SERVER_ARGS` to pass through to `cass server`.
+- Tip: for richer symbols, consider adding to `Cargo.toml`:
+  ```toml
+  [profile.release]
+  debug = 1
+  ```
