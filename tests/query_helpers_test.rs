@@ -59,9 +59,11 @@ fn table_factor_to_ns_handles_table_and_non_table() {
 
 #[test]
 fn cast_simple_covers_types_and_errors() {
-    assert_eq!(cast_simple("123", &DataType::Int(None)), Some("123".to_string()));
+    assert_eq!(
+        cast_simple("123", &DataType::Int(None)),
+        Some("123".to_string())
+    );
     assert!(cast_simple("abc", &DataType::Int(None)).is_none());
     assert_eq!(cast_simple("hi", &DataType::Text), Some("hi".to_string()));
     assert!(cast_simple("t", &DataType::Boolean).is_none());
 }
-

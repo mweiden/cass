@@ -100,31 +100,56 @@ impl SqlEngine {
         while i < bytes.len() {
             let b = bytes[i];
             if in_line_comment {
-                if b == b'\n' { in_line_comment = false; }
-                i += 1; continue;
+                if b == b'\n' {
+                    in_line_comment = false;
+                }
+                i += 1;
+                continue;
             }
             if in_squote {
                 if b == b'\'' {
                     // handle escaped single quote by doubling
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' { i += 2; continue; }
-                    in_squote = false; i += 1; continue;
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_squote = false;
+                    i += 1;
+                    continue;
                 }
-                i += 1; continue;
+                i += 1;
+                continue;
             }
             if in_dquote {
                 if b == b'"' {
                     // handle escaped double quote by doubling
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' { i += 2; continue; }
-                    in_dquote = false; i += 1; continue;
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    in_dquote = false;
+                    i += 1;
+                    continue;
                 }
-                i += 1; continue;
+                i += 1;
+                continue;
             }
             // not in quotes/comments
             if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-                in_line_comment = true; i += 2; continue;
+                in_line_comment = true;
+                i += 2;
+                continue;
             }
-            if b == b'\'' { in_squote = true; i += 1; continue; }
-            if b == b'"' { in_dquote = true; i += 1; continue; }
+            if b == b'\'' {
+                in_squote = true;
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                in_dquote = true;
+                i += 1;
+                continue;
+            }
 
             // check for IF token with word boundaries (ASCII only)
             // case-insensitive match for 'IF'
@@ -133,7 +158,11 @@ impl SqlEngine {
                 if b2 == b'F' || b2 == b'f' {
                     // check boundaries: prev non-alnum underscore, next non-alnum underscore
                     let prev = if i == 0 { b' ' } else { bytes[i - 1] };
-                    let next = if i + 2 < bytes.len() { bytes[i + 2] } else { b' ' };
+                    let next = if i + 2 < bytes.len() {
+                        bytes[i + 2]
+                    } else {
+                        b' '
+                    };
                     let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
                     if !is_word(prev) && !is_word(next) {
                         last_if = Some(i);
@@ -151,11 +180,22 @@ impl SqlEngine {
     /// INSERT/UPDATE statements so the remaining SQL can be parsed normally for
     /// analysis, routing, and planning.
     pub fn base_sql<'a>(&self, sql: &'a str) -> String {
-        if let Some(idx) = self.find_trailing_if_index(sql) {
-            sql[..idx].trim().to_string()
-        } else {
-            sql.trim().to_string()
+        let trimmed = sql.trim();
+        // Only consider stripping a trailing IF clause for statements that
+        // actually support LWT (INSERT/UPDATE). This avoids breaking valid
+        // constructs like `CREATE TABLE IF NOT EXISTS ...`.
+        let lower = trimmed
+            .chars()
+            .take(10)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let is_lwt_stmt = lower.starts_with("insert") || lower.starts_with("update");
+        if is_lwt_stmt {
+            if let Some(idx) = self.find_trailing_if_index(sql) {
+                return sql[..idx].trim().to_string();
+            }
         }
+        trimmed.to_string()
     }
 
     /// Execute `sql` against the provided [`Database`].

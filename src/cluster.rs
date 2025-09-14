@@ -23,8 +23,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use sqlparser::ast::{
-    AssignmentTarget, Expr, ObjectName, ObjectType, SelectItem,
-    SetExpr, Statement, TableFactor,
+    AssignmentTarget, Expr, ObjectName, ObjectType, SelectItem, SetExpr, Statement, TableFactor,
 };
 use sysinfo::Disks;
 use tokio::{sync::RwLock, time::sleep};

@@ -1,8 +1,8 @@
+use cass::Database;
 use cass::cluster::Cluster;
 use cass::query::QueryError;
-use cass::rpc::{query_response, QueryResponse};
+use cass::rpc::{QueryResponse, query_response};
 use cass::storage::local::LocalStorage;
-use cass::Database;
 use std::sync::Arc;
 use tempfile::tempdir;
 

@@ -27,3 +27,6 @@ target
 
 # Coverage reports
 lcov.info
+
+# Performance testing
+perf-results

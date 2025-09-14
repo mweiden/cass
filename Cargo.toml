@@ -29,6 +29,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tower-http = { version = "0.6", features = ["trace"] }
 memmap2 = "0.9"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+statrs = "0.16"
 
 [dev-dependencies]
 tempfile = "3"
@@ -36,6 +37,8 @@ s3s = "0.12.0-minio-preview.3"
 s3s-fs = "0.12.0-minio-preview.3"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 criterion = "0.5"
+regex = "1"
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf"] }
 
 [build-dependencies]
 tonic-build = "0.12"

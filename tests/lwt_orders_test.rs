@@ -1,5 +1,5 @@
 use cass::rpc::{QueryRequest, cass_client::CassClient, query_response};
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 mod common;
 use common::CassProcess;
@@ -41,7 +41,9 @@ async fn lwt_update_on_orders_distributed_all_read_consistency() {
     for _ in 0..40 {
         let ok1 = CassClient::connect(base1.to_string()).await.is_ok();
         let ok2 = CassClient::connect(base2.to_string()).await.is_ok();
-        if ok1 && ok2 { break; }
+        if ok1 && ok2 {
+            break;
+        }
         sleep(Duration::from_millis(100)).await;
     }
 
@@ -51,11 +53,15 @@ async fn lwt_update_on_orders_distributed_all_read_consistency() {
         .await
         .unwrap();
     client
-        .query(QueryRequest { sql: "INSERT INTO orders VALUES ('nike','abc123','2025-08-27')".into() })
+        .query(QueryRequest {
+            sql: "INSERT INTO orders VALUES ('nike','abc123','2025-08-27')".into(),
+        })
         .await
         .unwrap();
     client
-        .query(QueryRequest { sql: "INSERT INTO orders VALUES ('nike','def456','2025-08-26')".into() })
+        .query(QueryRequest {
+            sql: "INSERT INTO orders VALUES ('nike','def456','2025-08-26')".into(),
+        })
         .await
         .unwrap();
 
@@ -88,7 +94,10 @@ async fn lwt_update_on_orders_distributed_all_read_consistency() {
 
     // Verify actual DB value remains '2025-08-25' after first success
     let resp3 = client
-        .query(QueryRequest { sql: "SELECT order_date FROM orders WHERE customer_id='nike' AND order_id='abc123'".into() })
+        .query(QueryRequest {
+            sql: "SELECT order_date FROM orders WHERE customer_id='nike' AND order_id='abc123'"
+                .into(),
+        })
         .await
         .unwrap()
         .into_inner();
