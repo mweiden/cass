@@ -236,7 +236,7 @@ impl Cluster {
                     .await
                     .unwrap_or(true);
                     disk_health.store(healthy, Ordering::Relaxed);
-                    sleep(Duration::from_secs(1)).await;
+                    sleep(Duration::from_secs(10)).await;
                 }
             });
         }
