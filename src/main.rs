@@ -28,6 +28,7 @@ use hyper::{
 use once_cell::sync::Lazy;
 use prometheus::{Gauge, GaugeVec, register_gauge, register_gauge_vec};
 use sysinfo::System;
+use tokio::time::{Duration, sleep};
 use tonic::{Request, Response, Status, transport::Server};
 use tonic_prometheus_layer::{MetricsLayer, metrics as tl_metrics};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
@@ -259,7 +260,7 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
         args.rf,
         match args.read_consistency.unwrap_or(Consistency::Quorum) {
             Consistency::One => 1,
-            Consistency::Quorum => (args.rf.max(1) / 2 + 1),
+            Consistency::Quorum => args.rf.max(1) / 2 + 1,
             Consistency::All => args.rf.max(1),
         },
     ));
@@ -283,46 +284,45 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
     let cluster_metrics = cluster.clone();
     let data_dir_metrics = data_dir.clone();
     tokio::spawn(async move {
-        let make_svc = make_service_fn(move |_| {
-            let cluster = cluster_metrics.clone();
-            let data_dir = data_dir_metrics.clone();
-            async move {
-                Ok::<_, Infallible>(service_fn(move |_req: HttpRequest<HttpBody>| {
-                    let cluster = cluster.clone();
-                    let data_dir = data_dir.clone();
-                    async move {
-                        for (peer, alive) in cluster.peer_health().await {
-                            NODE_HEALTH
-                                .with_label_values(&[peer.as_str()])
-                                .set(if alive { 1.0 } else { 0.0 });
-                        }
-                        let self_addr = cluster.self_addr().to_string();
-                        let self_alive = cluster.self_healthy().await;
-                        NODE_HEALTH
-                            .with_label_values(&[self_addr.as_str()])
-                            .set(if self_alive { 1.0 } else { 0.0 });
-                        let mut sys = System::new_all();
-                        sys.refresh_memory();
-                        sys.refresh_cpu();
-                        let ram = sys.used_memory() as f64 * 1024.0;
-                        let cpu = sys.global_cpu_info().cpu_usage() as f64;
-                        RAM_USAGE.set(ram);
-                        CPU_USAGE.set(cpu);
-                        let disk = sstable_disk_usage(&data_dir) as f64;
-                        SSTABLE_DISK_USAGE.set(disk);
-
-                        let body = tl_metrics::encode_to_string().unwrap_or_default();
-                        let response = HttpResponse::builder()
-                            .header(
-                                CONTENT_TYPE,
-                                HeaderValue::from_static("text/plain; version=0.0.4"),
-                            )
-                            .body(HttpBody::from(body))
-                            .unwrap();
-                        Ok::<_, Infallible>(response)
-                    }
-                }))
+        let mut sys = System::new_all();
+        loop {
+            for (peer, alive) in cluster_metrics.peer_health().await {
+                NODE_HEALTH
+                    .with_label_values(&[peer.as_str()])
+                    .set(if alive { 1.0 } else { 0.0 });
             }
+            let self_addr = cluster_metrics.self_addr().to_string();
+            let self_alive = cluster_metrics.self_healthy().await;
+            NODE_HEALTH
+                .with_label_values(&[self_addr.as_str()])
+                .set(if self_alive { 1.0 } else { 0.0 });
+
+            sys.refresh_memory();
+            sys.refresh_cpu();
+            let ram = sys.used_memory() as f64 * 1024.0;
+            let cpu = sys.global_cpu_info().cpu_usage() as f64;
+            RAM_USAGE.set(ram);
+            CPU_USAGE.set(cpu);
+            let disk = sstable_disk_usage(&data_dir_metrics) as f64;
+            SSTABLE_DISK_USAGE.set(disk);
+
+            sleep(Duration::from_secs(10)).await;
+        }
+    });
+
+    tokio::spawn(async move {
+        let make_svc = make_service_fn(|_| async {
+            Ok::<_, Infallible>(service_fn(|_req: HttpRequest<HttpBody>| async move {
+                let body = tl_metrics::encode_to_string().unwrap_or_default();
+                let response = HttpResponse::builder()
+                    .header(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("text/plain; version=0.0.4"),
+                    )
+                    .body(HttpBody::from(body))
+                    .unwrap();
+                Ok::<_, Infallible>(response)
+            }))
         });
 
         if let Err(e) = HyperServer::bind(&metrics_addr).serve(make_svc).await {

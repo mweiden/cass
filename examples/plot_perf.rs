@@ -1,5 +1,5 @@
-use plotters::prelude::*;
 use plotters::coord::Shift;
+use plotters::prelude::*;
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs;
@@ -28,20 +28,34 @@ fn parse_cassandra_stress_log(path: &str) -> Option<Metrics> {
     let mut m = Metrics::default();
     for line in content.lines() {
         if let Some(c) = re_op.captures(line) {
-            if let Some(v) = parse_number(&c[1]) { m.op_rate = v; }
+            if let Some(v) = parse_number(&c[1]) {
+                m.op_rate = v;
+            }
         }
         if let Some(c) = re_row.captures(line) {
-            if let Some(v) = parse_number(&c[1]) { m.row_rate = v; }
+            if let Some(v) = parse_number(&c[1]) {
+                m.row_rate = v;
+            }
         }
         if let Some(c) = re_mean.captures(line) {
-            if let Some(v) = parse_number(&c[1]) { m.mean_ms = v; }
+            if let Some(v) = parse_number(&c[1]) {
+                m.mean_ms = v;
+            }
         }
         if let Some(c) = re_p95.captures(line) {
-            if let Some(v) = parse_number(&c[1]) { m.p95_ms = v; }
+            if let Some(v) = parse_number(&c[1]) {
+                m.p95_ms = v;
+            }
         }
     }
-    if m.row_rate == 0.0 { m.row_rate = m.op_rate; }
-    if m.op_rate > 0.0 || m.mean_ms > 0.0 { Some(m) } else { None }
+    if m.row_rate == 0.0 {
+        m.row_rate = m.op_rate;
+    }
+    if m.op_rate > 0.0 || m.mean_ms > 0.0 {
+        Some(m)
+    } else {
+        None
+    }
 }
 
 fn parse_cass_perf_log(path: &str) -> HashMap<String, Metrics> {
@@ -67,19 +81,29 @@ fn parse_cass_perf_log(path: &str) -> HashMap<String, Metrics> {
             current_kind = c[1].to_string();
             out.entry(current_kind.clone()).or_default();
         }
-        if current_kind.is_empty() { continue; }
+        if current_kind.is_empty() {
+            continue;
+        }
         let entry = out.entry(current_kind.clone()).or_default();
         if let Some(c) = re_op.captures(line) {
-            if let Some(v) = parse_number(&c[1]) { entry.op_rate = v; }
+            if let Some(v) = parse_number(&c[1]) {
+                entry.op_rate = v;
+            }
         }
         if let Some(c) = re_row.captures(line) {
-            if let Some(v) = parse_number(&c[1]) { entry.row_rate = v; }
+            if let Some(v) = parse_number(&c[1]) {
+                entry.row_rate = v;
+            }
         }
         if let Some(c) = re_mean.captures(line) {
-            if let Some(v) = parse_number(&c[1]) { entry.mean_ms = v; }
+            if let Some(v) = parse_number(&c[1]) {
+                entry.mean_ms = v;
+            }
         }
         if let Some(c) = re_p95.captures(line) {
-            if let Some(v) = parse_number(&c[1]) { entry.p95_ms = v; }
+            if let Some(v) = parse_number(&c[1]) {
+                entry.p95_ms = v;
+            }
         }
     }
     out
@@ -124,14 +148,13 @@ where
         .draw()?;
 
     // cass line (blue)
-    let series_a: Vec<(i32, f64)> = threads
-        .iter()
-        .cloned()
-        .zip(cass.iter().cloned())
-        .collect();
-    chart
-        .draw_series(LineSeries::new(series_a.clone(), BLUE.stroke_width(2)))?;
-    chart.draw_series(series_a.iter().map(|(x, y)| Circle::new((*x, *y), 3, BLUE.filled())))?;
+    let series_a: Vec<(i32, f64)> = threads.iter().cloned().zip(cass.iter().cloned()).collect();
+    chart.draw_series(LineSeries::new(series_a.clone(), BLUE.stroke_width(2)))?;
+    chart.draw_series(
+        series_a
+            .iter()
+            .map(|(x, y)| Circle::new((*x, *y), 3, BLUE.filled())),
+    )?;
 
     // cassandra line (red)
     let series_b: Vec<(i32, f64)> = threads
@@ -139,9 +162,12 @@ where
         .cloned()
         .zip(cassandra.iter().cloned())
         .collect();
-    chart
-        .draw_series(LineSeries::new(series_b.clone(), RED.stroke_width(2)))?;
-    chart.draw_series(series_b.iter().map(|(x, y)| TriangleMarker::new((*x, *y), 4, RED.filled())))?;
+    chart.draw_series(LineSeries::new(series_b.clone(), RED.stroke_width(2)))?;
+    chart.draw_series(
+        series_b
+            .iter()
+            .map(|(x, y)| TriangleMarker::new((*x, *y), 4, RED.filled())),
+    )?;
 
     // No per-panel legend; a single global legend is drawn by the caller
 
@@ -154,7 +180,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "perf-results/perf_comparison.png".to_string());
-    let threads_arg = args.get(2).cloned().unwrap_or_else(|| "1 4 8 32 64".to_string());
+    let threads_arg = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "1 4 8 32 64".to_string());
     let thread_counts: Vec<i32> = threads_arg
         .split_whitespace()
         .filter_map(|s| s.parse::<i32>().ok())
@@ -204,14 +233,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             res_dir
                 .join(format!("cassandra_write_t{}.log", t))
                 .to_str()
-                .unwrap_or("")
+                .unwrap_or(""),
         )
         .unwrap_or_default();
         let cs_r = parse_cassandra_stress_log(
             res_dir
                 .join(format!("cassandra_read_t{}.log", t))
                 .to_str()
-                .unwrap_or("")
+                .unwrap_or(""),
         )
         .unwrap_or_default();
 
@@ -309,14 +338,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let x_center = (w as i32) / 2;
     let y = band_top + (legend_h as i32) / 2;
     // cass (blue)
-    root.draw(&Rectangle::new([(x_center - 120, y - 8), (x_center - 108, y + 4)], BLUE.filled()))?;
+    root.draw(&Rectangle::new(
+        [(x_center - 120, y - 8), (x_center - 108, y + 4)],
+        BLUE.filled(),
+    ))?;
     root.draw(&Text::new(
         "cass",
         (x_center - 100, y + 4),
         ("sans-serif", 16).into_font(),
     ))?;
     // cassandra (red)
-    root.draw(&Rectangle::new([(x_center + 20, y - 8), (x_center + 32, y + 4)], RED.filled()))?;
+    root.draw(&Rectangle::new(
+        [(x_center + 20, y - 8), (x_center + 32, y + 4)],
+        RED.filled(),
+    ))?;
     root.draw(&Text::new(
         "cassandra",
         (x_center + 40, y + 4),

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::TryInto,
     io::Cursor,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -28,7 +29,6 @@ use serde_json::{Value, json};
 use sqlparser::ast::{
     AssignmentTarget, Expr, ObjectName, ObjectType, SelectItem, SetExpr, Statement, TableFactor,
 };
-use sysinfo::Disks;
 use tokio::{sync::RwLock, time::sleep};
 
 fn output_to_proto(out: QueryOutput) -> QueryResponse {
@@ -219,42 +219,14 @@ impl Cluster {
         };
         if !skip_disk_health {
             if let Some(path) = db.storage().local_path().map(|p| p.to_path_buf()) {
-            let disk_health = disk_ok.clone();
-            tokio::spawn(async move {
-                loop {
-                    let path_clone = path.clone();
-                    let healthy = tokio::task::spawn_blocking(move || {
-                        let mut disks = Disks::new_with_refreshed_list();
-                        disks.refresh();
-                        // Default to healthy in ambiguous environments (CI, containers) where
-                        // disk stats may be incomplete or unavailable.
-                        if let Some(disk) = disks
-                            .list()
-                            .iter()
-                            .find(|d| path_clone.starts_with(d.mount_point()))
-                        {
-                            let total = disk.total_space();
-                            let avail = disk.available_space();
-                            if total == 0 {
-                                // Unknown total — treat as healthy
-                                true
-                            } else if avail == 0 {
-                                // Some platforms report 0 for unavailable; avoid false negatives
-                                true
-                            } else {
-                                // Mark unhealthy only when confidently below 5% free
-                                (avail as f64 / total as f64) >= 0.05
-                            }
-                        } else {
-                            true
-                        }
-                    })
-                    .await
-                    .unwrap_or(true);
-                    disk_health.store(healthy, Ordering::Relaxed);
-                    sleep(Duration::from_secs(10)).await;
-                }
-            });
+                let disk_health = disk_ok.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let healthy = disk_is_healthy(&path);
+                        disk_health.store(healthy, Ordering::Relaxed);
+                        sleep(Duration::from_secs(10)).await;
+                    }
+                });
             }
         }
 
@@ -1291,6 +1263,46 @@ impl Cluster {
         } else {
             Ok(output_to_proto(QueryOutput::Rows(Vec::new())))
         }
+    }
+}
+
+fn disk_is_healthy(path: &Path) -> bool {
+    match disk_free_ratio(path) {
+        Some(ratio) => ratio >= 0.05,
+        None => true,
+    }
+}
+
+fn disk_free_ratio(path: &Path) -> Option<f64> {
+    #[cfg(target_family = "unix")]
+    {
+        use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut stat = MaybeUninit::<libc::statvfs>::uninit();
+        let res = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+        if res != 0 {
+            return None;
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.f_blocks == 0 || stat.f_frsize == 0 {
+            return None;
+        }
+        if stat.f_bavail == 0 {
+            // Some platforms report 0 when the value is unavailable; assume healthy.
+            return Some(1.0);
+        }
+        let total = (stat.f_blocks as f64) * (stat.f_frsize as f64);
+        if total == 0.0 {
+            return None;
+        }
+        let avail = (stat.f_bavail as f64) * (stat.f_frsize as f64);
+        Some(avail / total)
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = path;
+        None
     }
 }
 
