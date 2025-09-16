@@ -123,6 +123,11 @@ done
 docker exec cassA1 nodetool tpstats > "$OUTDIR/cassandra_metrics.log"
 
 # Generate unified comparison plot across thread counts
-cargo run --example plot_perf -- "$OUTDIR/perf_comparison.png" "$THREADS_SET"
+PLOT_FEATURES=${PLOT_FEATURES:-plot-ttf}
+if [[ -n "$PLOT_FEATURES" ]]; then
+  cargo run --features "$PLOT_FEATURES" --example plot_perf -- "$OUTDIR/perf_comparison.png" "$THREADS_SET"
+else
+  cargo run --example plot_perf -- "$OUTDIR/perf_comparison.png" "$THREADS_SET"
+fi
 
 echo "Results stored under $OUTDIR"
