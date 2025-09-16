@@ -332,9 +332,9 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     info!("Cass gRPC server listening on {addr}");
     let trace_layer = TraceLayer::new_for_grpc()
-        .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
-        .on_request(DefaultOnRequest::new().level(Level::INFO))
-        .on_response(DefaultOnResponse::new().level(Level::INFO));
+        .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
+        .on_request(DefaultOnRequest::new().level(Level::DEBUG))
+        .on_response(DefaultOnResponse::new().level(Level::DEBUG));
     Server::builder()
         .layer(metrics_layer)
         .layer(trace_layer)
