@@ -1,12 +1,34 @@
 #!/usr/bin/env bash
 set -euox pipefail
 
+# Perf compare harness: runs cass (docker compose) and Apache Cassandra (docker) and
+# collects throughput/latency logs, then plots a comparison.
+#
+# Usage:
+#   scripts/perf_compare.sh [--cass-only]
+#
+# Flags:
+#   --cass-only   Skip the Apache Cassandra phase; only run cass and write cass_*.log.
+#                 Useful when you already have cassandra_* logs in $OUTDIR.
+
 OPS=${OPS:-5000}
 OUTDIR=${OUTDIR:-perf-results}
 CASS_NODE=${CASS_NODE:-http://localhost:8080}
 THREADS=${THREADS:-54}
 # Space-separated set of thread counts to test
 THREADS_SET=${THREADS_SET:-"1 2 4 8 16 32 64"}
+# If set (or --cass-only flag passed), skip Cassandra phase and only collect cass metrics
+CASS_ONLY=${CASS_ONLY:-0}
+
+# CLI flag: --cass-only
+for arg in "$@"; do
+  case "$arg" in
+    --cass-only)
+      CASS_ONLY=1
+      shift || true
+      ;;
+  esac
+done
 
 cleanup() {
   # Tear down cass cluster if still up
@@ -96,31 +118,35 @@ start_cassandra_cluster() {
   done
 }
 
-start_cassandra_cluster
+if [[ "$CASS_ONLY" -eq 0 ]]; then
+  start_cassandra_cluster
 
-# Load the user profile for analogous queries (INSERT/SELECT by primary key)
-docker cp scripts/cassandra_stress_profile.yaml cassA1:/tmp/profile.yaml
+  # Load the user profile for analogous queries (INSERT/SELECT by primary key)
+  docker cp scripts/cassandra_stress_profile.yaml cassA1:/tmp/profile.yaml
 
-# Ensure a clean keyspace
-docker exec cassA1 cqlsh -e "DROP KEYSPACE IF EXISTS perf_rf3;" || true
+  # Ensure a clean keyspace
+  docker exec cassA1 cqlsh -e "DROP KEYSPACE IF EXISTS perf_rf3;" || true
 
-for T in $THREADS_SET; do
-  echo "Running cassandra-stress with threads=$T ..."
-  # Writes with QUORUM consistency (built-in insert op)
-  docker exec cassA1 /opt/cassandra/tools/bin/cassandra-stress \
-    user profile=/tmp/profile.yaml 'ops(insert=1)' n=$OPS cl=QUORUM -node cassA1 -mode native cql3 \
-    -rate threads=$T \
-    > "$OUTDIR/cassandra_write_t${T}.log"
+  for T in $THREADS_SET; do
+    echo "Running cassandra-stress with threads=$T ..."
+    # Writes with QUORUM consistency (built-in insert op)
+    docker exec cassA1 /opt/cassandra/tools/bin/cassandra-stress \
+      user profile=/tmp/profile.yaml 'ops(insert=1)' n=$OPS cl=QUORUM -node cassA1 -mode native cql3 \
+      -rate threads=$T \
+      > "$OUTDIR/cassandra_write_t${T}.log"
 
-  # Reads with QUORUM consistency (primary key lookup)
-  docker exec cassA1 /opt/cassandra/tools/bin/cassandra-stress \
-    user profile=/tmp/profile.yaml 'ops(select1=1)' n=$OPS cl=QUORUM -node cassA1 -mode native cql3 \
-    -rate threads=$T \
-    > "$OUTDIR/cassandra_read_t${T}.log"
-done
+    # Reads with QUORUM consistency (primary key lookup)
+    docker exec cassA1 /opt/cassandra/tools/bin/cassandra-stress \
+      user profile=/tmp/profile.yaml 'ops(select1=1)' n=$OPS cl=QUORUM -node cassA1 -mode native cql3 \
+      -rate threads=$T \
+      > "$OUTDIR/cassandra_read_t${T}.log"
+  done
 
-# Capture metrics from Cassandra
-docker exec cassA1 nodetool tpstats > "$OUTDIR/cassandra_metrics.log"
+  # Capture metrics from Cassandra
+  docker exec cassA1 nodetool tpstats > "$OUTDIR/cassandra_metrics.log"
+else
+  echo "Skipping Cassandra phase (--cass-only); using existing cassandra_* logs in $OUTDIR if present."
+fi
 
 # Generate unified comparison plot across thread counts
 PLOT_FEATURES=${PLOT_FEATURES:-plot-ttf}
