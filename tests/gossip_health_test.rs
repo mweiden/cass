@@ -5,19 +5,19 @@ use cass::rpc::{HealthRequest, QueryRequest, cass_client::CassClient};
 use serde_json::Value;
 
 mod common;
-use common::CassProcess;
+use common::{CassProcess, free_http_addr};
 
 /// The health endpoint reports the node's tokens.
 #[tokio::test]
 async fn health_endpoint_reports_tokens() {
-    let base = "http://127.0.0.1:18085";
+    let base = free_http_addr();
     let dir = tempfile::tempdir().unwrap();
     let _child = CassProcess::spawn([
         "server",
         "--data-dir",
         dir.path().to_str().unwrap(),
         "--node-addr",
-        base,
+        &base,
         "--rf",
         "1",
         "--vnodes",
@@ -25,13 +25,13 @@ async fn health_endpoint_reports_tokens() {
     ]);
 
     for _ in 0..20 {
-        if CassClient::connect(base.to_string()).await.is_ok() {
+        if CassClient::connect(base.clone()).await.is_ok() {
             break;
         }
         sleep(Duration::from_millis(100)).await;
     }
 
-    let mut client = CassClient::connect(base.to_string()).await.unwrap();
+    let mut client = CassClient::connect(base.clone()).await.unwrap();
     let body = client
         .health(HealthRequest {})
         .await
@@ -46,8 +46,8 @@ async fn health_endpoint_reports_tokens() {
 /// Queries fail when the required number of healthy replicas is not met.
 #[tokio::test]
 async fn errors_when_not_enough_healthy_replicas() {
-    let base1 = "http://127.0.0.1:18091";
-    let base2 = "http://127.0.0.1:18092";
+    let base1 = free_http_addr();
+    let base2 = free_http_addr();
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
 
@@ -56,9 +56,9 @@ async fn errors_when_not_enough_healthy_replicas() {
         "--data-dir",
         dir1.path().to_str().unwrap(),
         "--node-addr",
-        base1,
+        &base1,
         "--peer",
-        base2,
+        &base2,
         "--rf",
         "2",
     ]);
@@ -67,23 +67,23 @@ async fn errors_when_not_enough_healthy_replicas() {
         "--data-dir",
         dir2.path().to_str().unwrap(),
         "--node-addr",
-        base2,
+        &base2,
         "--peer",
-        base1,
+        &base1,
         "--rf",
         "2",
     ]);
 
     for _ in 0..20 {
-        let ok1 = CassClient::connect(base1.to_string()).await.is_ok();
-        let ok2 = CassClient::connect(base2.to_string()).await.is_ok();
+        let ok1 = CassClient::connect(base1.clone()).await.is_ok();
+        let ok2 = CassClient::connect(base2.clone()).await.is_ok();
         if ok1 && ok2 {
             break;
         }
         sleep(Duration::from_millis(100)).await;
     }
 
-    let mut c1 = CassClient::connect(base1.to_string()).await.unwrap();
+    let mut c1 = CassClient::connect(base1.clone()).await.unwrap();
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
     })
@@ -120,8 +120,8 @@ async fn errors_when_not_enough_healthy_replicas() {
 /// Lowering the read consistency allows queries to succeed with fewer healthy replicas.
 #[tokio::test]
 async fn read_succeeds_with_lower_consistency() {
-    let base1 = "http://127.0.0.1:18101";
-    let base2 = "http://127.0.0.1:18102";
+    let base1 = free_http_addr();
+    let base2 = free_http_addr();
     let dir1 = tempfile::tempdir().unwrap();
     let dir2 = tempfile::tempdir().unwrap();
 
@@ -130,9 +130,9 @@ async fn read_succeeds_with_lower_consistency() {
         "--data-dir",
         dir1.path().to_str().unwrap(),
         "--node-addr",
-        base1,
+        &base1,
         "--peer",
-        base2,
+        &base2,
         "--rf",
         "2",
         "--read-consistency",
@@ -143,9 +143,9 @@ async fn read_succeeds_with_lower_consistency() {
         "--data-dir",
         dir2.path().to_str().unwrap(),
         "--node-addr",
-        base2,
+        &base2,
         "--peer",
-        base1,
+        &base1,
         "--rf",
         "2",
         "--read-consistency",
@@ -153,15 +153,15 @@ async fn read_succeeds_with_lower_consistency() {
     ]);
 
     for _ in 0..20 {
-        let ok1 = CassClient::connect(base1.to_string()).await.is_ok();
-        let ok2 = CassClient::connect(base2.to_string()).await.is_ok();
+        let ok1 = CassClient::connect(base1.clone()).await.is_ok();
+        let ok2 = CassClient::connect(base2.clone()).await.is_ok();
         if ok1 && ok2 {
             break;
         }
         sleep(Duration::from_millis(100)).await;
     }
 
-    let mut c1 = CassClient::connect(base1.to_string()).await.unwrap();
+    let mut c1 = CassClient::connect(base1.clone()).await.unwrap();
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
     })

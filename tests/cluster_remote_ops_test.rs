@@ -7,7 +7,7 @@ use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
 
 mod common;
-use common::CassProcess;
+use common::{CassProcess, free_http_addr};
 
 async fn build_cluster(peers: Vec<String>, self_addr: &str) -> Cluster {
     let dir = tempdir().unwrap();
@@ -28,47 +28,47 @@ fn applied(resp: &cass::rpc::QueryResponse) -> Option<String> {
 
 #[tokio::test]
 async fn flush_all_calls_remote_nodes() {
-    let remote_addr = "http://127.0.0.1:9301";
+    let remote_addr = free_http_addr();
     let dir_remote = tempdir().unwrap();
     let _remote = CassProcess::spawn([
         "server",
         "--data-dir",
         dir_remote.path().to_str().unwrap(),
         "--node-addr",
-        remote_addr,
+        &remote_addr,
     ]);
 
-    for _ in 0..20 {
-        if CassClient::connect(remote_addr.to_string()).await.is_ok() {
-            break;
-        }
+    let mut ready = false;
+    for _ in 0..100 { // up to ~5s
+        if CassClient::connect(remote_addr.clone()).await.is_ok() { ready = true; break; }
         sleep(Duration::from_millis(50)).await;
     }
+    assert!(ready, "remote server did not become ready: {}", remote_addr);
 
-    let cluster = build_cluster(vec![remote_addr.to_string()], "http://127.0.0.1:9300").await;
+    let cluster = build_cluster(vec![remote_addr.clone()], &free_http_addr()).await;
     cluster.flush_all().await.unwrap();
 }
 
 #[tokio::test]
 async fn execute_lwt_remote_branches() {
-    let remote_addr = "http://127.0.0.1:9401";
+    let remote_addr = free_http_addr();
     let dir_remote = tempdir().unwrap();
     let _remote = CassProcess::spawn([
         "server",
         "--data-dir",
         dir_remote.path().to_str().unwrap(),
         "--node-addr",
-        remote_addr,
+        &remote_addr,
     ]);
 
-    for _ in 0..40 {
-        if CassClient::connect(remote_addr.to_string()).await.is_ok() {
-            break;
-        }
+    let mut ready = false;
+    for _ in 0..100 { // up to ~5s
+        if CassClient::connect(remote_addr.clone()).await.is_ok() { ready = true; break; }
         sleep(Duration::from_millis(50)).await;
     }
+    assert!(ready, "remote server did not become ready: {}", remote_addr);
 
-    let cluster = build_cluster(vec![remote_addr.to_string()], "http://127.0.0.1:9400").await;
+    let cluster = build_cluster(vec![remote_addr.clone()], &free_http_addr()).await;
     cluster
         .execute("CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))", false)
         .await
@@ -92,7 +92,7 @@ async fn execute_lwt_remote_branches() {
         .unwrap();
     assert_eq!(applied(&resp2), Some("false".to_string()));
 
-    let mut client = CassClient::connect(remote_addr.to_string()).await.unwrap();
+    let mut client = CassClient::connect(remote_addr.clone()).await.unwrap();
     let res = client
         .query(QueryRequest {
             sql: "SELECT val FROM t WHERE id='a'".into(),

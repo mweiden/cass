@@ -31,3 +31,14 @@ impl Drop for CassProcess {
         self.kill();
     }
 }
+
+/// Allocate a free loopback HTTP address like "http://127.0.0.1:<ephemeral>".
+#[allow(dead_code)]
+pub fn free_http_addr() -> String {
+    use std::net::TcpListener;
+    // Bind to port 0 to let the OS choose an available port, then release it.
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).expect("bind 127.0.0.1:0");
+    let port = listener.local_addr().expect("local_addr").port();
+    drop(listener);
+    format!("http://127.0.0.1:{}", port)
+}
