@@ -53,7 +53,3 @@ plot-ttf = ["plotters/ttf"]
 [[bench]]
 name = "lookup"
 harness = false
-
-[[bench]]
-name = "query_fast_paths"
-harness = false
