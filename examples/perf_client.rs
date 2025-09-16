@@ -36,9 +36,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Writes with concurrency
-    let (write_lat_ms, write_dur) = run_phase(args.node.clone(), args.ops, args.threads, true).await?;
+    let (write_lat_ms, write_dur) =
+        run_phase(args.node.clone(), args.ops, args.threads, true).await?;
     // Reads with concurrency
-    let (read_lat_ms, read_dur) = run_phase(args.node.clone(), args.ops, args.threads, false).await?;
+    let (read_lat_ms, read_dur) =
+        run_phase(args.node.clone(), args.ops, args.threads, false).await?;
 
     // Report in a style similar to cassandra-stress
     report("WRITE", args.ops, write_dur.as_secs_f64(), &write_lat_ms);
@@ -86,7 +88,9 @@ async fn run_phase(
         let count = if t < rem { base + 1 } else { base };
         let offset = t * base + t.min(rem);
         handles.push(tokio::spawn(async move {
-            if count == 0 { return; }
+            if count == 0 {
+                return;
+            }
             let mut client = CassClient::connect(node_cl).await.expect("connect");
             for i in 0..count {
                 let k = offset + i;
@@ -104,7 +108,9 @@ async fn run_phase(
             }
         }));
     }
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
     let dur = start.elapsed();
     let out = match Arc::try_unwrap(latencies) {
         Ok(m) => m.into_inner().unwrap_or_default(),

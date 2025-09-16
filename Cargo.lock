@@ -371,6 +371,7 @@ dependencies = [
  "futures",
  "hyper 0.14.32",
  "hyper-util",
+ "libc",
  "memmap2",
  "murmur3",
  "once_cell",
