@@ -259,6 +259,7 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
         wal: WalOptions {
             commitlog_sync_period: Duration::from_millis(args.commitlog_sync_period_ms),
         },
+        ..DatabaseOptions::default()
     };
     let db = Arc::new(Database::new_with_options(storage, "wal.log", db_options).await?);
     let cluster = Arc::new(Cluster::new_with_consistency(

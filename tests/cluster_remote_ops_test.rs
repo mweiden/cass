@@ -39,8 +39,12 @@ async fn flush_all_calls_remote_nodes() {
     ]);
 
     let mut ready = false;
-    for _ in 0..100 { // up to ~5s
-        if CassClient::connect(remote_addr.clone()).await.is_ok() { ready = true; break; }
+    for _ in 0..100 {
+        // up to ~5s
+        if CassClient::connect(remote_addr.clone()).await.is_ok() {
+            ready = true;
+            break;
+        }
         sleep(Duration::from_millis(50)).await;
     }
     assert!(ready, "remote server did not become ready: {}", remote_addr);
@@ -62,8 +66,12 @@ async fn execute_lwt_remote_branches() {
     ]);
 
     let mut ready = false;
-    for _ in 0..100 { // up to ~5s
-        if CassClient::connect(remote_addr.clone()).await.is_ok() { ready = true; break; }
+    for _ in 0..100 {
+        // up to ~5s
+        if CassClient::connect(remote_addr.clone()).await.is_ok() {
+            ready = true;
+            break;
+        }
         sleep(Duration::from_millis(50)).await;
     }
     assert!(ready, "remote server did not become ready: {}", remote_addr);
