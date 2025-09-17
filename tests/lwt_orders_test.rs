@@ -47,8 +47,6 @@ async fn lwt_update_on_orders_distributed_all_read_consistency() {
         sleep(Duration::from_millis(100)).await;
     }
 
-    sleep(Duration::from_secs(2)).await;
-
     let mut client = CassClient::connect(base1.to_string()).await.unwrap();
     client
         .query(QueryRequest { sql: "CREATE TABLE orders (customer_id TEXT, order_id TEXT, order_date TEXT, PRIMARY KEY(customer_id, order_id))".into() })

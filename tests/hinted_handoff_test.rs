@@ -94,20 +94,19 @@ async fn hinted_handoff_replays_when_node_recovers() {
             })
             .await;
         let mut c2 = CassClient::connect(base2.to_string()).await.unwrap();
-        if let Ok(resp) = c2
+        let resp = c2
             .query(QueryRequest {
                 sql: "SELECT val FROM kv WHERE id = 'h'".into(),
             })
             .await
-        {
-            let resp = resp.into_inner();
-            if let Some(query_response::Payload::Rows(rs)) = resp.payload {
-                if rs.rows.get(0).and_then(|r| r.columns.get("val")) == Some(&"1".to_string()) {
-                    break;
-                }
+            .unwrap()
+            .into_inner();
+        if let Some(query_response::Payload::Rows(rs)) = resp.payload {
+            if rs.rows.get(0).and_then(|r| r.columns.get("val")) == Some(&"1".to_string()) {
+                break;
             }
         }
-        if start.elapsed() > Duration::from_secs(10) {
+        if start.elapsed() > Duration::from_secs(4) {
             panic!("hint not delivered");
         }
         sleep(Duration::from_millis(100)).await;

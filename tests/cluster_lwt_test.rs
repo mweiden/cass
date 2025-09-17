@@ -10,7 +10,7 @@ async fn build_cluster(rf: usize, self_addr: &str) -> Cluster {
     let dir = tempdir().unwrap();
     let storage = Arc::new(LocalStorage::new(dir.path()));
     let db = Arc::new(Database::new(storage, "wal.log").await.unwrap());
-    Cluster::new(db, self_addr.to_string(), Vec::new(), 1, rf, rf, rf)
+    Cluster::new(db, self_addr.to_string(), Vec::new(), 1, rf, rf)
 }
 
 fn applied(resp: &QueryResponse) -> Option<String> {

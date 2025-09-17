@@ -262,20 +262,17 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
         ..DatabaseOptions::default()
     };
     let db = Arc::new(Database::new_with_options(storage, "wal.log", db_options).await?);
-    let read_consistency = match args.read_consistency.unwrap_or(Consistency::Quorum) {
-        Consistency::One => 1,
-        Consistency::Quorum => args.rf.max(1) / 2 + 1,
-        Consistency::All => args.rf.max(1),
-    };
-    let write_consistency = read_consistency;
     let cluster = Arc::new(Cluster::new_with_consistency(
         db.clone(),
         args.node_addr.clone(),
         args.peer.clone(),
         args.vnodes,
         args.rf,
-        read_consistency,
-        write_consistency,
+        match args.read_consistency.unwrap_or(Consistency::Quorum) {
+            Consistency::One => 1,
+            Consistency::Quorum => args.rf.max(1) / 2 + 1,
+            Consistency::All => args.rf.max(1),
+        },
     ));
 
     tl_metrics::try_init_settings(tl_metrics::GlobalSettings {

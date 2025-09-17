@@ -18,7 +18,6 @@ use crate::{
 };
 
 /// Structured results produced by the SQL engine.
-#[derive(Clone)]
 pub enum QueryOutput {
     /// Mutation summary with operation, unit, and affected count.
     Mutation {
@@ -59,7 +58,7 @@ pub fn split_ts(bytes: &[u8]) -> (u64, &[u8]) {
 }
 
 /// Errors that can occur when parsing or executing a query.
-#[derive(thiserror::Error, Debug, Clone)]
+#[derive(thiserror::Error, Debug)]
 pub enum QueryError {
     /// The input SQL could not be parsed.
     #[error("parse: {0}")]

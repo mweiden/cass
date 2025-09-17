@@ -11,7 +11,7 @@ async fn build_cluster(peers: Vec<String>, vnodes: usize, rf: usize, self_addr: 
     let dir = tempdir().unwrap();
     let storage = Arc::new(LocalStorage::new(dir.path()));
     let db = Arc::new(Database::new(storage, "wal.log").await.unwrap());
-    Cluster::new(db, self_addr.to_string(), peers, vnodes, rf, rf, rf)
+    Cluster::new(db, self_addr.to_string(), peers, vnodes, rf, rf)
 }
 
 fn first_val(resp: QueryResponse, col: &str) -> Option<String> {
