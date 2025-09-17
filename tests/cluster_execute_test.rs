@@ -65,6 +65,33 @@ async fn insert_errors_when_no_healthy_replicas() {
 }
 
 #[tokio::test]
+async fn insert_errors_when_quorum_unavailable() {
+    let addr = "http://127.0.0.1:6009";
+    let peer = "http://127.0.0.1:6010".to_string();
+    let cluster = build_cluster(vec![peer.clone()], 1, 2, addr).await;
+    cluster
+        .execute("CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))", false)
+        .await
+        .unwrap();
+
+    for _ in 0..50 {
+        if !cluster.is_alive(&peer).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let err = cluster
+        .execute("INSERT INTO t (id, val) VALUES ('a','1')", false)
+        .await
+        .unwrap_err();
+    match err {
+        QueryError::Other(msg) => assert_eq!(msg, "not enough healthy replicas"),
+        _ => panic!("unexpected error"),
+    }
+}
+
+#[tokio::test]
 async fn select_errors_when_all_replicas_unhealthy() {
     let addr = "http://127.0.0.1:6002";
     let cluster = build_cluster(Vec::new(), 1, 1, addr).await;

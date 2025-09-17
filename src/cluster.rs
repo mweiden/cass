@@ -29,7 +29,10 @@ use serde_json::{Value, json};
 use sqlparser::ast::{
     AssignmentTarget, Expr, ObjectName, ObjectType, SelectItem, SetExpr, Statement, TableFactor,
 };
-use tokio::{sync::RwLock, time::sleep};
+use tokio::{
+    sync::{RwLock, mpsc},
+    time::sleep,
+};
 
 fn output_to_proto(out: QueryOutput) -> QueryResponse {
     match out {
@@ -101,6 +104,7 @@ pub struct Cluster {
     ring: BTreeMap<u32, String>,
     rf: usize,
     read_cl: ConsistencyLevel,
+    write_cl: ConsistencyLevel,
     self_addr: String,
     health: Arc<RwLock<HashMap<String, Instant>>>,
     panic_until: Arc<RwLock<Option<Instant>>>,
@@ -237,12 +241,14 @@ impl Cluster {
         } else {
             ConsistencyLevel::Quorum
         };
+        let write_cl = read_cl;
 
         Self {
             db,
             ring,
             rf: rf.max(1),
             read_cl,
+            write_cl,
             self_addr,
             health,
             panic_until,
@@ -397,17 +403,24 @@ impl Cluster {
             .filter(|n| !healthy.contains(n))
             .cloned()
             .collect();
-        if !meta.broadcast {
-            if meta.is_write {
-                if healthy.is_empty() {
-                    return Err(QueryError::Other("no healthy replicas".into()));
-                }
-                if !unhealthy.is_empty() {
-                    self.store_hints(&unhealthy, sql.to_string(), ts).await;
-                }
-            } else if healthy.len() < self.read_cl.required(self.rf) {
-                return Err(QueryError::Other("not enough healthy replicas".into()));
+        if meta.is_write {
+            if healthy.is_empty() {
+                return Err(QueryError::Other("no healthy replicas".into()));
             }
+            let sql_owned = sql.to_string();
+            if !unhealthy.is_empty() {
+                self.store_hints(&unhealthy, sql_owned.clone(), ts).await;
+            }
+            if meta.broadcast {
+                let results = self.run_on_nodes(healthy, sql_owned, ts).await;
+                return self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta);
+            }
+            return self
+                .execute_write_with_consistency(sql_owned, ts, healthy, meta)
+                .await;
+        }
+        if !meta.broadcast && healthy.len() < self.read_cl.required(self.rf) {
+            return Err(QueryError::Other("not enough healthy replicas".into()));
         }
         let results = self
             .run_on_nodes(healthy.clone(), sql.to_string(), ts)
@@ -416,6 +429,86 @@ impl Cluster {
             self.read_repair(&meta, &results, replicas, unhealthy).await;
         }
         self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta)
+    }
+
+    async fn execute_write_with_consistency(
+        &self,
+        sql: String,
+        ts: u64,
+        healthy: Vec<String>,
+        meta: QueryMeta,
+    ) -> Result<QueryResponse, QueryError> {
+        let required = self.write_cl.required(self.rf);
+        if healthy.len() < required {
+            return Err(QueryError::Other("not enough healthy replicas".into()));
+        }
+
+        let mut successes = 0usize;
+        let mut results: Vec<Result<QueryOutput, QueryError>> = Vec::new();
+        let mut remote_nodes = Vec::new();
+
+        for node in healthy {
+            if node == self.self_addr {
+                let engine = SqlEngine::new();
+                let res = engine.execute_with_ts(&self.db, &sql, ts, true).await;
+                if res.is_ok() {
+                    successes += 1;
+                }
+                results.push(res);
+            } else {
+                remote_nodes.push(node);
+            }
+        }
+
+        if successes >= required {
+            return self.merge_results(results, meta);
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for node in remote_nodes {
+            let tx = tx.clone();
+            let sql_clone = sql.clone();
+            tokio::spawn(async move {
+                let target = node;
+                let payload = if ts > 0 {
+                    format!("--ts:{}\n{}", ts, sql_clone)
+                } else {
+                    sql_clone
+                };
+                let res = match CassClient::connect(target.clone()).await {
+                    Ok(mut client) => client
+                        .internal(Request::new(QueryRequest { sql: payload }))
+                        .await
+                        .map(|resp| proto_to_output(resp.into_inner()))
+                        .map_err(|e| QueryError::Other(e.to_string())),
+                    Err(e) => Err(QueryError::Other(e.to_string())),
+                };
+                let _ = tx.send((target, res));
+            });
+        }
+        drop(tx);
+
+        while let Some((node, res)) = rx.recv().await {
+            match res {
+                Ok(output) => {
+                    successes += 1;
+                    results.push(Ok(output));
+                }
+                Err(e) => {
+                    results.push(Err(e));
+                    self.store_hints(&[node], sql.clone(), ts).await;
+                }
+            }
+            if successes >= required {
+                break;
+            }
+        }
+
+        if successes < required {
+            return Err(QueryError::Other("failed to reach write quorum".into()));
+        }
+
+        self.merge_results(results, meta)
     }
 
     fn parse_forwarded(sql: &str) -> (u64, &str) {
