@@ -20,6 +20,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Core database type combining an in-memory memtable with a persistent
 /// storage layer.
+pub struct DatabaseOptions {
+    pub wal: wal::WalOptions,
+}
+
+impl Default for DatabaseOptions {
+    fn default() -> Self {
+        Self {
+            wal: wal::WalOptions::default(),
+        }
+    }
+}
+
 pub struct Database {
     storage: Arc<dyn storage::Storage>,
     memtable: memtable::MemTable,
@@ -36,8 +48,18 @@ impl Database {
         storage: Arc<dyn storage::Storage>,
         wal_path: impl Into<String>,
     ) -> std::io::Result<Self> {
+        Self::new_with_options(storage, wal_path, DatabaseOptions::default()).await
+    }
+
+    /// Create a new database instance with explicit configuration options.
+    pub async fn new_with_options(
+        storage: Arc<dyn storage::Storage>,
+        wal_path: impl Into<String>,
+        options: DatabaseOptions,
+    ) -> std::io::Result<Self> {
         let wal_path = wal_path.into();
-        let (wal, entries) = wal::Wal::new(storage.clone(), wal_path).await?;
+        let (wal, entries) =
+            wal::Wal::new_with_options(storage.clone(), wal_path, options.wal).await?;
         let memtable = memtable::MemTable::new();
         for (k, v) in entries {
             memtable.insert(k, v).await;
@@ -88,6 +110,11 @@ impl Database {
     /// Return a reference to the in-memory memtable used for writes.
     pub fn memtable(&self) -> &memtable::MemTable {
         &self.memtable
+    }
+
+    /// Force the write-ahead log to flush pending entries to storage.
+    pub async fn sync_wal(&self) -> std::io::Result<()> {
+        self.wal.flush().await
     }
 
     /// Current timestamp in microseconds since Unix epoch.

@@ -11,8 +11,11 @@ impl CassProcess {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let child = Command::new(env!("CARGO_BIN_EXE_cass"))
-            .args(args)
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cass"));
+        command.args(args);
+        command.arg("--commitlog-sync-period-ms");
+        command.arg("0");
+        let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

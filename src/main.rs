@@ -5,7 +5,7 @@ use std::{
 };
 
 use cass::{
-    Database,
+    Database, DatabaseOptions,
     cluster::Cluster,
     rpc::{
         FlushRequest, FlushResponse, HealthRequest, HealthResponse, LwtCommitRequest,
@@ -18,6 +18,7 @@ use cass::{
     },
     storage::{Storage, local::LocalStorage, s3::S3Storage},
     util::{print_rows, sstable_disk_usage},
+    wal::WalOptions,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hyper::{
@@ -87,6 +88,9 @@ struct ServerArgs {
     /// Server-level read consistency: ONE, QUORUM, ALL
     #[arg(long, value_enum)]
     read_consistency: Option<Consistency>,
+    /// Periodic commitlog fsync interval in milliseconds (0 for immediate flushes)
+    #[arg(long, default_value_t = 10_000)]
+    commitlog_sync_period_ms: u64,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -251,7 +255,12 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
             Arc::new(S3Storage::new(&bucket).await?)
         }
     };
-    let db = Arc::new(Database::new(storage, "wal.log").await?);
+    let db_options = DatabaseOptions {
+        wal: WalOptions {
+            commitlog_sync_period: Duration::from_millis(args.commitlog_sync_period_ms),
+        },
+    };
+    let db = Arc::new(Database::new_with_options(storage, "wal.log", db_options).await?);
     let cluster = Arc::new(Cluster::new_with_consistency(
         db.clone(),
         args.node_addr.clone(),
