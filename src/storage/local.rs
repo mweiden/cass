@@ -1,6 +1,9 @@
 use super::{Storage, StorageError};
 use async_trait::async_trait;
-use std::{collections::HashMap, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use tokio::{io::AsyncWriteExt, sync::Mutex};
 
 pub struct LocalStorage {
@@ -50,7 +53,11 @@ impl Storage for LocalStorage {
             if let Some(h) = map.get(&p) {
                 h.clone()
             } else {
-                let file = OpenOptions::new().create(true).append(true).open(&p).await?;
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&p)
+                    .await?;
                 let arc = std::sync::Arc::new(Mutex::new(file));
                 map.insert(p.clone(), arc.clone());
                 arc

@@ -22,12 +22,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// storage layer.
 pub struct DatabaseOptions {
     pub wal: wal::WalOptions,
+    /// Approximate upper bound (in bytes) before the memtable is flushed.
+    pub max_memtable_bytes: usize,
 }
 
 impl Default for DatabaseOptions {
     fn default() -> Self {
         Self {
             wal: wal::WalOptions::default(),
+            max_memtable_bytes: 128 * 1024 * 1024,
         }
     }
 }
@@ -36,7 +39,7 @@ pub struct Database {
     storage: Arc<dyn storage::Storage>,
     memtable: memtable::MemTable,
     sstables: tokio::sync::RwLock<Vec<sstable::SsTable>>,
-    max_memtable_size: usize,
+    max_memtable_bytes: usize,
     next_id: std::sync::atomic::AtomicUsize,
     wal: wal::Wal,
 }
@@ -58,8 +61,12 @@ impl Database {
         options: DatabaseOptions,
     ) -> std::io::Result<Self> {
         let wal_path = wal_path.into();
+        let DatabaseOptions {
+            wal: wal_options,
+            max_memtable_bytes,
+        } = options;
         let (wal, entries) =
-            wal::Wal::new_with_options(storage.clone(), wal_path, options.wal).await?;
+            wal::Wal::new_with_options(storage.clone(), wal_path, wal_options).await?;
         let memtable = memtable::MemTable::new();
         for (k, v) in entries {
             memtable.insert(k, v).await;
@@ -96,7 +103,7 @@ impl Database {
             memtable,
             sstables: tokio::sync::RwLock::new(sstables),
             // default threshold before automatically flushing to disk
-            max_memtable_size: 1024,
+            max_memtable_bytes,
             next_id: std::sync::atomic::AtomicUsize::new(next_id),
             wal,
         })
@@ -134,7 +141,7 @@ impl Database {
         let _ = self.wal.append(&rec).await;
 
         self.memtable.insert(key, value).await;
-        if self.memtable.len().await >= self.max_memtable_size {
+        if self.memtable.size_bytes().await >= self.max_memtable_bytes {
             // best-effort flush; ignore errors for now
             let _ = self.flush().await;
         }

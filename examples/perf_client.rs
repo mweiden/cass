@@ -2,8 +2,8 @@ use std::time::Instant;
 
 use cass::rpc::{QueryRequest, cass_client::CassClient};
 use clap::Parser;
-use statrs::statistics::Statistics;
 use futures::stream::{self, StreamExt};
+use statrs::statistics::Statistics;
 use tokio::fs;
 use url::Url;
 
@@ -40,11 +40,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Writes with concurrency
-    let (write_lat_ms, write_dur) =
-        run_phase(args.node.clone(), args.ops, args.threads, args.inflight, true).await?;
+    let (write_lat_ms, write_dur) = run_phase(
+        args.node.clone(),
+        args.ops,
+        args.threads,
+        args.inflight,
+        true,
+    )
+    .await?;
     // Reads with concurrency
-    let (read_lat_ms, read_dur) =
-        run_phase(args.node.clone(), args.ops, args.threads, args.inflight, false).await?;
+    let (read_lat_ms, read_dur) = run_phase(
+        args.node.clone(),
+        args.ops,
+        args.threads,
+        args.inflight,
+        false,
+    )
+    .await?;
 
     // Report in a style similar to cassandra-stress
     report("WRITE", args.ops, write_dur.as_secs_f64(), &write_lat_ms);
@@ -93,7 +105,9 @@ async fn run_phase(
         let offset = t * base + t.min(rem);
         handles.push(tokio::spawn(async move {
             let inflight = inflight.max(1);
-            if count == 0 { return Vec::<f64>::new(); }
+            if count == 0 {
+                return Vec::<f64>::new();
+            }
             let futs = (0..count).map(|i| {
                 // clone a client for this op; clones share the channel
                 let mut client = (*base_client).clone();
@@ -109,13 +123,18 @@ async fn run_phase(
                     op_start.elapsed().as_secs_f64() * 1000.0
                 }
             });
-            let lats: Vec<f64> = stream::iter(futs).buffer_unordered(inflight).collect().await;
+            let lats: Vec<f64> = stream::iter(futs)
+                .buffer_unordered(inflight)
+                .collect()
+                .await;
             lats
         }));
     }
     let mut all = Vec::with_capacity(ops);
     for h in handles {
-        if let Ok(v) = h.await { all.extend(v); }
+        if let Ok(v) = h.await {
+            all.extend(v);
+        }
     }
     let dur = start.elapsed();
     Ok((all, dur))
