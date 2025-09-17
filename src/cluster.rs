@@ -15,9 +15,12 @@ use crate::rpc::{
     LwtReadRequest, MetaResult, MetaRow, MutationResult, QueryRequest, QueryResponse, ResultSet,
     Row as RpcRow, ShowTablesResult, cass_client::CassClient, query_response,
 };
-use futures::future::join_all;
+use futures::{
+    future::join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use murmur3::murmur3_32;
-use tonic::Request;
+use tonic::{Request, transport::Channel};
 
 use crate::{
     Database, SqlEngine,
@@ -101,12 +104,14 @@ pub struct Cluster {
     ring: BTreeMap<u32, String>,
     rf: usize,
     read_cl: ConsistencyLevel,
+    write_cl: ConsistencyLevel,
     self_addr: String,
     health: Arc<RwLock<HashMap<String, Instant>>>,
     panic_until: Arc<RwLock<Option<Instant>>>,
     disk_ok: Arc<AtomicBool>,
     hints: Arc<RwLock<HashMap<String, Vec<(u64, String)>>>>,
     lwt: Arc<RwLock<HashMap<String, PaxosSlot>>>,
+    client_pool: Arc<RwLock<HashMap<String, CassClient<Channel>>>>,
 }
 
 struct QueryMeta {
@@ -142,6 +147,11 @@ impl ConsistencyLevel {
     }
 }
 
+struct WriteQuorumState {
+    successes: usize,
+    results: Vec<(String, Result<QueryOutput, QueryError>)>,
+}
+
 impl Cluster {
     /// Create a new cluster coordinator.
     pub fn new(
@@ -151,8 +161,17 @@ impl Cluster {
         vnodes: usize,
         rf: usize,
         read_consistency: usize,
+        write_consistency: usize,
     ) -> Self {
-        Self::new_with_consistency(db, self_addr, peers, vnodes, rf, read_consistency)
+        Self::new_with_consistency(
+            db,
+            self_addr,
+            peers,
+            vnodes,
+            rf,
+            read_consistency,
+            write_consistency,
+        )
     }
 
     /// Create a cluster with explicit LWT consistency.
@@ -163,6 +182,7 @@ impl Cluster {
         vnodes: usize,
         rf: usize,
         read_consistency: usize,
+        write_consistency: usize,
     ) -> Self {
         peers.push(self_addr.clone());
         let mut ring = BTreeMap::new();
@@ -178,7 +198,7 @@ impl Cluster {
         let mut initial = HashMap::new();
         for p in peers.iter() {
             if p != &self_addr {
-                initial.insert(p.clone(), Instant::now());
+                initial.insert(p.clone(), Instant::now() - Duration::from_secs(9));
             }
         }
         let health = Arc::new(RwLock::new(initial));
@@ -237,18 +257,27 @@ impl Cluster {
         } else {
             ConsistencyLevel::Quorum
         };
+        let write_cl = if write_consistency <= 1 {
+            ConsistencyLevel::One
+        } else if write_consistency >= rf.max(1) {
+            ConsistencyLevel::All
+        } else {
+            ConsistencyLevel::Quorum
+        };
 
         Self {
             db,
             ring,
             rf: rf.max(1),
             read_cl,
+            write_cl,
             self_addr,
             health,
             panic_until,
             disk_ok,
             hints: Arc::new(RwLock::new(HashMap::new())),
             lwt: Arc::new(RwLock::new(HashMap::new())),
+            client_pool: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -397,22 +426,45 @@ impl Cluster {
             .filter(|n| !healthy.contains(n))
             .cloned()
             .collect();
-        if !meta.broadcast {
-            if meta.is_write {
-                if healthy.is_empty() {
-                    return Err(QueryError::Other("no healthy replicas".into()));
-                }
-                if !unhealthy.is_empty() {
-                    self.store_hints(&unhealthy, sql.to_string(), ts).await;
-                }
-            } else if healthy.len() < self.read_cl.required(self.rf) {
+        let sql_owned = sql.to_string();
+        if meta.is_write {
+            if healthy.is_empty() {
+                return Err(QueryError::Other("no healthy replicas".into()));
+            }
+            if !unhealthy.is_empty() {
+                self.store_hints(&unhealthy, sql_owned.clone(), ts).await;
+            }
+            let required = if meta.broadcast {
+                healthy.len()
+            } else {
+                self.write_cl.required(self.rf)
+            };
+            if healthy.len() < required {
                 return Err(QueryError::Other("not enough healthy replicas".into()));
             }
+            let quorum = self
+                .run_write_with_quorum(healthy.clone(), sql_owned.clone(), ts, required)
+                .await;
+            for (node, res) in &quorum.results {
+                if res.is_err() {
+                    if node != &self.self_addr {
+                        self.store_hints(&vec![node.clone()], sql_owned.clone(), ts)
+                            .await;
+                    }
+                    self.mark_peer_unhealthy(node).await;
+                }
+            }
+            if quorum.successes < required {
+                return Err(QueryError::Other("not enough replicas acknowledged".into()));
+            }
+            let responses = quorum.results.into_iter().map(|(_, r)| r).collect();
+            return self.merge_results(responses, meta);
+        } else if healthy.len() < self.read_cl.required(self.rf) && !meta.broadcast {
+            return Err(QueryError::Other("not enough healthy replicas".into()));
         }
-        let results = self
-            .run_on_nodes(healthy.clone(), sql.to_string(), ts)
-            .await;
-        if !meta.is_write && !meta.broadcast {
+
+        let results = self.run_on_nodes(healthy.clone(), sql_owned, ts).await;
+        if !meta.broadcast {
             self.read_repair(&meta, &results, replicas, unhealthy).await;
         }
         self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta)
@@ -686,8 +738,8 @@ impl Cluster {
                         max_accepted_value = acc_v;
                     }
                 }
-            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
-                if let Ok(resp) = client
+            } else if let Ok(mut client) = self.client_for_node(node).await {
+                match client
                     .lwt_prepare(tonic::Request::new(LwtPrepareRequest {
                         namespace: ns.clone(),
                         key: key.clone(),
@@ -695,15 +747,23 @@ impl Cluster {
                     }))
                     .await
                 {
-                    let r = resp.into_inner();
-                    if r.promised {
-                        promised += 1;
-                        if r.ballot > max_accepted_ballot {
-                            max_accepted_ballot = r.ballot;
-                            max_accepted_value = r.value;
+                    Ok(resp) => {
+                        let r = resp.into_inner();
+                        if r.promised {
+                            promised += 1;
+                            if r.ballot > max_accepted_ballot {
+                                max_accepted_ballot = r.ballot;
+                                max_accepted_value = r.value;
+                            }
                         }
                     }
+                    Err(_) => {
+                        self.evict_client(node).await;
+                        self.mark_peer_unhealthy(node).await;
+                    }
                 }
+            } else {
+                self.mark_peer_unhealthy(node).await;
             }
         }
         if promised < required {
@@ -722,25 +782,33 @@ impl Cluster {
                     read_ballot = b;
                     read_value = v;
                 }
-            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
-                if let Ok(resp) = client
+            } else if let Ok(mut client) = self.client_for_node(node).await {
+                match client
                     .lwt_read(tonic::Request::new(LwtReadRequest {
                         namespace: ns.clone(),
                         key: key.clone(),
                     }))
                     .await
                 {
-                    let r = resp.into_inner();
-                    if r.ballot > read_ballot
-                        || (r.ballot == 0
-                            && read_ballot == 0
-                            && read_value.is_empty()
-                            && !r.value.is_empty())
-                    {
-                        read_ballot = r.ballot;
-                        read_value = r.value;
+                    Ok(resp) => {
+                        let r = resp.into_inner();
+                        if r.ballot > read_ballot
+                            || (r.ballot == 0
+                                && read_ballot == 0
+                                && read_value.is_empty()
+                                && !r.value.is_empty())
+                        {
+                            read_ballot = r.ballot;
+                            read_value = r.value;
+                        }
+                    }
+                    Err(_) => {
+                        self.evict_client(node).await;
+                        self.mark_peer_unhealthy(node).await;
                     }
                 }
+            } else {
+                self.mark_peer_unhealthy(node).await;
             }
         }
 
@@ -812,8 +880,8 @@ impl Cluster {
                 {
                     accepted += 1;
                 }
-            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
-                if let Ok(resp) = client
+            } else if let Ok(mut client) = self.client_for_node(node).await {
+                match client
                     .lwt_propose(tonic::Request::new(LwtProposeRequest {
                         namespace: ns.clone(),
                         key: key.clone(),
@@ -822,10 +890,18 @@ impl Cluster {
                     }))
                     .await
                 {
-                    if resp.into_inner().accepted {
-                        accepted += 1;
+                    Ok(resp) => {
+                        if resp.into_inner().accepted {
+                            accepted += 1;
+                        }
+                    }
+                    Err(_) => {
+                        self.evict_client(node).await;
+                        self.mark_peer_unhealthy(node).await;
                     }
                 }
+            } else {
+                self.mark_peer_unhealthy(node).await;
             }
         }
         if accepted < required {
@@ -836,14 +912,21 @@ impl Cluster {
         for node in &healthy {
             if node == &self.self_addr {
                 self.lwt_commit(&ns, &key, proposed_value.clone()).await;
-            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
-                let _ = client
+            } else if let Ok(mut client) = self.client_for_node(node).await {
+                if client
                     .lwt_commit(tonic::Request::new(LwtCommitRequest {
                         namespace: ns.clone(),
                         key: key.clone(),
                         value: proposed_value.clone(),
                     }))
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    self.evict_client(node).await;
+                    self.mark_peer_unhealthy(node).await;
+                }
+            } else {
+                self.mark_peer_unhealthy(node).await;
             }
         }
 
@@ -925,42 +1008,115 @@ impl Cluster {
         healthy
     }
 
+    async fn client_for_node(&self, node: &str) -> Result<CassClient<Channel>, QueryError> {
+        {
+            let pool = self.client_pool.read().await;
+            if let Some(client) = pool.get(node) {
+                return Ok(client.clone());
+            }
+        }
+
+        let mut pool = self.client_pool.write().await;
+        if let Some(client) = pool.get(node) {
+            return Ok(client.clone());
+        }
+
+        let client = CassClient::connect(node.to_string())
+            .await
+            .map_err(|e| QueryError::Other(e.to_string()))?;
+        pool.insert(node.to_string(), client.clone());
+        Ok(client)
+    }
+
+    async fn evict_client(&self, node: &str) {
+        let mut pool = self.client_pool.write().await;
+        pool.remove(node);
+    }
+
+    async fn mark_peer_unhealthy(&self, node: &str) {
+        let mut map = self.health.write().await;
+        map.insert(node.to_string(), Instant::now() - Duration::from_secs(9));
+    }
+
+    async fn execute_on_node(
+        &self,
+        node: &str,
+        sql: &str,
+        ts: u64,
+    ) -> Result<QueryOutput, QueryError> {
+        if node == self.self_addr {
+            let engine = SqlEngine::new();
+            engine.execute_with_ts(&self.db, sql, ts, true).await
+        } else {
+            let mut client = self.client_for_node(node).await?;
+            let payload = if ts > 0 {
+                format!("--ts:{}\n{}", ts, sql)
+            } else {
+                sql.to_string()
+            };
+            match client
+                .internal(Request::new(QueryRequest { sql: payload }))
+                .await
+            {
+                Ok(resp) => Ok(proto_to_output(resp.into_inner())),
+                Err(e) => {
+                    self.evict_client(node).await;
+                    Err(QueryError::Other(e.to_string()))
+                }
+            }
+        }
+    }
+
     async fn run_on_nodes(
         &self,
         nodes: Vec<String>,
         sql: String,
         ts: u64,
     ) -> Vec<(String, Result<QueryOutput, QueryError>)> {
-        let tasks: Vec<_> = nodes
-            .into_iter()
-            .map(|node| {
-                let db = self.db.clone();
-                let self_addr = self.self_addr.clone();
-                let sql_clone = sql.clone();
-                async move {
-                    let res = if node == self_addr {
-                        let engine = SqlEngine::new();
-                        engine.execute_with_ts(&db, &sql_clone, ts, true).await
-                    } else {
-                        let payload = if ts > 0 {
-                            format!("--ts:{}\n{}", ts, sql_clone.clone())
-                        } else {
-                            sql_clone.clone()
-                        };
-                        match CassClient::connect(node.clone()).await {
-                            Ok(mut client) => client
-                                .internal(Request::new(QueryRequest { sql: payload }))
-                                .await
-                                .map(|resp| proto_to_output(resp.into_inner()))
-                                .map_err(|e| QueryError::Other(e.to_string())),
-                            Err(e) => Err(QueryError::Other(e.to_string())),
-                        }
-                    };
-                    (node, res)
-                }
-            })
-            .collect();
-        join_all(tasks).await
+        let sql = Arc::new(sql);
+        let this = self;
+        let futures = nodes.into_iter().map(move |node| {
+            let sql = sql.clone();
+            async move {
+                let res = this.execute_on_node(&node, &sql, ts).await;
+                (node, res)
+            }
+        });
+        join_all(futures).await
+    }
+
+    async fn run_write_with_quorum(
+        &self,
+        nodes: Vec<String>,
+        sql: String,
+        ts: u64,
+        required: usize,
+    ) -> WriteQuorumState {
+        if nodes.is_empty() || required == 0 {
+            return WriteQuorumState {
+                successes: 0,
+                results: Vec::new(),
+            };
+        }
+        let sql = Arc::new(sql);
+        let mut futures = FuturesUnordered::new();
+        for node in nodes.into_iter() {
+            let sql = sql.clone();
+            let this = self;
+            futures.push(async move {
+                let res = this.execute_on_node(&node, &sql, ts).await;
+                (node, res)
+            });
+        }
+        let mut successes = 0usize;
+        let mut results = Vec::new();
+        while let Some((node, res)) = futures.next().await {
+            if res.is_ok() {
+                successes += 1;
+            }
+            results.push((node, res));
+        }
+        WriteQuorumState { successes, results }
     }
 
     /// Record failed writes as hints for later delivery.
@@ -1319,7 +1475,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = Arc::new(LocalStorage::new(dir.path()));
         let db = Arc::new(Database::new(storage, "wal.log").await.unwrap());
-        Cluster::new(db, self_addr.to_string(), peers, 1, 1, 1)
+        Cluster::new(db, self_addr.to_string(), peers, 1, 1, 1, 1)
     }
 
     #[test]

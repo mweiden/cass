@@ -83,6 +83,8 @@ async fn errors_when_not_enough_healthy_replicas() {
         sleep(Duration::from_millis(100)).await;
     }
 
+    sleep(Duration::from_secs(3)).await;
+
     let mut c1 = CassClient::connect(base1.clone()).await.unwrap();
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
@@ -105,7 +107,13 @@ async fn errors_when_not_enough_healthy_replicas() {
             })
             .await;
         if let Err(e) = res {
-            assert!(e.message().contains("not enough healthy replicas"));
+            let msg = e.message();
+            assert!(
+                msg.contains("not enough healthy replicas")
+                    || msg.contains("not enough replicas acknowledged"),
+                "unexpected error message: {}",
+                msg
+            );
             break;
         }
         if start.elapsed() > Duration::from_secs(2) {

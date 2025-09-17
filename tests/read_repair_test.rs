@@ -46,6 +46,8 @@ async fn read_repairs_stale_replicas() {
         sleep(Duration::from_millis(100)).await;
     }
 
+    sleep(Duration::from_secs(3)).await;
+
     let mut c1 = CassClient::connect(base1.to_string()).await.unwrap();
     let mut c2 = CassClient::connect(base2.to_string()).await.unwrap();
     c1.query(QueryRequest {

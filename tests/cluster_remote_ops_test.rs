@@ -13,7 +13,22 @@ async fn build_cluster(peers: Vec<String>, self_addr: &str) -> Cluster {
     let dir = tempdir().unwrap();
     let storage = Arc::new(LocalStorage::new(dir.path()));
     let db = Arc::new(Database::new(storage, "wal.log").await.unwrap());
-    Cluster::new(db, self_addr.to_string(), peers, 1, 2, 1)
+    let peer_list = peers.clone();
+    let cluster = Cluster::new(db, self_addr.to_string(), peers, 1, 2, 1, 1);
+    for _ in 0..100 {
+        let mut all_healthy = true;
+        for peer in &peer_list {
+            if !cluster.is_alive(peer).await {
+                all_healthy = false;
+                break;
+            }
+        }
+        if all_healthy {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    cluster
 }
 
 fn applied(resp: &cass::rpc::QueryResponse) -> Option<String> {
