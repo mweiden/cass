@@ -1,11 +1,16 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use std::{
-    sync::{Arc, Mutex as StdMutex},
+    future::Future,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::Duration,
 };
 use tokio::{
+    runtime::Builder,
     sync::{Mutex, Notify},
-    task::JoinHandle,
 };
 
 use crate::storage::{Storage, StorageError};
@@ -36,15 +41,16 @@ struct WalInner {
     path: String,
     storage: Arc<dyn Storage>,
     state: Mutex<WalState>,
+    flush_lock: Mutex<()>,
+    shutdown: AtomicBool,
     flush_interval: Duration,
     notify: Notify,
-    flush_task: StdMutex<Option<JoinHandle<()>>>,
+    flush_task: StdMutex<Option<thread::JoinHandle<()>>>,
 }
 
 struct WalState {
     data: Vec<u8>,
     flushed: usize,
-    shutdown: bool,
 }
 
 fn parse_entries(data: &[u8]) -> std::io::Result<Vec<(String, Vec<u8>)>> {
@@ -75,8 +81,25 @@ fn map_err(e: StorageError) -> std::io::Error {
     }
 }
 
+fn block_on_future<F, T>(future: F) -> T
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    thread::spawn(move || {
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build runtime for WAL drop")
+            .block_on(future)
+    })
+    .join()
+    .expect("blocking WAL drop thread panicked")
+}
+
 impl WalInner {
     async fn flush_pending(&self) -> std::io::Result<()> {
+        let _flush_guard = self.flush_lock.lock().await;
         let (to_flush, new_flushed) = {
             let state = self.state.lock().await;
             let end = state.data.len();
@@ -101,28 +124,37 @@ impl WalInner {
         Ok(())
     }
 
-    async fn shutdown_requested(&self) -> bool {
-        self.state.lock().await.shutdown
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
     }
 
-    fn set_flush_task(&self, handle: JoinHandle<()>) {
+    fn set_flush_task(&self, handle: thread::JoinHandle<()>) {
         let mut guard = self.flush_task.lock().unwrap();
         *guard = Some(handle);
     }
 
-    fn take_flush_task(&self) -> Option<JoinHandle<()>> {
+    fn take_flush_task(&self) -> Option<thread::JoinHandle<()>> {
         self.flush_task.lock().unwrap().take()
     }
 }
 
 impl Drop for Wal {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.inner.state.try_lock() {
-            state.shutdown = true;
+        let inner = self.inner.clone();
+
+        inner.shutdown.store(true, Ordering::Release);
+
+        inner.notify.notify_waiters();
+
+        if let Some(task) = inner.take_flush_task() {
+            if let Err(err) = task.join() {
+                eprintln!("wal flush worker panicked: {err:?}");
+            }
         }
-        self.inner.notify.notify_waiters();
-        if let Some(task) = self.inner.take_flush_task() {
-            task.abort();
+
+        let flush_inner = inner.clone();
+        if let Err(err) = block_on_future(async move { flush_inner.flush_pending().await }) {
+            eprintln!("wal flush error: {err}");
         }
     }
 }
@@ -153,8 +185,9 @@ impl Wal {
             state: Mutex::new(WalState {
                 data: buf,
                 flushed: initial_len,
-                shutdown: false,
             }),
+            flush_lock: Mutex::new(()),
+            shutdown: AtomicBool::new(false),
             flush_interval: options.commitlog_sync_period,
             notify: Notify::new(),
             flush_task: StdMutex::new(None),
@@ -162,22 +195,31 @@ impl Wal {
 
         if !inner.flush_interval.is_zero() {
             let worker_inner = inner.clone();
-            let handle = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(worker_inner.flush_interval) => {},
-                        _ = worker_inner.notify.notified() => {},
-                    }
+            let handle = thread::spawn(move || {
+                let runtime = Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build WAL worker runtime");
 
-                    if let Err(err) = worker_inner.flush_pending().await {
-                        eprintln!("wal flush error: {err}");
-                    }
+                runtime.block_on(async move {
+                    loop {
+                        tokio::select! {
+                            _ = tokio::time::sleep(worker_inner.flush_interval) => {},
+                            _ = worker_inner.notify.notified() => {},
+                        }
 
-                    if worker_inner.shutdown_requested().await {
-                        let _ = worker_inner.flush_pending().await;
-                        break;
+                        if let Err(err) = worker_inner.flush_pending().await {
+                            eprintln!("wal flush error: {err}");
+                        }
+
+                        if worker_inner.shutdown_requested() {
+                            if let Err(err) = worker_inner.flush_pending().await {
+                                eprintln!("wal flush error: {err}");
+                            }
+                            break;
+                        }
                     }
-                }
+                });
             });
             inner.set_flush_task(handle);
         }
