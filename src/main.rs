@@ -309,7 +309,7 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
 
             sys.refresh_memory();
             sys.refresh_cpu();
-            let ram = sys.used_memory() as f64 * 1024.0;
+            let ram = sys.used_memory() as f64;
             let cpu = sys.global_cpu_info().cpu_usage() as f64;
             RAM_USAGE.set(ram);
             CPU_USAGE.set(cpu);
