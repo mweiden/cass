@@ -15,7 +15,7 @@ use crate::rpc::{
     LwtReadRequest, MetaResult, MetaRow, MutationResult, QueryRequest, QueryResponse, ResultSet,
     Row as RpcRow, ShowTablesResult, cass_client::CassClient, query_response,
 };
-use futures::future::join_all;
+use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use murmur3::murmur3_32;
 use tonic::Request;
 
@@ -1073,37 +1073,36 @@ impl Cluster {
         let meta_results = Arc::new(Mutex::new(
             Vec::<(String, Vec<(String, u64, String)>)>::new(),
         ));
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut futures = FuturesUnordered::new();
         for node in nodes {
-            let tx = tx.clone();
             let sql = sql.clone();
             let cluster = self.clone();
-            tokio::spawn(async move {
+            futures.push(async move {
                 let res = cluster.execute_on_node(&node, &sql, ts).await;
-                let _ = tx.send((node, res));
+                (node, res)
             });
         }
-        drop(tx);
 
         let mut successes = 0usize;
         let mut received = 0usize;
         let mut collected: Vec<(String, Result<QueryOutput, QueryError>)> = Vec::new();
 
-        while let Some((node, res)) = rx.recv().await {
+        while let Some((node, res)) = futures.next().await {
             received += 1;
-            if res.is_ok() {
-                successes += 1;
-            }
             if let Ok(QueryOutput::Meta(rows)) = &res {
                 let mut guard = meta_results.lock().await;
                 guard.push((node.clone(), rows.clone()));
             }
-            collected.push((node, res));
-            if successes >= required {
-                break;
+            if res.is_ok() {
+                successes += 1;
             }
             if total - received + successes < required {
                 return Err(QueryError::Other("not enough replicas acknowledged".into()));
+            }
+            let done = successes >= required;
+            collected.push((node, res));
+            if done {
+                break;
             }
         }
 
@@ -1111,11 +1110,12 @@ impl Cluster {
             return Err(QueryError::Other("not enough replicas acknowledged".into()));
         }
 
-        let mut rx_remaining = rx;
         let meta_arc = meta_results.clone();
         let cluster = self.clone();
+        let meta_clone = meta.clone();
         tokio::spawn(async move {
-            while let Some((node, res)) = rx_remaining.recv().await {
+            let mut remaining = futures;
+            while let Some((node, res)) = remaining.next().await {
                 if let Ok(QueryOutput::Meta(rows)) = &res {
                     let mut guard = meta_arc.lock().await;
                     guard.push((node.clone(), rows.clone()));
@@ -1126,7 +1126,7 @@ impl Cluster {
                 guard.clone()
             };
             cluster
-                .read_repair(&meta, &final_results, replicas, unhealthy)
+                .read_repair(&meta_clone, &final_results, replicas, unhealthy)
                 .await;
         });
 
