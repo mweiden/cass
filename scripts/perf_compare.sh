@@ -60,6 +60,7 @@ for T in $THREADS_SET; do
 done
 # Capture Prometheus metrics from the prometheus node
 curl -s http://localhost:9090/metrics > "$OUTDIR/cass_metrics.prom"
+docker compose logs --no-color > perf-results/cass_server.log
 docker compose stop cass1 cass2 cass3 cass4 cass5 >/dev/null 2>&1 || true
 docker compose rm -f cass1 cass2 cass3 cass4 cass5 >/dev/null 2>&1 || true
 
