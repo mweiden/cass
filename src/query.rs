@@ -1,7 +1,8 @@
 //! Minimal SQL execution engine for the key-value store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::convert::TryInto;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlparser::ast::{
@@ -11,6 +12,9 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+
+use once_cell::sync::Lazy;
+use tokio::sync::RwLock;
 
 use crate::{
     Database,
@@ -75,6 +79,14 @@ impl ParsedQuery {
     pub fn base_sql(&self) -> &str {
         &self.base_sql
     }
+}
+
+type SchemaCache = Arc<RwLock<HashMap<(usize, String), Arc<TableSchema>>>>;
+
+static SCHEMA_CACHE: Lazy<SchemaCache> = Lazy::new(|| Arc::new(RwLock::new(HashMap::new())));
+
+fn schema_cache_key(db: &Database, table: &str) -> (usize, String) {
+    (db.instance_id(), table.to_string())
 }
 
 /// Split the leading 8-byte timestamp from a buffer, returning the timestamp and
@@ -350,6 +362,7 @@ impl SqlEngine {
                     db.clear_ns(&ns).await;
                     db.delete_ns("_tables", &ns).await;
                     db.delete_ns("_schemas", &ns).await;
+                    invalidate_schema_entry(db, &ns).await;
                     Ok(QueryOutput::Mutation {
                         op: "DROP TABLE".to_string(),
                         unit: "table".to_string(),
@@ -391,7 +404,10 @@ impl SqlEngine {
             }
             _ => return Err(QueryError::Unsupported),
         };
-        let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
+        let schema = lookup_schema(db, &ns)
+            .await
+            .ok_or(QueryError::Unsupported)?;
+        let schema_ref = schema.as_ref();
         let source = insert.source.ok_or(QueryError::Unsupported)?;
         let values = match *source.body {
             SetExpr::Values(v) => v,
@@ -405,7 +421,7 @@ impl SqlEngine {
                 .map(|c| c.value.to_lowercase())
                 .collect()
         } else {
-            schema.columns.clone()
+            schema_ref.columns.clone()
         };
 
         if let Some(LwtCondition::NotExists) = cond {
@@ -413,7 +429,7 @@ impl SqlEngine {
                 return Err(QueryError::Unsupported);
             }
             let (key, data) =
-                build_row(&schema, &cols, &values.rows[0]).ok_or(QueryError::Unsupported)?;
+                build_row(schema_ref, &cols, &values.rows[0]).ok_or(QueryError::Unsupported)?;
             let applied = db.insert_ns_if_absent_ts(&ns, key, data, ts).await;
             let mut row = BTreeMap::new();
             row.insert("[applied]".to_string(), applied.to_string());
@@ -421,7 +437,8 @@ impl SqlEngine {
         } else {
             let mut count = 0;
             for row in values.rows {
-                let (key, data) = build_row(&schema, &cols, &row).ok_or(QueryError::Unsupported)?;
+                let (key, data) =
+                    build_row(schema_ref, &cols, &row).ok_or(QueryError::Unsupported)?;
                 db.insert_ns_ts(&ns, key, data, ts).await;
                 count += 1;
             }
@@ -444,11 +461,14 @@ impl SqlEngine {
         cond: Option<&LwtCondition>,
     ) -> Result<QueryOutput, QueryError> {
         let ns = table_factor_to_ns(&table.relation).ok_or(QueryError::Unsupported)?;
-        let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
+        let schema = lookup_schema(db, &ns)
+            .await
+            .ok_or(QueryError::Unsupported)?;
+        let schema_ref = schema.as_ref();
         // schema-aware path using the WHERE clause for the key
         let where_expr = selection.ok_or(QueryError::Unsupported)?;
         let cond_map = where_to_map(&where_expr);
-        let key = build_single_key(&schema, &cond_map).ok_or(QueryError::Unsupported)?;
+        let key = build_single_key(schema_ref, &cond_map).ok_or(QueryError::Unsupported)?;
         let mut row_map = if let Some(bytes) = db.get_ns(&ns, &key).await {
             let (_, data) = split_ts(&bytes);
             decode_row(data)
@@ -485,7 +505,8 @@ impl SqlEngine {
             if let AssignmentTarget::ColumnName(name) = assign.target {
                 if let Some(id) = name.0.first().and_then(|p| p.as_ident()) {
                     let col = id.value.to_lowercase();
-                    if schema.partition_keys.contains(&col) || schema.clustering_keys.contains(&col)
+                    if schema_ref.partition_keys.contains(&col)
+                        || schema_ref.clustering_keys.contains(&col)
                     {
                         continue; // skip key columns
                     }
@@ -523,11 +544,13 @@ impl SqlEngine {
             return Err(QueryError::Unsupported);
         }
         let ns = table_factor_to_ns(&table[0].relation).ok_or(QueryError::Unsupported)?;
-        let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
+        let schema = lookup_schema(db, &ns)
+            .await
+            .ok_or(QueryError::Unsupported)?;
         // schema-aware deletion using key columns
         let expr = delete.selection.ok_or(QueryError::Unsupported)?;
         let cond_map = where_to_map(&expr);
-        let key = build_single_key(&schema, &cond_map).ok_or(QueryError::Unsupported)?;
+        let key = build_single_key(schema.as_ref(), &cond_map).ok_or(QueryError::Unsupported)?;
         // record tombstone with timestamp
         db.insert_ns_ts(&ns, key, Vec::new(), ts).await;
         Ok(1)
@@ -562,19 +585,22 @@ impl SqlEngine {
             return Err(QueryError::Unsupported);
         }
         let ns = table_factor_to_ns(&select.from[0].relation).ok_or(QueryError::Unsupported)?;
-        let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
+        let schema = lookup_schema(db, &ns)
+            .await
+            .ok_or(QueryError::Unsupported)?;
+        let schema_ref = schema.as_ref();
 
         // handle COUNT(*) with optional WHERE filtering
         if select.projection.len() == 1 {
             if let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0] {
                 if func.name.to_string().eq_ignore_ascii_case("count") {
                     let selection = select.selection.clone();
-                    return self.exec_count(db, &ns, &schema, selection).await;
+                    return self.exec_count(db, &ns, schema_ref, selection).await;
                 }
             }
         }
 
-        self.exec_select_schema(db, &ns, &schema, select, meta)
+        self.exec_select_schema(db, &ns, schema_ref, select, meta)
             .await
     }
 
@@ -784,7 +810,10 @@ impl SqlEngine {
                         }
                         _ => return Err(QueryError::Unsupported),
                     };
-                    let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
+                    let schema = lookup_schema(db, &ns)
+                        .await
+                        .ok_or(QueryError::Unsupported)?;
+                    let schema_ref = schema.as_ref();
                     let source = insert.source.as_ref().ok_or(QueryError::Unsupported)?;
                     let values = match &*source.body {
                         SetExpr::Values(v) => v,
@@ -797,10 +826,10 @@ impl SqlEngine {
                             .map(|c| c.value.to_lowercase())
                             .collect()
                     } else {
-                        schema.columns.clone()
+                        schema_ref.columns.clone()
                     };
                     for row in &values.rows {
-                        if let Some(key) = extract_partition_key(&schema, &cols, row) {
+                        if let Some(key) = extract_partition_key(schema_ref, &cols, row) {
                             keys.push(key);
                         }
                     }
@@ -810,7 +839,9 @@ impl SqlEngine {
                 } => {
                     needs_key = true;
                     let ns = table_factor_to_ns(&table.relation).ok_or(QueryError::Unsupported)?;
-                    let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
+                    let schema = lookup_schema(db, &ns)
+                        .await
+                        .ok_or(QueryError::Unsupported)?;
                     if let Some(expr) = selection.as_ref() {
                         let map = where_to_multi_map(expr);
                         keys.extend(build_keys(&schema.partition_keys, &map));
@@ -826,7 +857,9 @@ impl SqlEngine {
                     }
                     let ns =
                         table_factor_to_ns(&table[0].relation).ok_or(QueryError::Unsupported)?;
-                    let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
+                    let schema = lookup_schema(db, &ns)
+                        .await
+                        .ok_or(QueryError::Unsupported)?;
                     if let Some(expr) = delete.selection.as_ref() {
                         let map = where_to_multi_map(expr);
                         keys.extend(build_keys(&schema.partition_keys, &map));
@@ -840,7 +873,9 @@ impl SqlEngine {
                         }
                         let ns = table_factor_to_ns(&select.from[0].relation)
                             .ok_or(QueryError::Unsupported)?;
-                        let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
+                        let schema = lookup_schema(db, &ns)
+                            .await
+                            .ok_or(QueryError::Unsupported)?;
                         if let Some(expr) = select.selection.as_ref() {
                             let map = where_to_multi_map(expr);
                             keys.extend(build_keys(&schema.partition_keys, &map));
@@ -866,18 +901,39 @@ async fn register_table(db: &Database, table: &str) {
     }
 }
 
-/// Retrieve the schema for a table if it exists.
-async fn get_schema(db: &Database, table: &str) -> Option<TableSchema> {
-    db.get_ns("_schemas", table).await.and_then(|v| {
-        let (_, data) = split_ts(&v);
-        serde_json::from_slice(data).ok()
-    })
+async fn cache_schema_entry(db: &Database, table: &str, schema: Arc<TableSchema>) {
+    let key = schema_cache_key(db, table);
+    let mut guard = SCHEMA_CACHE.write().await;
+    guard.insert(key, schema);
+}
+
+async fn invalidate_schema_entry(db: &Database, table: &str) {
+    let key = schema_cache_key(db, table);
+    let mut guard = SCHEMA_CACHE.write().await;
+    guard.remove(&key);
+}
+
+/// Retrieve the schema for a table if it exists, caching successful lookups.
+pub(crate) async fn lookup_schema(db: &Database, table: &str) -> Option<Arc<TableSchema>> {
+    if let Some(schema) = {
+        let cache = SCHEMA_CACHE.read().await;
+        cache.get(&schema_cache_key(db, table)).cloned()
+    } {
+        return Some(schema);
+    }
+    let raw = db.get_ns("_schemas", table).await?;
+    let (_, data) = split_ts(&raw);
+    let parsed = serde_json::from_slice(data).ok()?;
+    let schema = Arc::new(parsed);
+    cache_schema_entry(db, table, Arc::clone(&schema)).await;
+    Some(schema)
 }
 
 /// Persist a schema definition for a table.
 async fn save_schema(db: &Database, table: &str, schema: &TableSchema) {
     if let Ok(data) = serde_json::to_vec(schema) {
         db.insert_ns("_schemas", table.to_string(), data).await;
+        cache_schema_entry(db, table, Arc::new(schema.clone())).await;
     }
 }
 
@@ -1158,4 +1214,49 @@ pub fn cast_simple(val: &str, data_type: &DataType) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use super::*;
+    use crate::{
+        SqlEngine,
+        storage::{Storage, local::LocalStorage},
+    };
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn schema_cache_scoped_per_database() {
+        let tmp1 = tempdir().unwrap();
+        let tmp2 = tempdir().unwrap();
+        let storage1: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp1.path()));
+        let storage2: Arc<dyn Storage> = Arc::new(LocalStorage::new(tmp2.path()));
+        let db1 = Database::new(storage1, "wal1.log").await.unwrap();
+        let db2 = Database::new(storage2, "wal2.log").await.unwrap();
+        let engine = SqlEngine::new();
+
+        engine
+            .execute(
+                &db1,
+                "CREATE TABLE users (id TEXT, val TEXT, PRIMARY KEY(id))",
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                &db2,
+                "CREATE TABLE users (id TEXT, ts TEXT, val TEXT, PRIMARY KEY(id, ts))",
+            )
+            .await
+            .unwrap();
+
+        let schema1 = lookup_schema(&db1, "users").await.unwrap();
+        let schema2 = lookup_schema(&db2, "users").await.unwrap();
+        assert_eq!(schema1.key_columns(), vec!["id".to_string()]);
+        assert_eq!(
+            schema2.key_columns(),
+            vec!["id".to_string(), "ts".to_string()]
+        );
+
+        invalidate_schema_entry(&db1, "users").await;
+        invalidate_schema_entry(&db2, "users").await;
+    }
+}

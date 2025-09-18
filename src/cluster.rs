@@ -727,7 +727,7 @@ impl Cluster {
                     }
                 }
                 // Build full primary key string
-                let key = Self::build_key_from_map(&schema, &row_map)?;
+                let key = Self::build_key_from_map(schema.as_ref(), &row_map)?;
                 (ns, key, None, Some((schema, row_map)))
             }
             Statement::Update {
@@ -743,7 +743,7 @@ impl Cluster {
                     .ok_or(QueryError::Unsupported)?;
                 let where_expr = selection.as_ref().ok_or(QueryError::Unsupported)?;
                 let cond_map = Self::where_to_map(where_expr);
-                let key = Self::build_key_from_map(&schema, &cond_map)?;
+                let key = Self::build_key_from_map(schema.as_ref(), &cond_map)?;
                 (ns, key, Some((schema, assignments.clone())), None)
             }
             _ => return Err(QueryError::Unsupported),
@@ -1291,11 +1291,8 @@ impl Cluster {
     }
 
     /// Retrieve the [`TableSchema`] for `table` from the internal schema store.
-    async fn get_schema(db: &Database, table: &str) -> Option<TableSchema> {
-        db.get_ns("_schemas", table).await.and_then(|v| {
-            let (_, data) = Self::split_ts(&v);
-            serde_json::from_slice(data).ok()
-        })
+    async fn get_schema(db: &Database, table: &str) -> Option<Arc<TableSchema>> {
+        crate::query::lookup_schema(db, table).await
     }
 
     /// Split the leading 8-byte timestamp from a buffer, returning the timestamp
