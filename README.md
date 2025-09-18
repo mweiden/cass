@@ -263,11 +263,6 @@ Current results (in comparison to Cassandra):
 
 _5 nodes, replication factor 3, read consistency QUORUM, x axis is number of threads querying_
 
-Current flamegraph for simple reads and writes:
-
-![Flamegraph](perf-results/query_flamegraph.svg)
-
-_Single node_
 
 ## Flamegraph Profiling
 
@@ -282,3 +277,9 @@ Outputs an SVG under `perf-results/`, e.g. `perf-results/query_flamegraph_YYYYmm
 Notes:
 - Prereqs: `cargo install flamegraph`. On Linux, ensure `perf` is installed and accessible; on macOS, `dtrace` requires `sudo` and may require Developer Mode.
 - Tunables via env vars: `NODE` (default `http://127.0.0.1:8080`), `OPS` (default `10000`), `THREADS` (default `32`), `OUTDIR` (default `perf-results`), and `EXTRA_SERVER_ARGS` to pass through to `cass server`.
+
+Current flamegraph for simple reads and writes:
+
+![Flamegraph](perf-results/query_flamegraph.svg)
+
+_Single node_
