@@ -257,11 +257,17 @@ scripts/perf_compare.sh         # runs both databases and stores metrics in ./pe
 
 The script starts a three-node `cass` cluster and uses the example program `perf_client` to drive load. Metrics from the first `cass` node and `nodetool` statistics from Cassandra are written to the `perf-results` directory for analysis.
 
-Current results (in comparison to cassandra):
+Current results (in comparison to Cassandra):
 
 ![Cass vs Cassandra throughput and latency across thread counts](perf-results/perf_comparison.png)
 
 _5 nodes, replication factor 3, read consistency QUORUM, x axis is number of threads querying_
+
+Current flamegraph for simple reads and writes:
+
+![Flamegraph](perf-results/query_flamegraph.png)
+
+_Single node_
 
 ## Flamegraph Profiling
 

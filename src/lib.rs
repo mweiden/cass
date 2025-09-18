@@ -15,8 +15,13 @@ pub mod rpc {
 
 use base64::Engine;
 pub use query::SqlEngine;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// Core database type combining an in-memory memtable with a persistent
 /// storage layer.
@@ -35,12 +40,15 @@ impl Default for DatabaseOptions {
     }
 }
 
+static DATABASE_INSTANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 pub struct Database {
     storage: Arc<dyn storage::Storage>,
     memtable: memtable::MemTable,
     sstables: tokio::sync::RwLock<Vec<sstable::SsTable>>,
     max_memtable_bytes: usize,
-    next_id: std::sync::atomic::AtomicUsize,
+    next_id: AtomicUsize,
+    instance_id: usize,
     wal: wal::Wal,
 }
 
@@ -98,13 +106,15 @@ impl Database {
         }
         pairs.sort_by_key(|(id, _)| *id);
         let sstables = pairs.into_iter().map(|(_, t)| t).collect();
+        let instance_id = DATABASE_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             storage,
             memtable,
             sstables: tokio::sync::RwLock::new(sstables),
             // default threshold before automatically flushing to disk
             max_memtable_bytes,
-            next_id: std::sync::atomic::AtomicUsize::new(next_id),
+            next_id: AtomicUsize::new(next_id),
+            instance_id,
             wal,
         })
     }
@@ -117,6 +127,10 @@ impl Database {
     /// Return a reference to the in-memory memtable used for writes.
     pub fn memtable(&self) -> &memtable::MemTable {
         &self.memtable
+    }
+
+    pub(crate) fn instance_id(&self) -> usize {
+        self.instance_id
     }
 
     /// Force the write-ahead log to flush pending entries to storage.
@@ -293,9 +307,7 @@ impl Database {
         if entries.is_empty() {
             return Ok(());
         }
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let path = format!("sstable_{id}.tbl");
         let table = sstable::SsTable::create(&path, &entries, self.storage.as_ref()).await?;
         let entry_count = entries.len();
