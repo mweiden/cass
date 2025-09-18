@@ -265,7 +265,7 @@ _5 nodes, replication factor 3, read consistency QUORUM, x axis is number of thr
 
 Current flamegraph for simple reads and writes:
 
-![Flamegraph](perf-results/query_flamegraph.png)
+![Flamegraph](perf-results/query_flamegraph.svg)
 
 _Single node_
 
