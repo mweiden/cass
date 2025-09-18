@@ -21,7 +21,7 @@ use tonic::Request;
 
 use crate::{
     Database, SqlEngine,
-    query::{QueryError, QueryOutput},
+    query::{LwtCondition, ParsedQuery, QueryError, QueryOutput},
     schema::{TableSchema, decode_row},
     storage::StorageError,
 };
@@ -392,13 +392,16 @@ impl Cluster {
             return Ok(output_to_proto(out));
         }
 
-        let meta = Self::analyze_sql(&engine, sql);
+        let parsed = engine.parse_query(sql)?;
+        let meta = Self::analyze_sql(&parsed);
         if meta.is_lwt {
             // Execute Cassandra-style LWT via Paxos across replicas
-            return self.execute_lwt(&engine, sql).await;
+            return self.execute_lwt(&engine, &parsed).await;
         }
         let ts = Self::timestamp_for(meta.is_write);
-        let replicas = self.target_replicas(&engine, sql, meta.broadcast).await?;
+        let replicas = self
+            .target_replicas(&engine, &parsed, meta.broadcast)
+            .await?;
         let healthy = self.healthy_nodes(replicas.clone()).await;
         let unhealthy: Vec<String> = replicas
             .iter()
@@ -534,7 +537,7 @@ impl Cluster {
         (0, sql)
     }
 
-    fn analyze_sql(engine: &SqlEngine, sql: &str) -> QueryMeta {
+    fn analyze_sql(parsed: &ParsedQuery) -> QueryMeta {
         let mut meta = QueryMeta {
             broadcast: false,
             is_write: false,
@@ -543,84 +546,79 @@ impl Cluster {
             ns: None,
             is_lwt: false,
         };
-        let parsed_sql = engine.base_sql(sql);
-        if let Ok(stmts) = engine.parse(&parsed_sql) {
-            if let Some(st) = stmts.first() {
-                meta.first_stmt = Some(st.clone());
-                meta.ns = match st {
-                    Statement::Insert(insert) => {
-                        if let sqlparser::ast::TableObject::TableName(name) = &insert.table {
-                            Self::object_name_to_ns(name)
+        let stmts = parsed.statements();
+        if let Some(st) = stmts.first() {
+            meta.first_stmt = Some(st.clone());
+            meta.ns = match st {
+                Statement::Insert(insert) => {
+                    if let sqlparser::ast::TableObject::TableName(name) = &insert.table {
+                        Self::object_name_to_ns(name)
+                    } else {
+                        None
+                    }
+                }
+                Statement::Update { table, .. } => Self::table_factor_to_ns(&table.relation),
+                Statement::Delete(delete) => {
+                    use sqlparser::ast::FromTable;
+                    let table = match &delete.from {
+                        FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
+                    };
+                    if table.len() == 1 {
+                        Self::table_factor_to_ns(&table[0].relation)
+                    } else {
+                        None
+                    }
+                }
+                Statement::Query(q) => {
+                    if let SetExpr::Select(s) = &*q.body {
+                        if !s.from.is_empty() {
+                            Self::table_factor_to_ns(&s.from[0].relation)
                         } else {
                             None
                         }
+                    } else {
+                        None
                     }
-                    Statement::Update { table, .. } => Self::table_factor_to_ns(&table.relation),
-                    Statement::Delete(delete) => {
-                        use sqlparser::ast::FromTable;
-                        let table = match &delete.from {
-                            FromTable::WithFromKeyword(t) | FromTable::WithoutKeyword(t) => t,
-                        };
-                        if table.len() == 1 {
-                            Self::table_factor_to_ns(&table[0].relation)
-                        } else {
-                            None
-                        }
-                    }
-                    Statement::Query(q) => {
-                        if let SetExpr::Select(s) = &*q.body {
-                            if !s.from.is_empty() {
-                                Self::table_factor_to_ns(&s.from[0].relation)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
-                };
-            }
-            if let Some(Statement::Query(q)) = meta.first_stmt.as_ref() {
-                if let SetExpr::Select(s) = &*q.body {
-                    if s.projection.len() == 1 {
-                        if let SelectItem::UnnamedExpr(Expr::Function(func)) = &s.projection[0] {
-                            if func.name.to_string().eq_ignore_ascii_case("count") {
-                                meta.is_count = true;
-                            }
+                }
+                _ => None,
+            };
+        }
+        if let Some(Statement::Query(q)) = meta.first_stmt.as_ref() {
+            if let SetExpr::Select(s) = &*q.body {
+                if s.projection.len() == 1 {
+                    if let SelectItem::UnnamedExpr(Expr::Function(func)) = &s.projection[0] {
+                        if func.name.to_string().eq_ignore_ascii_case("count") {
+                            meta.is_count = true;
                         }
                     }
                 }
             }
-            meta.broadcast = stmts.iter().all(|s| {
-                matches!(
-                    s,
-                    Statement::CreateTable(_)
-                        | Statement::Drop {
-                            object_type: ObjectType::Table,
-                            ..
-                        }
-                        | Statement::ShowTables { .. }
-                )
-            });
-            meta.is_write = stmts.iter().any(|s| {
-                matches!(
-                    s,
-                    Statement::Insert(_)
-                        | Statement::Update { .. }
-                        | Statement::Delete(_)
-                        | Statement::CreateTable(_)
-                        | Statement::Drop {
-                            object_type: ObjectType::Table,
-                            ..
-                        }
-                )
-            });
         }
-        // Heuristic: presence of trailing " IF ..." indicates an LWT on
-        // supported statements (INSERT/UPDATE). Base SQL strips it.
-        let has_if = engine.find_trailing_if_index(sql).is_some();
-        if has_if {
+        meta.broadcast = stmts.iter().all(|s| {
+            matches!(
+                s,
+                Statement::CreateTable(_)
+                    | Statement::Drop {
+                        object_type: ObjectType::Table,
+                        ..
+                    }
+                    | Statement::ShowTables { .. }
+            )
+        });
+        meta.is_write = stmts.iter().any(|s| {
+            matches!(
+                s,
+                Statement::Insert(_)
+                    | Statement::Update { .. }
+                    | Statement::Delete(_)
+                    | Statement::CreateTable(_)
+                    | Statement::Drop {
+                        object_type: ObjectType::Table,
+                        ..
+                    }
+            )
+        });
+        if parsed.is_lwt() {
             if let Some(st) = &meta.first_stmt {
                 meta.is_lwt = matches!(st, Statement::Insert(_) | Statement::Update { .. });
             }
@@ -642,13 +640,13 @@ impl Cluster {
     async fn target_replicas(
         &self,
         engine: &SqlEngine,
-        sql: &str,
+        parsed: &ParsedQuery,
         broadcast: bool,
     ) -> Result<Vec<String>, QueryError> {
         if broadcast {
             return Ok(self.ring.values().cloned().collect());
         }
-        let keys = engine.partition_keys(&self.db, sql).await?;
+        let keys = engine.partition_keys_parsed(&self.db, parsed).await?;
         let mut replicas: HashSet<String> = HashSet::new();
         for key in keys {
             for node in self.replicas_for(&key) {
@@ -666,10 +664,10 @@ impl Cluster {
     async fn execute_lwt(
         &self,
         engine: &SqlEngine,
-        sql: &str,
+        parsed: &ParsedQuery,
     ) -> Result<QueryResponse, QueryError> {
         // Determine replicas for the partition
-        let replicas = self.target_replicas(engine, sql, false).await?;
+        let replicas = self.target_replicas(engine, parsed, false).await?;
         let healthy = self.healthy_nodes(replicas.clone()).await;
         let rf = self.rf.max(1);
         let required = ConsistencyLevel::Quorum.required(rf);
@@ -678,35 +676,16 @@ impl Cluster {
         }
 
         // Parse statement and condition
-        let base = engine.base_sql(sql);
-        let mut stmts = engine.parse(&base)?;
-        if stmts.len() != 1 {
+        if parsed.statements().len() != 1 {
             return Err(QueryError::Unsupported);
         }
-        let stmt = stmts.pop().unwrap();
+        let stmt = parsed.statements().first().cloned().unwrap();
 
-        // Extract conditional part
-        let mut lwt_not_exists = false;
-        let mut lwt_equals: BTreeMap<String, String> = BTreeMap::new();
-        if let Some(idx) = engine.find_trailing_if_index(sql) {
-            let cond_str = sql[idx + 2..].trim_start();
-            if cond_str.eq_ignore_ascii_case("not exists") {
-                lwt_not_exists = true;
-            } else {
-                // Parse simple equality conjunctions via a synthetic WHERE clause
-                let dialect = sqlparser::dialect::GenericDialect {};
-                let cond_sql = format!("SELECT * FROM tmp WHERE {}", cond_str);
-                if let Ok(mut s) = sqlparser::parser::Parser::parse_sql(&dialect, &cond_sql) {
-                    if let Some(Statement::Query(q)) = s.pop() {
-                        if let SetExpr::Select(select) = *q.body {
-                            if let Some(expr) = select.selection {
-                                lwt_equals = Self::where_to_map(&expr);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let (lwt_not_exists, lwt_equals) = match parsed.lwt_condition() {
+            Some(LwtCondition::NotExists) => (true, BTreeMap::new()),
+            Some(LwtCondition::Equals(map)) => (false, map.clone()),
+            None => (false, BTreeMap::new()),
+        };
 
         // Compute namespace, key, and the row mutation intent (for INSERT or UPDATE)
         let (ns, key, assignments, insert_row_values) = match &stmt {
@@ -963,7 +942,7 @@ impl Cluster {
             let data = Self::split_ts(&read_value).1;
             let current = crate::schema::decode_row(data);
             for (k, _) in lwt_equals.iter() {
-                if let Some(v) = current.get(k) {
+                if let Some(v) = current.get(k.as_str()) {
                     row.insert(k.clone(), v.clone());
                 }
             }
@@ -1576,7 +1555,8 @@ mod tests {
     #[tokio::test]
     async fn analyze_sql_extracts_delete_ns() {
         let engine = SqlEngine::new();
-        let meta = Cluster::analyze_sql(&engine, "DELETE FROM tbl WHERE id='1'");
+        let parsed = engine.parse_query("DELETE FROM tbl WHERE id='1'").unwrap();
+        let meta = Cluster::analyze_sql(&parsed);
         assert_eq!(meta.ns, Some("tbl".into()));
         assert!(meta.is_write);
     }

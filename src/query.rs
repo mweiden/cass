@@ -40,11 +40,41 @@ pub enum QueryOutput {
 /// Currently only supports checking for absence of a row or comparing column
 /// equality. Additional variants can be added in the future as the SQL dialect
 /// expands.
-enum LwtCondition {
+#[derive(Clone)]
+pub(crate) enum LwtCondition {
     /// Proceed only if the targeted row does not yet exist.
     NotExists,
     /// Proceed only if the specified columns equal the provided values.
     Equals(BTreeMap<String, String>),
+}
+
+#[derive(Clone)]
+pub struct ParsedQuery {
+    base_sql: String,
+    statements: Vec<Statement>,
+    lwt_condition: Option<LwtCondition>,
+}
+
+impl ParsedQuery {
+    pub fn statements(&self) -> &[Statement] {
+        &self.statements
+    }
+
+    pub fn into_statements(self) -> Vec<Statement> {
+        self.statements
+    }
+
+    pub(crate) fn lwt_condition(&self) -> Option<&LwtCondition> {
+        self.lwt_condition.as_ref()
+    }
+
+    pub fn is_lwt(&self) -> bool {
+        self.lwt_condition.is_some()
+    }
+
+    pub fn base_sql(&self) -> &str {
+        &self.base_sql
+    }
 }
 
 /// Split the leading 8-byte timestamp from a buffer, returning the timestamp and
@@ -207,6 +237,38 @@ impl SqlEngine {
         self.execute_with_ts(db, sql, ts, false).await
     }
 
+    fn extract_lwt_condition(&self, sql: &str) -> Option<LwtCondition> {
+        if let Some(idx) = self.find_trailing_if_index(sql) {
+            let cond_str = sql[idx + 2..].trim_start();
+            if cond_str.eq_ignore_ascii_case("not exists") {
+                return Some(LwtCondition::NotExists);
+            }
+            let cond_sql = format!("SELECT * FROM tmp WHERE {}", cond_str);
+            if let Ok(mut stmts) = Parser::parse_sql(&self.dialect, &cond_sql) {
+                if let Some(Statement::Query(q)) = stmts.pop() {
+                    if let SetExpr::Select(select) = *q.body {
+                        if let Some(expr) = select.selection {
+                            let map = where_to_map(&expr);
+                            return Some(LwtCondition::Equals(map));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn parse_query(&self, sql: &str) -> Result<ParsedQuery, QueryError> {
+        let base_sql = self.base_sql(sql);
+        let lwt_condition = self.extract_lwt_condition(sql);
+        let statements = self.parse(&base_sql)?;
+        Ok(ParsedQuery {
+            base_sql,
+            statements,
+            lwt_condition,
+        })
+    }
+
     /// Execute `sql` with a supplied timestamp. When `meta` is true, results
     /// will include the row key and mutation timestamp.
     pub async fn execute_with_ts(
@@ -216,32 +278,21 @@ impl SqlEngine {
         ts: u64,
         meta: bool,
     ) -> Result<QueryOutput, QueryError> {
-        let mut lwt_cond = None;
-        let base_sql = self.base_sql(sql);
-        if let Some(idx) = self.find_trailing_if_index(sql) {
-            let cond_str = sql[idx + 2..].trim_start(); // skip 'IF'
-            if cond_str.eq_ignore_ascii_case("not exists") {
-                lwt_cond = Some(LwtCondition::NotExists);
-            } else {
-                let cond_sql = format!("SELECT * FROM tmp WHERE {}", cond_str);
-                if let Ok(mut stmts) = Parser::parse_sql(&self.dialect, &cond_sql) {
-                    if let Some(Statement::Query(q)) = stmts.pop() {
-                        if let SetExpr::Select(select) = *q.body {
-                            if let Some(expr) = select.selection {
-                                let map = where_to_map(&expr);
-                                lwt_cond = Some(LwtCondition::Equals(map));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let stmts = self.parse(&base_sql)?;
+        let parsed = self.parse_query(sql)?;
+        self.execute_with_parsed(db, &parsed, ts, meta).await
+    }
+
+    pub async fn execute_with_parsed(
+        &self,
+        db: &Database,
+        parsed: &ParsedQuery,
+        ts: u64,
+        meta: bool,
+    ) -> Result<QueryOutput, QueryError> {
         let mut result = QueryOutput::None;
-        for stmt in stmts {
-            result = self
-                .execute_stmt(db, stmt, ts, meta, lwt_cond.as_ref())
-                .await?;
+        let lwt_cond = parsed.lwt_condition();
+        for stmt in parsed.statements().iter().cloned() {
+            result = self.execute_stmt(db, stmt, ts, meta, lwt_cond).await?;
         }
         Ok(result)
     }
@@ -711,11 +762,19 @@ impl SqlEngine {
         db: &Database,
         sql: &str,
     ) -> Result<Vec<String>, QueryError> {
-        let base = self.base_sql(sql);
-        let stmts = self.parse(&base)?;
+        let parsed = self.parse_query(sql)?;
+        self.partition_keys_parsed(db, &parsed).await
+    }
+
+    /// Extract partition key values from a previously parsed query.
+    pub async fn partition_keys_parsed(
+        &self,
+        db: &Database,
+        parsed: &ParsedQuery,
+    ) -> Result<Vec<String>, QueryError> {
         let mut keys = Vec::new();
         let mut needs_key = false;
-        for stmt in stmts {
+        for stmt in parsed.statements() {
             match stmt {
                 Statement::Insert(insert) => {
                     needs_key = true;
@@ -726,8 +785,8 @@ impl SqlEngine {
                         _ => return Err(QueryError::Unsupported),
                     };
                     let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
-                    let source = insert.source.ok_or(QueryError::Unsupported)?;
-                    let values = match *source.body {
+                    let source = insert.source.as_ref().ok_or(QueryError::Unsupported)?;
+                    let values = match &*source.body {
                         SetExpr::Values(v) => v,
                         _ => return Err(QueryError::Unsupported),
                     };
@@ -740,8 +799,8 @@ impl SqlEngine {
                     } else {
                         schema.columns.clone()
                     };
-                    for row in values.rows {
-                        if let Some(key) = extract_partition_key(&schema, &cols, &row) {
+                    for row in &values.rows {
+                        if let Some(key) = extract_partition_key(&schema, &cols, row) {
                             keys.push(key);
                         }
                     }
@@ -752,8 +811,8 @@ impl SqlEngine {
                     needs_key = true;
                     let ns = table_factor_to_ns(&table.relation).ok_or(QueryError::Unsupported)?;
                     let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
-                    if let Some(expr) = selection {
-                        let map = where_to_multi_map(&expr);
+                    if let Some(expr) = selection.as_ref() {
+                        let map = where_to_multi_map(expr);
                         keys.extend(build_keys(&schema.partition_keys, &map));
                     }
                 }
@@ -768,22 +827,22 @@ impl SqlEngine {
                     let ns =
                         table_factor_to_ns(&table[0].relation).ok_or(QueryError::Unsupported)?;
                     let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
-                    if let Some(expr) = delete.selection {
-                        let map = where_to_multi_map(&expr);
+                    if let Some(expr) = delete.selection.as_ref() {
+                        let map = where_to_multi_map(expr);
                         keys.extend(build_keys(&schema.partition_keys, &map));
                     }
                 }
                 Statement::Query(q) => {
                     needs_key = true;
-                    if let SetExpr::Select(select) = *q.body {
+                    if let SetExpr::Select(select) = &*q.body {
                         if select.from.len() != 1 {
                             return Err(QueryError::Unsupported);
                         }
                         let ns = table_factor_to_ns(&select.from[0].relation)
                             .ok_or(QueryError::Unsupported)?;
                         let schema = get_schema(db, &ns).await.ok_or(QueryError::Unsupported)?;
-                        if let Some(expr) = select.selection {
-                            let map = where_to_multi_map(&expr);
+                        if let Some(expr) = select.selection.as_ref() {
+                            let map = where_to_multi_map(expr);
                             keys.extend(build_keys(&schema.partition_keys, &map));
                         }
                     }
