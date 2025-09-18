@@ -298,6 +298,8 @@ impl Database {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path = format!("sstable_{id}.tbl");
         let table = sstable::SsTable::create(&path, &entries, self.storage.as_ref()).await?;
+        let entry_count = entries.len();
+        tracing::info!("memtable_flush {entries} entries to {sstable}", entries = entry_count, sstable = path);
         self.memtable.clear().await;
         self.sstables.write().await.push(table);
         // reset WAL since its contents are now persisted in the SSTable
