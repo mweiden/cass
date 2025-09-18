@@ -31,8 +31,9 @@ for arg in "$@"; do
 done
 
 cleanup() {
-  # Tear down cass cluster if still up
-  docker compose down >/dev/null 2>&1 || true
+  # Tear down cass cluster if still up, but leave monitoring running
+  docker compose stop cass1 cass2 cass3 cass4 cass5 >/dev/null 2>&1 || true
+  docker compose rm -f cass1 cass2 cass3 cass4 cass5 >/dev/null 2>&1 || true
 
   # Remove any cass data
   rm -r /tmp/cass-data* || true
@@ -49,7 +50,7 @@ mkdir -p "$OUTDIR"
 rm -r /tmp/cass-data* || true
 
 echo "Starting cass cluster (5 nodes, rf=3)..."
-docker compose up --build -d >/dev/null
+docker compose up -d >/dev/null
 
 # Give the nodes a moment to come up
 sleep 10
@@ -57,9 +58,10 @@ for T in $THREADS_SET; do
   echo "Running cass perf_client with threads=$T ..."
   cargo run --example perf_client -- --node "$CASS_NODE" --ops "$OPS" --threads "$T" > "$OUTDIR/cass_t${T}.log"
 done
-# Capture Prometheus metrics from the first node
+# Capture Prometheus metrics from the prometheus node
 curl -s http://localhost:9090/metrics > "$OUTDIR/cass_metrics.prom"
-docker compose down >/dev/null
+docker compose stop cass1 cass2 cass3 cass4 cass5 >/dev/null 2>&1 || true
+docker compose rm -f cass1 cass2 cass3 cass4 cass5 >/dev/null 2>&1 || true
 
 start_cassandra_cluster() {
   echo "Starting Apache Cassandra cluster (5 nodes)..."
