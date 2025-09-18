@@ -105,7 +105,13 @@ async fn errors_when_not_enough_healthy_replicas() {
             })
             .await;
         if let Err(e) = res {
-            assert!(e.message().contains("not enough healthy replicas"));
+            let msg = e.message();
+            assert!(
+                msg.contains("not enough healthy replicas")
+                    || msg.contains("not enough replicas acknowledged"),
+                "unexpected error message: {}",
+                msg
+            );
             break;
         }
         if start.elapsed() > Duration::from_secs(2) {

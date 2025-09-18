@@ -30,7 +30,7 @@ use sqlparser::ast::{
     AssignmentTarget, Expr, ObjectName, ObjectType, SelectItem, SetExpr, Statement, TableFactor,
 };
 use tokio::{
-    sync::{RwLock, mpsc},
+    sync::{Mutex, RwLock, mpsc},
     time::sleep,
 };
 
@@ -99,6 +99,7 @@ fn proto_to_output(resp: QueryResponse) -> QueryOutput {
 /// Each node owns a number of virtual nodes on the ring in order to
 /// balance load.  Requests are replicated to the selected peers based on
 /// a Murmur3 hash of the incoming statement.
+#[derive(Clone)]
 pub struct Cluster {
     db: Arc<Database>,
     ring: BTreeMap<u32, String>,
@@ -113,6 +114,7 @@ pub struct Cluster {
     lwt: Arc<RwLock<HashMap<String, PaxosSlot>>>,
 }
 
+#[derive(Clone)]
 struct QueryMeta {
     broadcast: bool,
     is_write: bool,
@@ -419,15 +421,26 @@ impl Cluster {
                 .execute_write_with_consistency(sql_owned, ts, healthy, meta)
                 .await;
         }
-        if !meta.broadcast && healthy.len() < self.read_cl.required(self.rf) {
+        if meta.broadcast {
+            let results = self.run_on_nodes(healthy, sql.to_string(), ts).await;
+            return self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta);
+        }
+
+        let required = self.read_cl.required(self.rf);
+        if healthy.len() < required {
             return Err(QueryError::Other("not enough healthy replicas".into()));
         }
         let results = self
-            .run_on_nodes(healthy.clone(), sql.to_string(), ts)
-            .await;
-        if !meta.is_write && !meta.broadcast {
-            self.read_repair(&meta, &results, replicas, unhealthy).await;
-        }
+            .run_read_with_quorum(
+                healthy,
+                sql.to_string(),
+                ts,
+                required,
+                meta.clone(),
+                replicas,
+                unhealthy,
+            )
+            .await?;
         self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta)
     }
 
@@ -1018,6 +1031,32 @@ impl Cluster {
         healthy
     }
 
+    async fn execute_on_node(
+        &self,
+        node: &str,
+        sql: &str,
+        ts: u64,
+    ) -> Result<QueryOutput, QueryError> {
+        if node == self.self_addr {
+            let engine = SqlEngine::new();
+            engine.execute_with_ts(&self.db, sql, ts, true).await
+        } else {
+            let payload = if ts > 0 {
+                format!("--ts:{}\n{}", ts, sql)
+            } else {
+                sql.to_string()
+            };
+            match CassClient::connect(node.to_string()).await {
+                Ok(mut client) => client
+                    .internal(Request::new(QueryRequest { sql: payload }))
+                    .await
+                    .map(|resp| proto_to_output(resp.into_inner()))
+                    .map_err(|e| QueryError::Other(e.to_string())),
+                Err(e) => Err(QueryError::Other(e.to_string())),
+            }
+        }
+    }
+
     async fn run_on_nodes(
         &self,
         nodes: Vec<String>,
@@ -1027,33 +1066,92 @@ impl Cluster {
         let tasks: Vec<_> = nodes
             .into_iter()
             .map(|node| {
-                let db = self.db.clone();
-                let self_addr = self.self_addr.clone();
-                let sql_clone = sql.clone();
+                let sql = sql.clone();
                 async move {
-                    let res = if node == self_addr {
-                        let engine = SqlEngine::new();
-                        engine.execute_with_ts(&db, &sql_clone, ts, true).await
-                    } else {
-                        let payload = if ts > 0 {
-                            format!("--ts:{}\n{}", ts, sql_clone.clone())
-                        } else {
-                            sql_clone.clone()
-                        };
-                        match CassClient::connect(node.clone()).await {
-                            Ok(mut client) => client
-                                .internal(Request::new(QueryRequest { sql: payload }))
-                                .await
-                                .map(|resp| proto_to_output(resp.into_inner()))
-                                .map_err(|e| QueryError::Other(e.to_string())),
-                            Err(e) => Err(QueryError::Other(e.to_string())),
-                        }
-                    };
+                    let res = self.execute_on_node(&node, &sql, ts).await;
                     (node, res)
                 }
             })
             .collect();
         join_all(tasks).await
+    }
+
+    async fn run_read_with_quorum(
+        &self,
+        nodes: Vec<String>,
+        sql: String,
+        ts: u64,
+        required: usize,
+        meta: QueryMeta,
+        replicas: Vec<String>,
+        unhealthy: Vec<String>,
+    ) -> Result<Vec<(String, Result<QueryOutput, QueryError>)>, QueryError> {
+        let total = nodes.len();
+        if required == 0 || total == 0 {
+            return Ok(Vec::new());
+        }
+
+        let meta_results = Arc::new(Mutex::new(
+            Vec::<(String, Vec<(String, u64, String)>)>::new(),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for node in nodes {
+            let tx = tx.clone();
+            let sql = sql.clone();
+            let cluster = self.clone();
+            tokio::spawn(async move {
+                let res = cluster.execute_on_node(&node, &sql, ts).await;
+                let _ = tx.send((node, res));
+            });
+        }
+        drop(tx);
+
+        let mut successes = 0usize;
+        let mut received = 0usize;
+        let mut collected: Vec<(String, Result<QueryOutput, QueryError>)> = Vec::new();
+
+        while let Some((node, res)) = rx.recv().await {
+            received += 1;
+            if res.is_ok() {
+                successes += 1;
+            }
+            if let Ok(QueryOutput::Meta(rows)) = &res {
+                let mut guard = meta_results.lock().await;
+                guard.push((node.clone(), rows.clone()));
+            }
+            collected.push((node, res));
+            if successes >= required {
+                break;
+            }
+            if total - received + successes < required {
+                return Err(QueryError::Other("not enough replicas acknowledged".into()));
+            }
+        }
+
+        if successes < required {
+            return Err(QueryError::Other("not enough replicas acknowledged".into()));
+        }
+
+        let mut rx_remaining = rx;
+        let meta_arc = meta_results.clone();
+        let cluster = self.clone();
+        tokio::spawn(async move {
+            while let Some((node, res)) = rx_remaining.recv().await {
+                if let Ok(QueryOutput::Meta(rows)) = &res {
+                    let mut guard = meta_arc.lock().await;
+                    guard.push((node.clone(), rows.clone()));
+                }
+            }
+            let final_results = {
+                let guard = meta_arc.lock().await;
+                guard.clone()
+            };
+            cluster
+                .read_repair(&meta, &final_results, replicas, unhealthy)
+                .await;
+        });
+
+        Ok(collected)
     }
 
     /// Record failed writes as hints for later delivery.
@@ -1163,7 +1261,7 @@ impl Cluster {
     async fn read_repair(
         &self,
         meta: &QueryMeta,
-        results: &[(String, Result<QueryOutput, QueryError>)],
+        results: &[(String, Vec<(String, u64, String)>)],
         replicas: Vec<String>,
         unhealthy: Vec<String>,
     ) {
@@ -1175,14 +1273,12 @@ impl Cluster {
             return;
         };
         let mut latest: BTreeMap<String, (u64, String)> = BTreeMap::new();
-        for (_node, res) in results.iter() {
-            if let Ok(QueryOutput::Meta(rows)) = res {
-                for (k, ts, v) in rows {
-                    match latest.get(k) {
-                        Some((cur, _)) if *cur >= *ts => {}
-                        _ => {
-                            latest.insert(k.clone(), (*ts, v.clone()));
-                        }
+        for (_node, rows) in results.iter() {
+            for (k, ts, v) in rows {
+                match latest.get(k) {
+                    Some((cur, _)) if *cur >= *ts => {}
+                    _ => {
+                        latest.insert(k.clone(), (*ts, v.clone()));
                     }
                 }
             }
