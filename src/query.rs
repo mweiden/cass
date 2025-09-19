@@ -55,16 +55,16 @@ pub(crate) enum LwtCondition {
 #[derive(Clone)]
 pub struct ParsedQuery {
     base_sql: String,
-    statements: Vec<Statement>,
+    statements: Vec<Arc<Statement>>,
     lwt_condition: Option<LwtCondition>,
 }
 
 impl ParsedQuery {
-    pub fn statements(&self) -> &[Statement] {
+    pub fn statements(&self) -> &[Arc<Statement>] {
         &self.statements
     }
 
-    pub fn into_statements(self) -> Vec<Statement> {
+    pub fn into_statements(self) -> Vec<Arc<Statement>> {
         self.statements
     }
 
@@ -273,7 +273,7 @@ impl SqlEngine {
     pub fn parse_query(&self, sql: &str) -> Result<ParsedQuery, QueryError> {
         let base_sql = self.base_sql(sql);
         let lwt_condition = self.extract_lwt_condition(sql);
-        let statements = self.parse(&base_sql)?;
+        let statements = self.parse(&base_sql)?.into_iter().map(Arc::new).collect();
         Ok(ParsedQuery {
             base_sql,
             statements,
@@ -303,8 +303,10 @@ impl SqlEngine {
     ) -> Result<QueryOutput, QueryError> {
         let mut result = QueryOutput::None;
         let lwt_cond = parsed.lwt_condition();
-        for stmt in parsed.statements().iter().cloned() {
-            result = self.execute_stmt(db, stmt, ts, meta, lwt_cond).await?;
+        for stmt in parsed.statements() {
+            result = self
+                .execute_stmt(db, stmt.as_ref(), ts, meta, lwt_cond)
+                .await?;
         }
         Ok(result)
     }
@@ -313,7 +315,7 @@ impl SqlEngine {
     async fn execute_stmt(
         &self,
         db: &Database,
-        stmt: Statement,
+        stmt: &Statement,
         ts: u64,
         meta: bool,
         cond: Option<&LwtCondition>,
@@ -326,7 +328,7 @@ impl SqlEngine {
                 selection,
                 ..
             } => {
-                self.exec_update(db, table, assignments, selection, ts, cond)
+                self.exec_update(db, table, assignments, selection.as_ref(), ts, cond)
                     .await
             }
             Statement::Delete(delete) => {
@@ -385,7 +387,7 @@ impl SqlEngine {
                     Err(QueryError::Unsupported)
                 }
             }
-            Statement::Query(q) => self.exec_query(db, q, meta).await,
+            Statement::Query(q) => self.exec_query(db, q.as_ref(), meta).await,
             _ => Err(QueryError::Unsupported),
         }
     }
@@ -394,7 +396,7 @@ impl SqlEngine {
     async fn exec_insert(
         &self,
         db: &Database,
-        insert: Insert,
+        insert: &Insert,
         ts: u64,
         cond: Option<&LwtCondition>,
     ) -> Result<QueryOutput, QueryError> {
@@ -408,8 +410,8 @@ impl SqlEngine {
             .await
             .ok_or(QueryError::Unsupported)?;
         let schema_ref = schema.as_ref();
-        let source = insert.source.ok_or(QueryError::Unsupported)?;
-        let values = match *source.body {
+        let source = insert.source.as_ref().ok_or(QueryError::Unsupported)?;
+        let values = match &*source.body {
             SetExpr::Values(v) => v,
             _ => return Err(QueryError::Unsupported),
         };
@@ -428,17 +430,17 @@ impl SqlEngine {
             if values.rows.len() != 1 {
                 return Err(QueryError::Unsupported);
             }
-            let (key, data) =
-                build_row(schema_ref, &cols, &values.rows[0]).ok_or(QueryError::Unsupported)?;
+            let row = values.rows.get(0).ok_or(QueryError::Unsupported)?;
+            let (key, data) = build_row(schema_ref, &cols, row).ok_or(QueryError::Unsupported)?;
             let applied = db.insert_ns_if_absent_ts(&ns, key, data, ts).await;
             let mut row = BTreeMap::new();
             row.insert("[applied]".to_string(), applied.to_string());
             Ok(QueryOutput::Rows(vec![row]))
         } else {
             let mut count = 0;
-            for row in values.rows {
+            for row in &values.rows {
                 let (key, data) =
-                    build_row(schema_ref, &cols, &row).ok_or(QueryError::Unsupported)?;
+                    build_row(schema_ref, &cols, row).ok_or(QueryError::Unsupported)?;
                 db.insert_ns_ts(&ns, key, data, ts).await;
                 count += 1;
             }
@@ -454,9 +456,9 @@ impl SqlEngine {
     async fn exec_update(
         &self,
         db: &Database,
-        table: TableWithJoins,
-        assignments: Vec<Assignment>,
-        selection: Option<Expr>,
+        table: &TableWithJoins,
+        assignments: &[Assignment],
+        selection: Option<&Expr>,
         ts: u64,
         cond: Option<&LwtCondition>,
     ) -> Result<QueryOutput, QueryError> {
@@ -467,7 +469,7 @@ impl SqlEngine {
         let schema_ref = schema.as_ref();
         // schema-aware path using the WHERE clause for the key
         let where_expr = selection.ok_or(QueryError::Unsupported)?;
-        let cond_map = where_to_map(&where_expr);
+        let cond_map = where_to_map(where_expr);
         let key = build_single_key(schema_ref, &cond_map).ok_or(QueryError::Unsupported)?;
         let mut row_map = if let Some(bytes) = db.get_ns(&ns, &key).await {
             let (_, data) = split_ts(&bytes);
@@ -502,7 +504,7 @@ impl SqlEngine {
             }
         }
         for assign in assignments {
-            if let AssignmentTarget::ColumnName(name) = assign.target {
+            if let AssignmentTarget::ColumnName(name) = &assign.target {
                 if let Some(id) = name.0.first().and_then(|p| p.as_ident()) {
                     let col = id.value.to_lowercase();
                     if schema_ref.partition_keys.contains(&col)
@@ -534,7 +536,7 @@ impl SqlEngine {
     async fn exec_delete(
         &self,
         db: &Database,
-        delete: Delete,
+        delete: &Delete,
         ts: u64,
     ) -> Result<usize, QueryError> {
         let table = match &delete.from {
@@ -548,8 +550,8 @@ impl SqlEngine {
             .await
             .ok_or(QueryError::Unsupported)?;
         // schema-aware deletion using key columns
-        let expr = delete.selection.ok_or(QueryError::Unsupported)?;
-        let cond_map = where_to_map(&expr);
+        let expr = delete.selection.as_ref().ok_or(QueryError::Unsupported)?;
+        let cond_map = where_to_map(expr);
         let key = build_single_key(schema.as_ref(), &cond_map).ok_or(QueryError::Unsupported)?;
         // record tombstone with timestamp
         db.insert_ns_ts(&ns, key, Vec::new(), ts).await;
@@ -560,12 +562,12 @@ impl SqlEngine {
     async fn exec_query(
         &self,
         db: &Database,
-        q: Box<Query>,
+        q: &Query,
         meta: bool,
     ) -> Result<QueryOutput, QueryError> {
-        match *q.body {
+        match &*q.body {
             SetExpr::Select(select) => {
-                self.exec_select(db, *select, q.order_by, q.limit_clause, meta)
+                self.exec_select(db, select, &q.order_by, q.limit_clause.as_ref(), meta)
                     .await
             }
             _ => Err(QueryError::Unsupported),
@@ -576,9 +578,9 @@ impl SqlEngine {
     async fn exec_select(
         &self,
         db: &Database,
-        select: Select,
-        _order: Option<OrderBy>,
-        _limit: Option<LimitClause>,
+        select: &Select,
+        _order: &Option<OrderBy>,
+        _limit: Option<&LimitClause>,
         meta: bool,
     ) -> Result<QueryOutput, QueryError> {
         if select.from.len() != 1 {
@@ -594,7 +596,7 @@ impl SqlEngine {
         if select.projection.len() == 1 {
             if let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0] {
                 if func.name.to_string().eq_ignore_ascii_case("count") {
-                    let selection = select.selection.clone();
+                    let selection = select.selection.as_ref();
                     return self.exec_count(db, &ns, schema_ref, selection).await;
                 }
             }
@@ -610,10 +612,10 @@ impl SqlEngine {
         db: &Database,
         ns: &str,
         schema: &TableSchema,
-        selection: Option<Expr>,
+        selection: Option<&Expr>,
     ) -> Result<QueryOutput, QueryError> {
         let cond_map = if let Some(expr) = selection {
-            where_to_map(&expr)
+            where_to_map(expr)
         } else {
             BTreeMap::new()
         };
@@ -666,18 +668,13 @@ impl SqlEngine {
         db: &Database,
         ns: &str,
         schema: &TableSchema,
-        select: Select,
+        select: &Select,
         meta: bool,
     ) -> Result<QueryOutput, QueryError> {
-        let Select {
-            projection,
-            selection,
-            ..
-        } = select;
-        let (cols, wildcard) = parse_projection(projection)?;
+        let (cols, wildcard) = parse_projection(&select.projection)?;
 
-        let cond_multi = if let Some(expr) = selection {
-            where_to_multi_map(&expr)
+        let cond_multi = if let Some(expr) = select.selection.as_ref() {
+            where_to_multi_map(expr)
         } else {
             BTreeMap::new()
         };
@@ -801,7 +798,7 @@ impl SqlEngine {
         let mut keys = Vec::new();
         let mut needs_key = false;
         for stmt in parsed.statements() {
-            match stmt {
+            match stmt.as_ref() {
                 Statement::Insert(insert) => {
                     needs_key = true;
                     let ns = match &insert.table {
@@ -996,7 +993,7 @@ fn expr_to_string(expr: &Expr) -> Option<String> {
 
 /// Parse the projection list of a `SELECT` into column names and optional casts.
 fn parse_projection(
-    projection: Vec<SelectItem>,
+    projection: &[SelectItem],
 ) -> Result<(Vec<(String, Option<DataType>)>, bool), QueryError> {
     let mut cols = Vec::new();
     let mut wildcard = false;
@@ -1012,8 +1009,8 @@ fn parse_projection(
             SelectItem::UnnamedExpr(Expr::Cast {
                 expr, data_type, ..
             }) => {
-                if let Expr::Identifier(id) = *expr {
-                    cols.push((id.value.to_lowercase(), Some(data_type)));
+                if let Expr::Identifier(id) = expr.as_ref() {
+                    cols.push((id.value.to_lowercase(), Some(data_type.clone())));
                 } else {
                     return Err(QueryError::Unsupported);
                 }

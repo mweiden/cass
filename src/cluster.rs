@@ -119,7 +119,7 @@ struct QueryMeta {
     broadcast: bool,
     is_write: bool,
     is_count: bool,
-    first_stmt: Option<Statement>,
+    first_stmt: Option<Arc<Statement>>,
     ns: Option<String>,
     is_lwt: bool,
 }
@@ -548,8 +548,8 @@ impl Cluster {
         };
         let stmts = parsed.statements();
         if let Some(st) = stmts.first() {
-            meta.first_stmt = Some(st.clone());
-            meta.ns = match st {
+            meta.first_stmt = Some(Arc::clone(st));
+            meta.ns = match st.as_ref() {
                 Statement::Insert(insert) => {
                     if let sqlparser::ast::TableObject::TableName(name) = &insert.table {
                         Self::object_name_to_ns(name)
@@ -583,12 +583,14 @@ impl Cluster {
                 _ => None,
             };
         }
-        if let Some(Statement::Query(q)) = meta.first_stmt.as_ref() {
-            if let SetExpr::Select(s) = &*q.body {
-                if s.projection.len() == 1 {
-                    if let SelectItem::UnnamedExpr(Expr::Function(func)) = &s.projection[0] {
-                        if func.name.to_string().eq_ignore_ascii_case("count") {
-                            meta.is_count = true;
+        if let Some(stmt) = meta.first_stmt.as_ref() {
+            if let Statement::Query(q) = stmt.as_ref() {
+                if let SetExpr::Select(s) = &*q.body {
+                    if s.projection.len() == 1 {
+                        if let SelectItem::UnnamedExpr(Expr::Function(func)) = &s.projection[0] {
+                            if func.name.to_string().eq_ignore_ascii_case("count") {
+                                meta.is_count = true;
+                            }
                         }
                     }
                 }
@@ -596,7 +598,7 @@ impl Cluster {
         }
         meta.broadcast = stmts.iter().all(|s| {
             matches!(
-                s,
+                s.as_ref(),
                 Statement::CreateTable(_)
                     | Statement::Drop {
                         object_type: ObjectType::Table,
@@ -607,7 +609,7 @@ impl Cluster {
         });
         meta.is_write = stmts.iter().any(|s| {
             matches!(
-                s,
+                s.as_ref(),
                 Statement::Insert(_)
                     | Statement::Update { .. }
                     | Statement::Delete(_)
@@ -620,7 +622,8 @@ impl Cluster {
         });
         if parsed.is_lwt() {
             if let Some(st) = &meta.first_stmt {
-                meta.is_lwt = matches!(st, Statement::Insert(_) | Statement::Update { .. });
+                meta.is_lwt =
+                    matches!(st.as_ref(), Statement::Insert(_) | Statement::Update { .. });
             }
         }
         meta
@@ -688,7 +691,7 @@ impl Cluster {
         };
 
         // Compute namespace, key, and the row mutation intent (for INSERT or UPDATE)
-        let (ns, key, assignments, insert_row_values) = match &stmt {
+        let (ns, key, assignments, insert_row_values) = match stmt.as_ref() {
             Statement::Insert(insert) => {
                 let ns = match &insert.table {
                     sqlparser::ast::TableObject::TableName(name) => {
@@ -699,8 +702,8 @@ impl Cluster {
                 let schema = Self::get_schema(&self.db, &ns)
                     .await
                     .ok_or(QueryError::Unsupported)?;
-                let source = insert.source.clone().ok_or(QueryError::Unsupported)?;
-                let values = match *source.body {
+                let source = insert.source.as_ref().ok_or(QueryError::Unsupported)?;
+                let values = match &*source.body {
                     SetExpr::Values(v) => v,
                     _ => return Err(QueryError::Unsupported),
                 };
@@ -716,7 +719,7 @@ impl Cluster {
                 } else {
                     schema.columns.clone()
                 };
-                let row_exprs = &values.rows[0];
+                let row_exprs = values.rows.get(0).ok_or(QueryError::Unsupported)?;
                 if cols.len() != row_exprs.len() {
                     return Err(QueryError::Unsupported);
                 }
@@ -831,7 +834,7 @@ impl Cluster {
 
         // Evaluate condition and build proposed value
         let mut applied = false;
-        let proposed_value: Vec<u8> = match (&stmt, lwt_not_exists) {
+        let proposed_value: Vec<u8> = match (stmt.as_ref(), lwt_not_exists) {
             (Statement::Insert(_), true) => {
                 // Check if row exists
                 let data = Self::split_ts(&read_value).1;
@@ -1375,7 +1378,7 @@ impl Cluster {
                     arr_rows[0].clone(),
                 ])));
             }
-            let count = match meta.first_stmt {
+            let count = match meta.first_stmt.as_deref() {
                 Some(Statement::CreateTable(_))
                 | Some(Statement::Drop {
                     object_type: ObjectType::Table,
@@ -1383,7 +1386,7 @@ impl Cluster {
                 }) => 1,
                 _ => row_count as usize,
             };
-            let (op, unit) = match meta.first_stmt {
+            let (op, unit) = match meta.first_stmt.as_deref() {
                 Some(Statement::Insert(_)) => ("INSERT", "row"),
                 Some(Statement::Update { .. }) => ("UPDATE", "row"),
                 Some(Statement::Delete(_)) => ("DELETE", "row"),
@@ -1401,7 +1404,10 @@ impl Cluster {
             }));
         }
 
-        if matches!(meta.first_stmt, Some(Statement::ShowTables { .. })) {
+        if matches!(
+            meta.first_stmt.as_deref(),
+            Some(Statement::ShowTables { .. })
+        ) {
             let tables: Vec<String> = table_set.into_iter().collect();
             return Ok(output_to_proto(QueryOutput::Tables(tables)));
         }
