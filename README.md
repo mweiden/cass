@@ -272,7 +272,7 @@ Generate a CPU flamegraph for the query endpoint with a one-shot helper that run
 scripts/flamegraph_query.sh
 ```
 
-Outputs an SVG under `perf-results/`, e.g. `perf-results/query_flamegraph_YYYYmmdd-HHMMSS.svg`.
+Outputs an SVG under `perf-results/`, e.g. `perf-results/query_flamegraph.svg`.
 
 Notes:
 - Prereqs: `cargo install flamegraph`. On Linux, ensure `perf` is installed and accessible; on macOS, `dtrace` requires `sudo` and may require Developer Mode.

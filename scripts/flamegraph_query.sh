@@ -73,11 +73,7 @@ if (( ${ALLOW_PORT_IN_USE:-0} == 0 )); then
   fi
 fi
 
-timestamp() {
-  date +%Y%m%d-%H%M%S
-}
-
-OUT_SVG="$OUTDIR/query_flamegraph_$(timestamp).svg"
+OUT_SVG="$OUTDIR/query_flamegraph.svg"
 
 echo "[flamegraph] output: $OUT_SVG"
 echo "[flamegraph] node:   $NODE | ops=$OPS threads=$THREADS"
