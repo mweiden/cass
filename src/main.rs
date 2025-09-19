@@ -293,8 +293,8 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     let cluster_metrics = cluster.clone();
     let data_dir_metrics = data_dir.clone();
+    let sys_metrics = Arc::new(Mutex::new(System::new_all()));
     tokio::spawn(async move {
-        let mut sys = System::new_all();
         loop {
             for (peer, alive) in cluster_metrics.peer_health().await {
                 NODE_HEALTH
@@ -307,14 +307,28 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
                 .with_label_values(&[self_addr.as_str()])
                 .set(if self_alive { 1.0 } else { 0.0 });
 
-            sys.refresh_memory();
-            sys.refresh_cpu();
-            let ram = sys.used_memory() as f64;
-            let cpu = sys.global_cpu_info().cpu_usage() as f64;
-            RAM_USAGE.set(ram);
-            CPU_USAGE.set(cpu);
-            let disk = sstable_disk_usage(&data_dir_metrics) as f64;
-            SSTABLE_DISK_USAGE.set(disk);
+            let sys = sys_metrics.clone();
+            let dir = data_dir_metrics.clone();
+            match tokio::task::spawn_blocking(move || {
+                let mut sys = sys.lock().unwrap();
+                sys.refresh_memory();
+                sys.refresh_cpu();
+                let ram = sys.used_memory() as f64;
+                let cpu = sys.global_cpu_info().cpu_usage() as f64;
+                let disk = sstable_disk_usage(&dir) as f64;
+                (ram, cpu, disk)
+            })
+            .await
+            {
+                Ok((ram, cpu, disk)) => {
+                    RAM_USAGE.set(ram);
+                    CPU_USAGE.set(cpu);
+                    SSTABLE_DISK_USAGE.set(disk);
+                }
+                Err(_) => {
+                    // If the blocking task panicked or was cancelled, skip this sample.
+                }
+            }
 
             sleep(Duration::from_secs(10)).await;
         }
