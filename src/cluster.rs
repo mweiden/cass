@@ -33,6 +33,7 @@ use tokio::{
     sync::{Mutex, RwLock, mpsc},
     time::sleep,
 };
+use tracing::{Instrument, Span, field, instrument};
 
 fn output_to_proto(out: QueryOutput) -> QueryResponse {
     match out {
@@ -202,7 +203,8 @@ impl Cluster {
                 idx = (idx + 1) % gossip_peers.len();
                 let peer = &gossip_peers[idx];
                 if peer != &gossip_addr {
-                    let ok = if let Ok(mut client) = CassClient::connect(peer.clone()).await {
+                    let ok = if let Ok(mut client) = CassClient::connect_traced(peer.clone()).await
+                    {
                         client.health(Request::new(HealthRequest {})).await.is_ok()
                     } else {
                         false
@@ -351,7 +353,7 @@ impl Cluster {
                     if node == self_addr {
                         db.flush().await.map_err(|e| e.to_string())
                     } else {
-                        match CassClient::connect(node.clone()).await {
+                        match CassClient::connect_traced(node.clone()).await {
                             Ok(mut client) => client
                                 .flush_internal(Request::new(FlushRequest {}))
                                 .await
@@ -384,6 +386,16 @@ impl Cluster {
     /// returned to the caller.  When `forwarded` is true the query is being
     /// handled on behalf of a peer and is executed locally without further
     /// replication.
+    #[instrument(
+        skip(self, sql),
+        fields(
+            query.sql = %sql,
+            forwarded = forwarded,
+            replica_count = field::Empty,
+            healthy_count = field::Empty,
+            unhealthy_count = field::Empty
+        )
+    )]
     pub async fn execute(&self, sql: &str, forwarded: bool) -> Result<QueryResponse, QueryError> {
         let engine = SqlEngine::new();
         if forwarded {
@@ -408,6 +420,10 @@ impl Cluster {
             .filter(|n| !healthy.contains(n))
             .cloned()
             .collect();
+        let span = Span::current();
+        span.record("replica_count", &field::display(replicas.len()));
+        span.record("healthy_count", &field::display(healthy.len()));
+        span.record("unhealthy_count", &field::display(unhealthy.len()));
         if meta.is_write {
             if healthy.is_empty() {
                 return Err(QueryError::Other("no healthy replicas".into()));
@@ -447,6 +463,10 @@ impl Cluster {
         self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta)
     }
 
+    #[instrument(
+        skip(self, sql, healthy, meta),
+        fields(ts = ts, required = field::Empty, target_count = field::Empty)
+    )]
     async fn execute_write_with_consistency(
         &self,
         sql: String,
@@ -458,6 +478,10 @@ impl Cluster {
         if healthy.len() < required {
             return Err(QueryError::Other("not enough healthy replicas".into()));
         }
+
+        let span = Span::current();
+        span.record("required", &field::display(required));
+        span.record("target_count", &field::display(healthy.len()));
 
         let mut successes = 0usize;
         let mut results: Vec<Result<QueryOutput, QueryError>> = Vec::new();
@@ -481,26 +505,31 @@ impl Cluster {
         }
 
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let parent_span = span.clone();
         for node in remote_nodes {
             let tx = tx.clone();
             let sql_clone = sql.clone();
-            tokio::spawn(async move {
-                let target = node;
-                let payload = if ts > 0 {
-                    format!("--ts:{}\n{}", ts, sql_clone)
-                } else {
-                    sql_clone
-                };
-                let res = match CassClient::connect(target.clone()).await {
-                    Ok(mut client) => client
-                        .internal(Request::new(QueryRequest { sql: payload }))
-                        .await
-                        .map(|resp| proto_to_output(resp.into_inner()))
-                        .map_err(|e| QueryError::Other(e.to_string())),
-                    Err(e) => Err(QueryError::Other(e.to_string())),
-                };
-                let _ = tx.send((target, res));
-            });
+            let span = parent_span.clone();
+            tokio::spawn(
+                async move {
+                    let target = node;
+                    let payload = if ts > 0 {
+                        format!("--ts:{}\n{}", ts, sql_clone)
+                    } else {
+                        sql_clone
+                    };
+                    let res = match CassClient::connect_traced(target.clone()).await {
+                        Ok(mut client) => client
+                            .internal(Request::new(QueryRequest { sql: payload }))
+                            .await
+                            .map(|resp| proto_to_output(resp.into_inner()))
+                            .map_err(|e| QueryError::Other(e.to_string())),
+                        Err(e) => Err(QueryError::Other(e.to_string())),
+                    };
+                    let _ = tx.send((target, res));
+                }
+                .instrument(span),
+            );
         }
         drop(tx);
 
@@ -664,6 +693,10 @@ impl Cluster {
 
     /// Execute a lightweight transaction (INSERT ... IF NOT EXISTS or UPDATE ... IF col=val)
     /// across replicas using a Paxos-style protocol.
+    #[instrument(
+        skip(self, engine, parsed),
+        fields(replica_count = field::Empty, healthy_count = field::Empty)
+    )]
     async fn execute_lwt(
         &self,
         engine: &SqlEngine,
@@ -672,6 +705,8 @@ impl Cluster {
         // Determine replicas for the partition
         let replicas = self.target_replicas(engine, parsed, false).await?;
         let healthy = self.healthy_nodes(replicas.clone()).await;
+        Span::current().record("replica_count", &field::display(replicas.len()));
+        Span::current().record("healthy_count", &field::display(healthy.len()));
         let rf = self.rf.max(1);
         let required = ConsistencyLevel::Quorum.required(rf);
         if healthy.len() < required {
@@ -774,7 +809,7 @@ impl Cluster {
                         max_accepted_value = acc_v;
                     }
                 }
-            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
+            } else if let Ok(mut client) = CassClient::connect_traced(node.clone()).await {
                 if let Ok(resp) = client
                     .lwt_prepare(tonic::Request::new(LwtPrepareRequest {
                         namespace: ns.clone(),
@@ -810,7 +845,7 @@ impl Cluster {
                     read_ballot = b;
                     read_value = v;
                 }
-            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
+            } else if let Ok(mut client) = CassClient::connect_traced(node.clone()).await {
                 if let Ok(resp) = client
                     .lwt_read(tonic::Request::new(LwtReadRequest {
                         namespace: ns.clone(),
@@ -900,7 +935,7 @@ impl Cluster {
                 {
                     accepted += 1;
                 }
-            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
+            } else if let Ok(mut client) = CassClient::connect_traced(node.clone()).await {
                 if let Ok(resp) = client
                     .lwt_propose(tonic::Request::new(LwtProposeRequest {
                         namespace: ns.clone(),
@@ -924,7 +959,7 @@ impl Cluster {
         for node in &healthy {
             if node == &self.self_addr {
                 self.lwt_commit(&ns, &key, proposed_value.clone()).await;
-            } else if let Ok(mut client) = CassClient::connect(node.clone()).await {
+            } else if let Ok(mut client) = CassClient::connect_traced(node.clone()).await {
                 let _ = client
                     .lwt_commit(tonic::Request::new(LwtCommitRequest {
                         namespace: ns.clone(),
@@ -1013,6 +1048,7 @@ impl Cluster {
         healthy
     }
 
+    #[instrument(skip(self, sql), fields(node = %node, ts = ts))]
     async fn execute_on_node(
         &self,
         node: &str,
@@ -1028,7 +1064,7 @@ impl Cluster {
             } else {
                 sql.to_string()
             };
-            match CassClient::connect(node.to_string()).await {
+            match CassClient::connect_traced(node.to_string()).await {
                 Ok(mut client) => client
                     .internal(Request::new(QueryRequest { sql: payload }))
                     .await
@@ -1039,25 +1075,38 @@ impl Cluster {
         }
     }
 
+    #[instrument(
+        skip(self, nodes, sql),
+        fields(ts = ts, node_count = field::Empty)
+    )]
     async fn run_on_nodes(
         &self,
         nodes: Vec<String>,
         sql: String,
         ts: u64,
     ) -> Vec<(String, Result<QueryOutput, QueryError>)> {
+        let span = Span::current();
+        span.record("node_count", &field::display(nodes.len()));
+        let parent_span = span.clone();
         let tasks: Vec<_> = nodes
             .into_iter()
             .map(|node| {
                 let sql = sql.clone();
+                let span = parent_span.clone();
                 async move {
                     let res = self.execute_on_node(&node, &sql, ts).await;
                     (node, res)
                 }
+                .instrument(span)
             })
             .collect();
         join_all(tasks).await
     }
 
+    #[instrument(
+        skip(self, nodes, sql, meta, replicas, unhealthy),
+        fields(ts = ts, required = required, node_count = field::Empty)
+    )]
     async fn run_read_with_quorum(
         &self,
         nodes: Vec<String>,
@@ -1073,17 +1122,24 @@ impl Cluster {
             return Ok(Vec::new());
         }
 
+        Span::current().record("node_count", &field::display(total));
+
         let meta_results = Arc::new(Mutex::new(
             Vec::<(String, Vec<(String, u64, String)>)>::new(),
         ));
         let mut futures = FuturesUnordered::new();
+        let parent_span = Span::current();
         for node in nodes {
             let sql = sql.clone();
             let cluster = self.clone();
-            futures.push(async move {
-                let res = cluster.execute_on_node(&node, &sql, ts).await;
-                (node, res)
-            });
+            let span = parent_span.clone();
+            futures.push(
+                async move {
+                    let res = cluster.execute_on_node(&node, &sql, ts).await;
+                    (node, res)
+                }
+                .instrument(span),
+            );
         }
 
         let mut successes = 0usize;
@@ -1116,22 +1172,26 @@ impl Cluster {
         let meta_arc = meta_results.clone();
         let cluster = self.clone();
         let meta_clone = meta.clone();
-        tokio::spawn(async move {
-            let mut remaining = futures;
-            while let Some((node, res)) = remaining.next().await {
-                if let Ok(QueryOutput::Meta(rows)) = &res {
-                    let mut guard = meta_arc.lock().await;
-                    guard.push((node.clone(), rows.clone()));
+        let repair_span = Span::current();
+        tokio::spawn(
+            async move {
+                let mut remaining = futures;
+                while let Some((node, res)) = remaining.next().await {
+                    if let Ok(QueryOutput::Meta(rows)) = &res {
+                        let mut guard = meta_arc.lock().await;
+                        guard.push((node.clone(), rows.clone()));
+                    }
                 }
+                let final_results = {
+                    let guard = meta_arc.lock().await;
+                    guard.clone()
+                };
+                cluster
+                    .read_repair(&meta_clone, &final_results, replicas, unhealthy)
+                    .await;
             }
-            let final_results = {
-                let guard = meta_arc.lock().await;
-                guard.clone()
-            };
-            cluster
-                .read_repair(&meta_clone, &final_results, replicas, unhealthy)
-                .await;
-        });
+            .instrument(repair_span),
+        );
 
         Ok(collected)
     }
@@ -1171,6 +1231,7 @@ impl Cluster {
     ///
     /// Returns whether the promise was made along with any previously
     /// accepted ballot and value.
+    #[instrument(skip(self), fields(namespace = %ns, key = %key, ballot = ballot))]
     pub async fn lwt_prepare(&self, ns: &str, key: &str, ballot: u64) -> (bool, u64, Vec<u8>) {
         let composite = format!("{}:{}", ns, key);
         let mut map = self.lwt.write().await;
@@ -1188,6 +1249,7 @@ impl Cluster {
     }
 
     /// Record a proposed value for the given ballot if the promise still holds.
+    #[instrument(skip(self, value), fields(namespace = %ns, key = %key, ballot = ballot))]
     pub async fn lwt_propose(&self, ns: &str, key: &str, ballot: u64, value: Vec<u8>) -> bool {
         let composite = format!("{}:{}", ns, key);
         let mut map = self.lwt.write().await;
@@ -1207,6 +1269,7 @@ impl Cluster {
     }
 
     /// Read the latest accepted value for a lightweight transaction key.
+    #[instrument(skip(self), fields(namespace = %ns, key = %key))]
     pub async fn lwt_read(&self, ns: &str, key: &str) -> (u64, Vec<u8>) {
         let composite = format!("{}:{}", ns, key);
         let maybe = {
@@ -1224,6 +1287,7 @@ impl Cluster {
     }
 
     /// Commit the chosen value to durable storage and clear any in-memory state.
+    #[instrument(skip(self, value), fields(namespace = %ns, key = %key))]
     pub async fn lwt_commit(&self, ns: &str, key: &str, value: Vec<u8>) {
         if !value.is_empty() {
             if value.len() >= 8 {

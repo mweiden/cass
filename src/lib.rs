@@ -5,12 +5,37 @@ pub mod query;
 pub mod schema;
 pub mod sstable;
 pub mod storage;
+pub mod telemetry;
 pub mod util;
 pub mod wal;
 pub mod zonemap;
 
 pub mod rpc {
     tonic::include_proto!("cass");
+}
+
+impl rpc::cass_client::CassClient<tonic::transport::Channel> {
+    /// Connect to the target endpoint while installing the gRPC tracing
+    /// interceptor that injects OpenTelemetry context into every request.
+    pub async fn connect_traced(
+        dst: String,
+    ) -> Result<
+        rpc::cass_client::CassClient<
+            tonic::codegen::InterceptedService<
+                tonic::transport::Channel,
+                crate::telemetry::PropagatingInterceptor,
+            >,
+        >,
+        tonic::transport::Error,
+    > {
+        let channel = tonic::transport::Endpoint::from_shared(dst)?
+            .connect()
+            .await?;
+        Ok(rpc::cass_client::CassClient::with_interceptor(
+            channel,
+            crate::telemetry::PropagatingInterceptor::default(),
+        ))
+    }
 }
 
 use base64::Engine;

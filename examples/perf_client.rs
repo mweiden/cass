@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     // Ensure table exists via a single client
     {
-        let mut client = CassClient::connect(args.node.clone()).await?;
+        let mut client = CassClient::connect_traced(args.node.clone()).await?;
         client
             .query(QueryRequest {
                 sql: "CREATE TABLE IF NOT EXISTS perf (k INT PRIMARY KEY, v INT)".into(),
@@ -98,7 +98,7 @@ async fn run_phase(
     let rem = ops % threads;
     let mut handles = Vec::with_capacity(threads);
     // Establish a base client once; clones share the underlying HTTP/2 channel
-    let base_client = std::sync::Arc::new(CassClient::connect(node.clone()).await?);
+    let base_client = std::sync::Arc::new(CassClient::connect_traced(node.clone()).await?);
     for t in 0..threads {
         let base_client = base_client.clone();
         let count = if t < rem { base + 1 } else { base };
