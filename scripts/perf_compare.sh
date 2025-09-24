@@ -20,6 +20,9 @@ THREADS_SET=${THREADS_SET:-"1 2 4 8 16 32 64"}
 # If set (or --cass-only flag passed), skip Cassandra phase and only collect cass metrics
 CASS_ONLY=${CASS_ONLY:-0}
 
+# Disable tracing within cass containers for perf runs to avoid export overhead.
+export CASS_DISABLE_TRACING=1
+
 # CLI flag: --cass-only
 for arg in "$@"; do
   case "$arg" in
