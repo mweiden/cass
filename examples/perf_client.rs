@@ -1,10 +1,17 @@
-use std::time::Instant;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use cass::rpc::{QueryRequest, cass_client::CassClient};
 use clap::Parser;
-use futures::stream::{self, StreamExt};
+use futures::{
+    future::try_join_all,
+    stream::{FuturesUnordered, StreamExt},
+};
 use statrs::statistics::Statistics;
-use tokio::fs;
+use tokio::{fs, time::timeout};
+use tonic::transport::Channel;
 use url::Url;
 
 #[derive(Parser)]
@@ -21,9 +28,31 @@ struct Args {
     /// Max in-flight RPCs per thread/task
     #[clap(long, default_value_t = 1)]
     inflight: usize,
+    /// Timeout in milliseconds for each RPC (0 disables the deadline)
+    #[clap(long, default_value_t = 5000)]
+    timeout_ms: u64,
     /// Optional path to write the node's Prometheus metrics after the run
     #[clap(long)]
     metrics_out: Option<String>,
+}
+
+const MAX_LOGGED_FAILURES: usize = 5;
+
+#[derive(Default)]
+struct PhaseStats {
+    errors: usize,
+    timeouts: usize,
+    messages: Vec<String>,
+}
+
+impl PhaseStats {
+    fn total_failures(&self) -> usize {
+        self.errors + self.timeouts
+    }
+
+    fn has_failures(&self) -> bool {
+        self.total_failures() > 0
+    }
 }
 
 #[tokio::main]
@@ -39,28 +68,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
+    let rpc_timeout = if args.timeout_ms == 0 {
+        None
+    } else {
+        Some(Duration::from_millis(args.timeout_ms))
+    };
+
     // Writes with concurrency
-    let (write_lat_ms, write_dur) = run_phase(
+    let (write_lat_ms, write_dur, write_stats) = run_phase(
         args.node.clone(),
         args.ops,
         args.threads,
         args.inflight,
         true,
+        rpc_timeout,
     )
     .await?;
     // Reads with concurrency
-    let (read_lat_ms, read_dur) = run_phase(
+    let (read_lat_ms, read_dur, read_stats) = run_phase(
         args.node.clone(),
         args.ops,
         args.threads,
         args.inflight,
         false,
+        rpc_timeout,
     )
     .await?;
 
     // Report in a style similar to cassandra-stress
     report("WRITE", args.ops, write_dur.as_secs_f64(), &write_lat_ms);
     report("READ", args.ops, read_dur.as_secs_f64(), &read_lat_ms);
+    log_phase_errors("WRITE", &write_stats);
+    log_phase_errors("READ", &read_stats);
 
     if let Some(out) = args.metrics_out {
         // Derive metrics URL from the node address: gRPC port + 1000.
@@ -89,55 +128,197 @@ async fn run_phase(
     threads: usize,
     inflight: usize,
     write: bool,
-) -> Result<(Vec<f64>, std::time::Duration), Box<dyn std::error::Error>> {
-    let threads = threads.max(1);
-    let start = Instant::now();
+    rpc_timeout: Option<Duration>,
+) -> Result<(Vec<f64>, Duration, PhaseStats), Box<dyn std::error::Error>> {
+    if ops == 0 {
+        return Ok((Vec::new(), Duration::from_secs(0), PhaseStats::default()));
+    }
 
-    // Partition ops across threads as evenly as possible
-    let base = ops / threads;
-    let rem = ops % threads;
-    let mut handles = Vec::with_capacity(threads);
-    // Establish a base client once; clones share the underlying HTTP/2 channel
-    let base_client = std::sync::Arc::new(CassClient::connect_traced(node.clone()).await?);
-    for t in 0..threads {
-        let base_client = base_client.clone();
-        let count = if t < rem { base + 1 } else { base };
-        let offset = t * base + t.min(rem);
+    let workers = threads.max(1).min(ops.max(1));
+    let start = Instant::now();
+    let base = ops / workers;
+    let rem = ops % workers;
+
+    let clients: Vec<CassClient<Channel>> =
+        try_join_all((0..workers).map(|_| CassClient::connect(node.clone()))).await?;
+
+    let mut handles = Vec::with_capacity(workers);
+    let concurrency = inflight.max(1);
+    for (idx, client) in clients.into_iter().enumerate() {
+        let count = if idx < rem { base + 1 } else { base };
+        let offset = idx * base + idx.min(rem);
+        let rpc_timeout = rpc_timeout;
         handles.push(tokio::spawn(async move {
-            let inflight = inflight.max(1);
-            if count == 0 {
-                return Vec::<f64>::new();
-            }
-            let futs = (0..count).map(|i| {
-                // clone a client for this op; clones share the channel
-                let mut client = (*base_client).clone();
-                let k = offset + i;
-                let sql = if write {
-                    format!("INSERT INTO perf VALUES ({}, {})", k, k)
-                } else {
-                    format!("SELECT * FROM perf WHERE k = {}", k)
-                };
-                async move {
-                    let op_start = Instant::now();
-                    let _ = client.query(QueryRequest { sql }).await;
-                    op_start.elapsed().as_secs_f64() * 1000.0
-                }
-            });
-            let lats: Vec<f64> = stream::iter(futs)
-                .buffer_unordered(inflight)
-                .collect()
-                .await;
-            lats
+            run_worker(client, offset, count, write, concurrency, rpc_timeout).await
         }));
     }
-    let mut all = Vec::with_capacity(ops);
-    for h in handles {
-        if let Ok(v) = h.await {
-            all.extend(v);
+
+    let mut latencies = Vec::with_capacity(ops);
+    let mut stats = PhaseStats::default();
+    for handle in handles {
+        let worker = handle
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        latencies.extend(worker.latencies);
+        stats.errors += worker.errors;
+        stats.timeouts += worker.timeouts;
+        if stats.messages.len() < MAX_LOGGED_FAILURES {
+            let remaining = MAX_LOGGED_FAILURES - stats.messages.len();
+            stats
+                .messages
+                .extend(worker.messages.into_iter().take(remaining));
         }
     }
-    let dur = start.elapsed();
-    Ok((all, dur))
+
+    Ok((latencies, start.elapsed(), stats))
+}
+
+struct WorkerStats {
+    latencies: Vec<f64>,
+    errors: usize,
+    timeouts: usize,
+    messages: Vec<String>,
+}
+
+enum RequestOutcome {
+    Ok,
+    Error { key: usize, detail: String },
+    Timeout { key: usize },
+}
+
+async fn run_worker(
+    client: CassClient<Channel>,
+    offset: usize,
+    count: usize,
+    write: bool,
+    inflight: usize,
+    rpc_timeout: Option<Duration>,
+) -> WorkerStats {
+    if count == 0 {
+        return WorkerStats {
+            latencies: Vec::new(),
+            errors: 0,
+            timeouts: 0,
+            messages: Vec::new(),
+        };
+    }
+
+    let concurrency = inflight.max(1);
+    let mut latencies = Vec::with_capacity(count);
+    let mut errors = 0;
+    let mut timeouts = 0;
+    let mut messages = Vec::new();
+
+    let mut pool: VecDeque<CassClient<Channel>> = VecDeque::with_capacity(concurrency);
+    pool.push_back(client);
+    if concurrency > 1 {
+        let template = pool.front().expect("client pool").clone();
+        for _ in 1..concurrency {
+            pool.push_back(template.clone());
+        }
+    }
+
+    let mut issued = 0usize;
+    let mut inflight_futures = FuturesUnordered::new();
+
+    while issued < count || !inflight_futures.is_empty() {
+        while issued < count && !pool.is_empty() {
+            let client = pool.pop_front().expect("available client");
+            let key = offset + issued;
+            let sql = if write {
+                format!("INSERT INTO perf VALUES ({}, {})", key, key)
+            } else {
+                format!("SELECT * FROM perf WHERE k = {}", key)
+            };
+            let deadline = rpc_timeout;
+            inflight_futures.push(async move {
+                let mut client = client;
+                let op_start = Instant::now();
+                let outcome = if let Some(limit) = deadline {
+                    match timeout(limit, client.query(QueryRequest { sql })).await {
+                        Ok(Ok(_)) => RequestOutcome::Ok,
+                        Ok(Err(status)) => RequestOutcome::Error {
+                            key,
+                            detail: format!("{} {}", status.code(), status.message()),
+                        },
+                        Err(_) => RequestOutcome::Timeout { key },
+                    }
+                } else {
+                    match client.query(QueryRequest { sql }).await {
+                        Ok(_) => RequestOutcome::Ok,
+                        Err(status) => RequestOutcome::Error {
+                            key,
+                            detail: format!("{} {}", status.code(), status.message()),
+                        },
+                    }
+                };
+                let elapsed = op_start.elapsed().as_secs_f64() * 1000.0;
+                (client, elapsed, outcome)
+            });
+            issued += 1;
+        }
+
+        if let Some((client, latency, outcome)) = inflight_futures.next().await {
+            latencies.push(latency);
+            match outcome {
+                RequestOutcome::Ok => {}
+                RequestOutcome::Error { key, detail } => {
+                    errors += 1;
+                    if messages.len() < MAX_LOGGED_FAILURES {
+                        messages.push(format!(
+                            "{} key {} failed: {}",
+                            if write { "WRITE" } else { "READ" },
+                            key,
+                            detail
+                        ));
+                    }
+                }
+                RequestOutcome::Timeout { key } => {
+                    timeouts += 1;
+                    if messages.len() < MAX_LOGGED_FAILURES {
+                        if let Some(limit) = rpc_timeout {
+                            messages.push(format!(
+                                "{} key {} timed out after {} ms",
+                                if write { "WRITE" } else { "READ" },
+                                key,
+                                limit.as_millis()
+                            ));
+                        } else {
+                            messages.push(format!(
+                                "{} key {} timed out",
+                                if write { "WRITE" } else { "READ" },
+                                key
+                            ));
+                        }
+                    }
+                }
+            }
+            pool.push_back(client);
+        }
+    }
+
+    WorkerStats {
+        latencies,
+        errors,
+        timeouts,
+        messages,
+    }
+}
+
+fn log_phase_errors(kind: &str, stats: &PhaseStats) {
+    if !stats.has_failures() {
+        return;
+    }
+
+    eprintln!(
+        "[{}] {} RPCs failed ({} timeouts)",
+        kind,
+        stats.total_failures(),
+        stats.timeouts
+    );
+    for msg in &stats.messages {
+        eprintln!("    {}", msg);
+    }
 }
 
 fn report(kind: &str, ops: usize, total_secs: f64, lat_ms: &[f64]) {
