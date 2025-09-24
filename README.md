@@ -247,6 +247,57 @@ There is also a preconfigured dashboard with basic metrics from all instances. S
 
 <img width="1257" height="821" alt="Screenshot 2025-08-17 at 11 48 28 PM" src="https://github.com/user-attachments/assets/cbaf71aa-c726-4c6a-a1eb-422060aecd0a" />
 
+## Distributed Tracing
+
+`cass` emits OpenTelemetry spans for every gRPC request, coordinator hop, and
+lightweight-transaction phase. Spans are exported via OTLP/gRPC to the endpoint
+specified in `OTEL_EXPORTER_OTLP_ENDPOINT` (default `http://127.0.0.1:4317`).
+Each process also honours the standard OpenTelemetry metadata:
+
+- `OTEL_SERVICE_NAME` – service name reported to the collector (`cass` by
+  default).
+- `OTEL_SERVICE_INSTANCE_ID` – a per-process identifier (defaults to the gRPC
+  listen address when running `cass server`).
+
+Clients (`cass flush`, `cass panic`, `cass repl`, and the `CassClient`
+helpers) automatically propagate the current span context through gRPC metadata
+so child spans on downstream nodes appear under the correct parent in your
+tracing backend.
+
+### Viewing spans with Jaeger
+
+The bundled `docker-compose.yml` now includes a Jaeger all-in-one deployment.
+Start the full stack with:
+
+```bash
+docker compose up
+```
+
+All five nodes forward spans to the Jaeger collector (`http://jaeger:4317`)
+with unique `service.instance.id`s. Open the Jaeger UI at
+<http://localhost:16686>, select the `cass` service, and you can inspect the
+span graph for queries, replication fan-out, LWT prepare/propose cycles, and
+hint replays.
+
+To run the server outside of Docker, point it at any OTLP collector:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
+OTEL_SERVICE_NAME=cass-dev \
+OTEL_SERVICE_INSTANCE_ID=dev-node-1 \
+cargo run -- server --node-addr http://127.0.0.1:8080
+```
+
+Then launch Jaeger separately if desired:
+
+```bash
+docker run --rm -p 16686:16686 -p 4317:4317 jaegertracing/all-in-one:1.54
+```
+
+Once the server starts handling requests (for example via `cass repl`), spans
+will appear in Jaeger with parent/child relationships that follow the full
+replication and LWT flow across nodes.
+
 ## Performance Benchmarking
 
 The repository includes a simple harness for comparing write and read throughput of `cass` against a reference Apache Cassandra node.

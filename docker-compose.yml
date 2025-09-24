@@ -2,6 +2,8 @@ version: '3.8'
 services:
   cass1:
     build: .
+    depends_on:
+      - jaeger
     volumes:
       - /tmp/cass-data1:/data
     command:
@@ -23,9 +25,15 @@ services:
       - "3"
     ports:
       - "8080:8080"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_SERVICE_NAME=cass
+      - OTEL_SERVICE_INSTANCE_ID=cass1
 
   cass2:
     build: .
+    depends_on:
+      - jaeger
     volumes:
       - /tmp/cass-data2:/data
     command:
@@ -47,9 +55,15 @@ services:
       - "3"
     ports:
       - "8081:8080"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_SERVICE_NAME=cass
+      - OTEL_SERVICE_INSTANCE_ID=cass2
 
   cass3:
     build: .
+    depends_on:
+      - jaeger
     volumes:
       - /tmp/cass-data3:/data
     command:
@@ -71,9 +85,15 @@ services:
       - "3"
     ports:
       - "8082:8080"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_SERVICE_NAME=cass
+      - OTEL_SERVICE_INSTANCE_ID=cass3
 
   cass4:
     build: .
+    depends_on:
+      - jaeger
     volumes:
       - /tmp/cass-data4:/data
     command:
@@ -95,9 +115,15 @@ services:
       - "3"
     ports:
       - "8083:8080"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_SERVICE_NAME=cass
+      - OTEL_SERVICE_INSTANCE_ID=cass4
 
   cass5:
     build: .
+    depends_on:
+      - jaeger
     volumes:
       - /tmp/cass-data5:/data
     command:
@@ -119,6 +145,21 @@ services:
       - "3"
     ports:
       - "8084:8080"
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_SERVICE_NAME=cass
+      - OTEL_SERVICE_INSTANCE_ID=cass5
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.54
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - JAEGER_QUERY__METRICS_BACKEND=prometheus
+      - JAEGER_QUERY__PROMETHEUS_SERVER_URL=http://prometheus:9090
 
   prometheus:
     image: prom/prometheus:latest

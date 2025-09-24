@@ -3,7 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cass::rpc::{QueryRequest, cass_client::CassClient};
+use cass::{
+    rpc::{QueryRequest, cass_client::CassClient},
+    telemetry::PropagatingInterceptor,
+};
 use clap::Parser;
 use futures::{
     future::try_join_all,
@@ -11,7 +14,9 @@ use futures::{
 };
 use statrs::statistics::Statistics;
 use tokio::{fs, time::timeout};
-use tonic::transport::Channel;
+use tonic::{codegen::InterceptedService, transport::Channel};
+
+type TracedCassClient = CassClient<InterceptedService<Channel, PropagatingInterceptor>>;
 use url::Url;
 
 #[derive(Parser)]
@@ -60,7 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     // Ensure table exists via a single client
     {
-        let mut client = CassClient::connect(args.node.clone()).await?;
+        let mut client = CassClient::connect_traced(args.node.clone()).await?;
         client
             .query(QueryRequest {
                 sql: "CREATE TABLE IF NOT EXISTS perf (k INT PRIMARY KEY, v INT)".into(),
@@ -139,8 +144,8 @@ async fn run_phase(
     let base = ops / workers;
     let rem = ops % workers;
 
-    let clients: Vec<CassClient<Channel>> =
-        try_join_all((0..workers).map(|_| CassClient::connect(node.clone()))).await?;
+    let clients: Vec<TracedCassClient> =
+        try_join_all((0..workers).map(|_| CassClient::connect_traced(node.clone()))).await?;
 
     let mut handles = Vec::with_capacity(workers);
     let concurrency = inflight.max(1);
@@ -187,7 +192,7 @@ enum RequestOutcome {
 }
 
 async fn run_worker(
-    client: CassClient<Channel>,
+    client: TracedCassClient,
     offset: usize,
     count: usize,
     write: bool,
@@ -209,7 +214,7 @@ async fn run_worker(
     let mut timeouts = 0;
     let mut messages = Vec::new();
 
-    let mut pool: VecDeque<CassClient<Channel>> = VecDeque::with_capacity(concurrency);
+    let mut pool: VecDeque<TracedCassClient> = VecDeque::with_capacity(concurrency);
     pool.push_back(client);
     if concurrency > 1 {
         let template = pool.front().expect("client pool").clone();

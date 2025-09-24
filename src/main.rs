@@ -17,6 +17,7 @@ use cass::{
         query_response,
     },
     storage::{Storage, local::LocalStorage, s3::S3Storage},
+    telemetry,
     util::{print_rows, sstable_disk_usage},
     wal::WalOptions,
 };
@@ -32,9 +33,9 @@ use sysinfo::System;
 use tokio::time::{Duration, sleep};
 use tonic::{Request, Response, Status, transport::Server};
 use tonic_prometheus_layer::{MetricsLayer, metrics as tl_metrics};
-use tower_http::trace::{DefaultMakeSpan, DefaultOnRequest, DefaultOnResponse, TraceLayer};
-use tracing::{Level, info};
-use tracing_subscriber::{EnvFilter, FmtSubscriber};
+use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::{Level, Span, field, info};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use url::Url;
 
 type DynStorage = Arc<dyn Storage>;
@@ -113,34 +114,50 @@ struct CassService {
 
 #[tonic::async_trait]
 impl Cass for CassService {
+    #[tracing::instrument(skip(self, req), fields(query.sql = field::Empty))]
     async fn query(&self, req: Request<QueryRequest>) -> Result<Response<QueryResponse>, Status> {
-        let sql = req.into_inner().sql;
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        let span = Span::current();
+        span.set_parent(parent_cx);
+        let sql = req.get_ref().sql.clone();
+        span.record("query.sql", &field::display(&sql));
         match self.cluster.execute(&sql, false).await {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Err(Status::invalid_argument(e.to_string())),
         }
     }
 
+    #[tracing::instrument(skip(self, req), fields(query.sql = field::Empty, query.forwarded = true))]
     async fn internal(
         &self,
         req: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let sql = req.into_inner().sql;
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        let span = Span::current();
+        span.set_parent(parent_cx);
+        let sql = req.get_ref().sql.clone();
+        span.record("query.sql", &field::display(&sql));
         match self.cluster.execute(&sql, true).await {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Err(Status::invalid_argument(e.to_string())),
         }
     }
 
-    async fn flush(&self, _req: Request<FlushRequest>) -> Result<Response<FlushResponse>, Status> {
+    #[tracing::instrument(skip(self, req))]
+    async fn flush(&self, req: Request<FlushRequest>) -> Result<Response<FlushResponse>, Status> {
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        Span::current().set_parent(parent_cx);
         self.cluster.flush_all().await.map_err(Status::internal)?;
         Ok(Response::new(FlushResponse {}))
     }
 
+    #[tracing::instrument(skip(self, req), fields(forwarded = true))]
     async fn flush_internal(
         &self,
-        _req: Request<FlushRequest>,
+        req: Request<FlushRequest>,
     ) -> Result<Response<FlushResponse>, Status> {
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        Span::current().set_parent(parent_cx);
         self.cluster
             .flush_self()
             .await
@@ -148,7 +165,10 @@ impl Cass for CassService {
         Ok(Response::new(FlushResponse {}))
     }
 
-    async fn panic(&self, _req: Request<PanicRequest>) -> Result<Response<PanicResponse>, Status> {
+    #[tracing::instrument(skip(self, req))]
+    async fn panic(&self, req: Request<PanicRequest>) -> Result<Response<PanicResponse>, Status> {
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        Span::current().set_parent(parent_cx);
         self.cluster
             .panic_for(std::time::Duration::from_secs(60))
             .await;
@@ -156,10 +176,13 @@ impl Cass for CassService {
         Ok(Response::new(PanicResponse { healthy }))
     }
 
+    #[tracing::instrument(skip(self, req))]
     async fn health(
         &self,
-        _req: Request<HealthRequest>,
+        req: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        Span::current().set_parent(parent_cx);
         if !self.cluster.self_healthy().await {
             return Err(Status::unavailable("unhealthy"));
         }
@@ -168,11 +191,21 @@ impl Cass for CassService {
         }))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(namespace = field::Empty, key = field::Empty, ballot = field::Empty)
+    )]
     async fn lwt_prepare(
         &self,
         req: Request<LwtPrepareRequest>,
     ) -> Result<Response<LwtPrepareResponse>, Status> {
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        let span = Span::current();
+        span.set_parent(parent_cx);
         let r = req.into_inner();
+        span.record("namespace", &field::display(&r.namespace));
+        span.record("key", &field::display(&r.key));
+        span.record("ballot", &field::display(r.ballot));
         let (promised, ballot, value) = self
             .cluster
             .lwt_prepare(&r.namespace, &r.key, r.ballot)
@@ -184,11 +217,21 @@ impl Cass for CassService {
         }))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(namespace = field::Empty, key = field::Empty, ballot = field::Empty)
+    )]
     async fn lwt_propose(
         &self,
         req: Request<LwtProposeRequest>,
     ) -> Result<Response<LwtProposeResponse>, Status> {
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        let span = Span::current();
+        span.set_parent(parent_cx);
         let r = req.into_inner();
+        span.record("namespace", &field::display(&r.namespace));
+        span.record("key", &field::display(&r.key));
+        span.record("ballot", &field::display(r.ballot));
         let accepted = self
             .cluster
             .lwt_propose(&r.namespace, &r.key, r.ballot, r.value)
@@ -196,20 +239,38 @@ impl Cass for CassService {
         Ok(Response::new(LwtProposeResponse { accepted }))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(namespace = field::Empty, key = field::Empty)
+    )]
     async fn lwt_read(
         &self,
         req: Request<LwtReadRequest>,
     ) -> Result<Response<LwtReadResponse>, Status> {
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        let span = Span::current();
+        span.set_parent(parent_cx);
         let r = req.into_inner();
+        span.record("namespace", &field::display(&r.namespace));
+        span.record("key", &field::display(&r.key));
         let (ballot, value) = self.cluster.lwt_read(&r.namespace, &r.key).await;
         Ok(Response::new(LwtReadResponse { ballot, value }))
     }
 
+    #[tracing::instrument(
+        skip(self, req),
+        fields(namespace = field::Empty, key = field::Empty)
+    )]
     async fn lwt_commit(
         &self,
         req: Request<LwtCommitRequest>,
     ) -> Result<Response<LwtCommitResponse>, Status> {
+        let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
+        let span = Span::current();
+        span.set_parent(parent_cx);
         let r = req.into_inner();
+        span.record("namespace", &field::display(&r.namespace));
+        span.record("key", &field::display(&r.key));
         self.cluster.lwt_commit(&r.namespace, &r.key, r.value).await;
         Ok(Response::new(LwtCommitResponse {}))
     }
@@ -217,26 +278,39 @@ impl Cass for CassService {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let subscriber = FmtSubscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .finish();
-    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-
     let cli = Cli::parse();
     match cli.command {
-        Command::Server(args) => run_server(args).await?,
+        Command::Server(args) => {
+            let guard = telemetry::init_tracing("cass", Some(args.node_addr.clone()))?;
+            run_server(args).await?;
+            if let Err(err) = guard.shutdown() {
+                tracing::error!(?err, "failed to shutdown tracer provider");
+            }
+        }
         Command::Flush { target } => {
-            let mut client = CassClient::connect(target).await?;
+            let guard = telemetry::init_tracing("cass-cli", None)?;
+            let mut client = CassClient::connect_traced(target).await?;
             client.flush(FlushRequest {}).await?;
+            if let Err(err) = guard.shutdown() {
+                tracing::error!(?err, "failed to shutdown tracer provider");
+            }
         }
         Command::Panic { target } => {
-            let mut client = CassClient::connect(target).await?;
+            let guard = telemetry::init_tracing("cass-cli", None)?;
+            let mut client = CassClient::connect_traced(target).await?;
             let resp = client.panic(PanicRequest {}).await?;
             println!("healthy: {}", resp.into_inner().healthy);
+            if let Err(err) = guard.shutdown() {
+                tracing::error!(?err, "failed to shutdown tracer provider");
+            }
         }
-        Command::Repl { nodes } => repl(nodes).await?,
+        Command::Repl { nodes } => {
+            let guard = telemetry::init_tracing("cass-repl", None)?;
+            repl(nodes).await?;
+            if let Err(err) = guard.shutdown() {
+                tracing::error!(?err, "failed to shutdown tracer provider");
+            }
+        }
     }
     Ok(())
 }
@@ -356,7 +430,18 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
 
     info!("Cass gRPC server listening on {addr}");
     let trace_layer = TraceLayer::new_for_grpc()
-        .make_span_with(DefaultMakeSpan::new().level(Level::DEBUG))
+        .make_span_with(|request: &tonic::codegen::http::Request<_>| {
+            let path = request.uri().path();
+            let span = tracing::debug_span!(
+                "grpc.request",
+                otel.name = %path,
+                grpc.method = %path,
+                grpc.status_code = field::Empty,
+            );
+            let context = telemetry::extract_remote_context_from_headers(request.headers());
+            span.set_parent(context);
+            span
+        })
         .on_request(DefaultOnRequest::new().level(Level::DEBUG))
         .on_response(DefaultOnResponse::new().level(Level::DEBUG));
     Server::builder()
@@ -390,7 +475,7 @@ async fn repl(nodes: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
 
         let mut last_err: Option<Status> = None;
         for node in &nodes {
-            match CassClient::connect(node.clone()).await {
+            match CassClient::connect_traced(node.clone()).await {
                 Ok(mut client) => match client
                     .query(QueryRequest {
                         sql: sql.to_string(),

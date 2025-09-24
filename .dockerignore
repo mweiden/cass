@@ -1,0 +1,9 @@
+!perf-results
+!tests
+!src
+!Cargo.toml
+!Cargo.lock
+!src
+!README.md
+!Dockerfile
+!.git
