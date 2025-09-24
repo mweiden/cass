@@ -39,6 +39,8 @@ jobs:
       - name: Run tests
         if: github.ref != 'refs/heads/main'
         run: cargo test
+      - name: Run simple scale test
+        run: ./scripts/ci_scale_test.sh
       - name: Install coverage tools
         if: github.ref == 'refs/heads/main'
         run: |
