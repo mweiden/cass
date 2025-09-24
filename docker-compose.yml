@@ -156,6 +156,10 @@ services:
       - "16686:16686"
       - "4317:4317"
       - "4318:4318"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - JAEGER_QUERY__METRICS_BACKEND=prometheus
+      - JAEGER_QUERY__PROMETHEUS_SERVER_URL=http://prometheus:9090
 
   prometheus:
     image: prom/prometheus:latest
