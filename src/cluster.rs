@@ -1148,9 +1148,13 @@ impl Cluster {
 
         while let Some((node, res)) = futures.next().await {
             received += 1;
-            if let Ok(QueryOutput::Meta(rows)) = &res {
+            if let Ok(output) = &res {
                 let mut guard = meta_results.lock().await;
-                guard.push((node.clone(), rows.clone()));
+                match output {
+                    QueryOutput::Meta(rows) => guard.push((node.clone(), rows.clone())),
+                    QueryOutput::None => guard.push((node.clone(), Vec::new())),
+                    _ => {}
+                }
             }
             if res.is_ok() {
                 successes += 1;
@@ -1172,26 +1176,26 @@ impl Cluster {
         let meta_arc = meta_results.clone();
         let cluster = self.clone();
         let meta_clone = meta.clone();
-        let repair_span = Span::current();
-        tokio::spawn(
-            async move {
-                let mut remaining = futures;
-                while let Some((node, res)) = remaining.next().await {
-                    if let Ok(QueryOutput::Meta(rows)) = &res {
-                        let mut guard = meta_arc.lock().await;
-                        guard.push((node.clone(), rows.clone()));
+        tokio::spawn(async move {
+            let mut remaining = futures;
+            while let Some((node, res)) = remaining.next().await {
+                if let Ok(output) = &res {
+                    let mut guard = meta_arc.lock().await;
+                    match output {
+                        QueryOutput::Meta(rows) => guard.push((node.clone(), rows.clone())),
+                        QueryOutput::None => guard.push((node.clone(), Vec::new())),
+                        _ => {}
                     }
                 }
-                let final_results = {
-                    let guard = meta_arc.lock().await;
-                    guard.clone()
-                };
-                cluster
-                    .read_repair(&meta_clone, &final_results, replicas, unhealthy)
-                    .await;
             }
-            .instrument(repair_span),
-        );
+            let final_results = {
+                let guard = meta_arc.lock().await;
+                guard.clone()
+            };
+            cluster
+                .read_repair(&meta_clone, &final_results, replicas, unhealthy)
+                .await;
+        });
 
         Ok(collected)
     }
@@ -1318,8 +1322,10 @@ impl Cluster {
         let Some(schema) = Self::get_schema(&self.db, &ns).await else {
             return;
         };
+        let mut unique_rows: BTreeSet<Vec<(String, u64, String)>> = BTreeSet::new();
         let mut latest: BTreeMap<String, (u64, String)> = BTreeMap::new();
         for (_node, rows) in results.iter() {
+            unique_rows.insert(rows.clone());
             for (k, ts, v) in rows {
                 match latest.get(k) {
                     Some((cur, _)) if *cur >= *ts => {}
@@ -1328,6 +1334,9 @@ impl Cluster {
                     }
                 }
             }
+        }
+        if unique_rows.len() <= 1 && unhealthy.is_empty() {
+            return;
         }
         let healthy: Vec<String> = replicas
             .into_iter()
