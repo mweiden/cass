@@ -56,7 +56,16 @@ pub fn init_tracing(
     default_service_name: &str,
     default_instance: Option<String>,
 ) -> Result<TelemetryGuard, Box<dyn Error>> {
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter =
+        || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if tracing_disabled() {
+        let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
+        tracing_subscriber::registry()
+            .with(env_filter())
+            .with(fmt_layer)
+            .try_init()?;
+        return Ok(TelemetryGuard { provider: None });
+    }
     let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .unwrap_or_else(|_| "http://127.0.0.1:4317".to_string());
     let service_name =
@@ -93,7 +102,7 @@ pub fn init_tracing(
     let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
 
     tracing_subscriber::registry()
-        .with(env_filter)
+        .with(env_filter())
         .with(fmt_layer)
         .with(tracing_opentelemetry::layer().with_tracer(tracer))
         .try_init()?;
@@ -171,4 +180,11 @@ impl<'a> opentelemetry::propagation::Injector for MetadataMapInjector<'a> {
             }
         }
     }
+}
+
+fn tracing_disabled() -> bool {
+    matches!(
+        std::env::var("CASS_DISABLE_TRACING"),
+        Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "True" | "yes" | "YES")
+    )
 }

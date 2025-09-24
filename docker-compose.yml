@@ -29,6 +29,7 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
       - OTEL_SERVICE_NAME=cass
       - OTEL_SERVICE_INSTANCE_ID=cass1
+      - CASS_DISABLE_TRACING=${CASS_DISABLE_TRACING:-0}
 
   cass2:
     build: .
@@ -59,6 +60,7 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
       - OTEL_SERVICE_NAME=cass
       - OTEL_SERVICE_INSTANCE_ID=cass2
+      - CASS_DISABLE_TRACING=${CASS_DISABLE_TRACING:-0}
 
   cass3:
     build: .
@@ -89,6 +91,7 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
       - OTEL_SERVICE_NAME=cass
       - OTEL_SERVICE_INSTANCE_ID=cass3
+      - CASS_DISABLE_TRACING=${CASS_DISABLE_TRACING:-0}
 
   cass4:
     build: .
@@ -119,6 +122,7 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
       - OTEL_SERVICE_NAME=cass
       - OTEL_SERVICE_INSTANCE_ID=cass4
+      - CASS_DISABLE_TRACING=${CASS_DISABLE_TRACING:-0}
 
   cass5:
     build: .
@@ -149,6 +153,7 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
       - OTEL_SERVICE_NAME=cass
       - OTEL_SERVICE_INSTANCE_ID=cass5
+      - CASS_DISABLE_TRACING=${CASS_DISABLE_TRACING:-0}
 
   jaeger:
     image: jaegertracing/all-in-one:1.54
