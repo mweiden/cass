@@ -86,11 +86,13 @@ async fn errors_when_not_enough_healthy_replicas() {
     let mut c1 = CassClient::connect(base1.clone()).await.unwrap();
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+        ts: 0,
     })
     .await
     .unwrap();
     c1.query(QueryRequest {
         sql: "INSERT INTO kv (id, val) VALUES ('x','1')".into(),
+        ts: 0,
     })
     .await
     .unwrap();
@@ -102,6 +104,7 @@ async fn errors_when_not_enough_healthy_replicas() {
         let res = c1
             .query(QueryRequest {
                 sql: "SELECT val FROM kv WHERE id = 'x'".into(),
+                ts: 0,
             })
             .await;
         if let Err(e) = res {
@@ -170,11 +173,13 @@ async fn read_succeeds_with_lower_consistency() {
     let mut c1 = CassClient::connect(base1.clone()).await.unwrap();
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+        ts: 0,
     })
     .await
     .unwrap();
     c1.query(QueryRequest {
         sql: "INSERT INTO kv (id, val) VALUES ('a','1')".into(),
+        ts: 0,
     })
     .await
     .unwrap();
@@ -186,6 +191,7 @@ async fn read_succeeds_with_lower_consistency() {
         let res = c1
             .query(QueryRequest {
                 sql: "SELECT val FROM kv WHERE id = 'a'".into(),
+                ts: 0,
             })
             .await;
         if let Ok(resp) = res {

@@ -396,11 +396,17 @@ impl Cluster {
             unhealthy_count = field::Empty
         )
     )]
-    pub async fn execute(&self, sql: &str, forwarded: bool) -> Result<QueryResponse, QueryError> {
+    pub async fn execute(
+        &self,
+        sql: &str,
+        forwarded: bool,
+        forwarded_ts: u64,
+    ) -> Result<QueryResponse, QueryError> {
         let engine = SqlEngine::new();
         if forwarded {
-            let (ts, real_sql) = Self::parse_forwarded(sql);
-            let out = engine.execute_with_ts(&self.db, real_sql, ts, true).await?;
+            let out = engine
+                .execute_with_ts(&self.db, sql, forwarded_ts, true)
+                .await?;
             return Ok(output_to_proto(out));
         }
 
@@ -513,14 +519,9 @@ impl Cluster {
             tokio::spawn(
                 async move {
                     let target = node;
-                    let payload = if ts > 0 {
-                        format!("--ts:{}\n{}", ts, sql_clone)
-                    } else {
-                        sql_clone
-                    };
                     let res = match CassClient::connect_traced(target.clone()).await {
                         Ok(mut client) => client
-                            .internal(Request::new(QueryRequest { sql: payload }))
+                            .internal(Request::new(QueryRequest { sql: sql_clone, ts }))
                             .await
                             .map(|resp| proto_to_output(resp.into_inner()))
                             .map_err(|e| QueryError::Other(e.to_string())),
@@ -554,16 +555,6 @@ impl Cluster {
         }
 
         self.merge_results(results, meta)
-    }
-
-    fn parse_forwarded(sql: &str) -> (u64, &str) {
-        if let Some(rest) = sql.strip_prefix("--ts:") {
-            if let Some(pos) = rest.find('\n') {
-                let ts = rest[..pos].parse().unwrap_or(0);
-                return (ts, &rest[pos + 1..]);
-            }
-        }
-        (0, sql)
     }
 
     fn analyze_sql(parsed: &ParsedQuery) -> QueryMeta {
@@ -1059,14 +1050,12 @@ impl Cluster {
             let engine = SqlEngine::new();
             engine.execute_with_ts(&self.db, sql, ts, true).await
         } else {
-            let payload = if ts > 0 {
-                format!("--ts:{}\n{}", ts, sql)
-            } else {
-                sql.to_string()
-            };
             match CassClient::connect_traced(node.to_string()).await {
                 Ok(mut client) => client
-                    .internal(Request::new(QueryRequest { sql: payload }))
+                    .internal(Request::new(QueryRequest {
+                        sql: sql.to_string(),
+                        ts,
+                    }))
                     .await
                     .map(|resp| proto_to_output(resp.into_inner()))
                     .map_err(|e| QueryError::Other(e.to_string())),

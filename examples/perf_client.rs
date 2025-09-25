@@ -101,6 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client
             .query(QueryRequest {
                 sql: "CREATE TABLE IF NOT EXISTS perf (k INT PRIMARY KEY, v INT)".into(),
+                ts: 0,
             })
             .await?;
     }
@@ -287,7 +288,7 @@ async fn run_worker(
                 let mut client = client;
                 let op_start = Instant::now();
                 let outcome = if let Some(limit) = deadline {
-                    match timeout(limit, client.query(QueryRequest { sql })).await {
+                    match timeout(limit, client.query(QueryRequest { sql, ts: 0 })).await {
                         Ok(Ok(_)) => RequestOutcome::Ok,
                         Ok(Err(status)) => RequestOutcome::Error {
                             key,
@@ -296,7 +297,7 @@ async fn run_worker(
                         Err(_) => RequestOutcome::Timeout { key },
                     }
                 } else {
-                    match client.query(QueryRequest { sql }).await {
+                    match client.query(QueryRequest { sql, ts: 0 }).await {
                         Ok(_) => RequestOutcome::Ok,
                         Err(status) => RequestOutcome::Error {
                             key,

@@ -51,22 +51,26 @@ async fn union_and_lww_across_replicas() {
 
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+        ts: 0,
     })
     .await
     .unwrap();
 
     c1.internal(QueryRequest {
-        sql: "--ts:1\nINSERT INTO kv (id, val) VALUES ('a','va1')".into(),
+        sql: "INSERT INTO kv (id, val) VALUES ('a','va1')".into(),
+        ts: 1,
     })
     .await
     .unwrap();
     c2.internal(QueryRequest {
-        sql: "--ts:2\nINSERT INTO kv (id, val) VALUES ('a','va2')".into(),
+        sql: "INSERT INTO kv (id, val) VALUES ('a','va2')".into(),
+        ts: 2,
     })
     .await
     .unwrap();
     c2.internal(QueryRequest {
-        sql: "--ts:3\nINSERT INTO kv (id, val) VALUES ('b','vb')".into(),
+        sql: "INSERT INTO kv (id, val) VALUES ('b','vb')".into(),
+        ts: 3,
     })
     .await
     .unwrap();
@@ -74,6 +78,7 @@ async fn union_and_lww_across_replicas() {
     let res_a = c1
         .query(QueryRequest {
             sql: "SELECT val FROM kv WHERE id = 'a'".into(),
+            ts: 0,
         })
         .await
         .unwrap()
@@ -89,6 +94,7 @@ async fn union_and_lww_across_replicas() {
     let res_b = c1
         .query(QueryRequest {
             sql: "SELECT val FROM kv WHERE id = 'b'".into(),
+            ts: 0,
         })
         .await
         .unwrap()
@@ -103,6 +109,7 @@ async fn union_and_lww_across_replicas() {
     let res_c = c1
         .query(QueryRequest {
             sql: "SELECT val FROM kv WHERE id IN ('a', 'b')".into(),
+            ts: 0,
         })
         .await
         .unwrap()
@@ -117,6 +124,7 @@ async fn union_and_lww_across_replicas() {
     let cnt = c1
         .query(QueryRequest {
             sql: "SELECT COUNT(*) FROM kv WHERE id = 'a'".into(),
+            ts: 0,
         })
         .await
         .unwrap()
@@ -132,6 +140,7 @@ async fn union_and_lww_across_replicas() {
     let ack = c1
         .query(QueryRequest {
             sql: "INSERT INTO kv (id, val) VALUES ('x','1'),('y','2')".into(),
+            ts: 0,
         })
         .await
         .unwrap()

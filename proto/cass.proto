@@ -18,6 +18,7 @@ service Cass {
 
 message QueryRequest {
   string sql = 1;
+  uint64 ts = 2;
 }
 
 message QueryResponse {

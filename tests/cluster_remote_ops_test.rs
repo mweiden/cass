@@ -78,7 +78,11 @@ async fn execute_lwt_remote_branches() {
 
     let cluster = build_cluster(vec![remote_addr.clone()], &free_http_addr()).await;
     cluster
-        .execute("CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))", false)
+        .execute(
+            "CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))",
+            false,
+            0,
+        )
         .await
         .unwrap();
 
@@ -86,6 +90,7 @@ async fn execute_lwt_remote_branches() {
         .execute(
             "INSERT INTO t (id, val) VALUES ('a','1') IF NOT EXISTS",
             false,
+            0,
         )
         .await
         .unwrap();
@@ -95,6 +100,7 @@ async fn execute_lwt_remote_branches() {
         .execute(
             "INSERT INTO t (id, val) VALUES ('a','2') IF NOT EXISTS",
             false,
+            0,
         )
         .await
         .unwrap();
@@ -104,6 +110,7 @@ async fn execute_lwt_remote_branches() {
     let res = client
         .query(QueryRequest {
             sql: "SELECT val FROM t WHERE id='a'".into(),
+            ts: 0,
         })
         .await
         .unwrap()

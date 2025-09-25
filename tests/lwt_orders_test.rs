@@ -49,25 +49,27 @@ async fn lwt_update_on_orders_distributed_all_read_consistency() {
 
     let mut client = CassClient::connect(base1.to_string()).await.unwrap();
     client
-        .query(QueryRequest { sql: "CREATE TABLE orders (customer_id TEXT, order_id TEXT, order_date TEXT, PRIMARY KEY(customer_id, order_id))".into() })
+        .query(QueryRequest { sql: "CREATE TABLE orders (customer_id TEXT, order_id TEXT, order_date TEXT, PRIMARY KEY(customer_id, order_id))".into(), ts: 0 })
         .await
         .unwrap();
     client
         .query(QueryRequest {
             sql: "INSERT INTO orders VALUES ('nike','abc123','2025-08-27')".into(),
+            ts: 0,
         })
         .await
         .unwrap();
     client
         .query(QueryRequest {
             sql: "INSERT INTO orders VALUES ('nike','def456','2025-08-26')".into(),
+            ts: 0,
         })
         .await
         .unwrap();
 
     // Successful LWT update when condition matches
     let resp = client
-        .query(QueryRequest { sql: "UPDATE orders SET order_date='2025-08-25' WHERE customer_id='nike' AND order_id='abc123' IF order_date='2025-08-27'".into() })
+        .query(QueryRequest { sql: "UPDATE orders SET order_date='2025-08-25' WHERE customer_id='nike' AND order_id='abc123' IF order_date='2025-08-27'".into(), ts: 0 })
         .await
         .unwrap()
         .into_inner();
@@ -80,7 +82,7 @@ async fn lwt_update_on_orders_distributed_all_read_consistency() {
 
     // Failed LWT update when condition no longer matches; should include current value
     let resp2 = client
-        .query(QueryRequest { sql: "UPDATE orders SET order_date='2025-08-24' WHERE customer_id='nike' AND order_id='abc123' IF order_date='2025-08-27'".into() })
+        .query(QueryRequest { sql: "UPDATE orders SET order_date='2025-08-24' WHERE customer_id='nike' AND order_id='abc123' IF order_date='2025-08-27'".into(), ts: 0 })
         .await
         .unwrap()
         .into_inner();
@@ -97,6 +99,7 @@ async fn lwt_update_on_orders_distributed_all_read_consistency() {
         .query(QueryRequest {
             sql: "SELECT order_date FROM orders WHERE customer_id='nike' AND order_id='abc123'"
                 .into(),
+            ts: 0,
         })
         .await
         .unwrap()
