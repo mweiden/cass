@@ -123,7 +123,7 @@ for warm_node in "$NODE1" "$NODE2"; do
     --node "$warm_node" \
     --ops "$WARMUP_OPS" \
     --threads 1 \
-    --inflight 1
+    --inflight 1 > /dev/null
 done
 
 client_log=$(mktemp)
