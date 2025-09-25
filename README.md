@@ -18,6 +18,8 @@ Toy/experimental clone of [Apache Cassandra](https://en.wikipedia.org/wiki/Apach
 - [Consistency, Hinted Handoff, and Read Repair](#consistency-hinted-handoff-and-read-repair)
 - [Maintenance Commands](#maintenance-commands)
 - [Monitoring](#monitoring)
+- [Distributed Tracing](#distributed-tracing)
+  - [Viewing spans with Jaeger](#viewing-spans-with-jaeger)
 - [Performance Benchmarking](#performance-benchmarking)
 - [Flamegraph Profiling](#flamegraph-profiling)
 
