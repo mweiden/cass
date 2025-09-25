@@ -1,17 +1,20 @@
-use std::{collections::BTreeMap, io::Cursor};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    io::Cursor,
+};
 
 use murmur3::murmur3_32;
 use tokio::sync::RwLock;
 
 struct InnerTable {
-    map: BTreeMap<String, Vec<u8>>,
+    map: HashMap<String, Vec<u8>>,
     size_bytes: usize,
 }
 
 impl InnerTable {
     fn new() -> Self {
         Self {
-            map: BTreeMap::new(),
+            map: HashMap::new(),
             size_bytes: 0,
         }
     }
@@ -60,13 +63,17 @@ impl MemTable {
         let key_len = key.len();
         let value_len = value.len();
         let mut guard = self.shards[shard_idx].data.write().await;
-        match guard.map.insert(key, value) {
-            Some(prev) => {
-                guard.size_bytes = guard.size_bytes.saturating_sub(prev.len());
-                guard.size_bytes += value_len;
+        let InnerTable { map, size_bytes } = &mut *guard;
+        match map.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let prev_len = entry.get().len();
+                entry.insert(value);
+                *size_bytes = size_bytes.saturating_sub(prev_len);
+                *size_bytes += value_len;
             }
-            None => {
-                guard.size_bytes += key_len + value_len;
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                *size_bytes += key_len + value_len;
             }
         }
     }
@@ -77,12 +84,14 @@ impl MemTable {
         let key_len = key.len();
         let value_len = value.len();
         let mut guard = self.shards[shard_idx].data.write().await;
-        if guard.map.contains_key(&key) {
-            false
-        } else {
-            guard.size_bytes += key_len + value_len;
-            guard.map.insert(key, value);
-            true
+        let InnerTable { map, size_bytes } = &mut *guard;
+        match map.entry(key) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(value);
+                *size_bytes += key_len + value_len;
+                true
+            }
         }
     }
 
@@ -132,6 +141,7 @@ impl MemTable {
         for shard in &self.shards {
             let mut guard = shard.data.write().await;
             guard.map.clear();
+            guard.map.shrink_to_fit();
             guard.size_bytes = 0;
         }
     }
@@ -140,17 +150,16 @@ impl MemTable {
     pub async fn delete_prefix(&self, prefix: &str) {
         for shard in &self.shards {
             let mut guard = shard.data.write().await;
-            let keys: Vec<String> = guard
-                .map
-                .keys()
-                .filter(|k| k.starts_with(prefix))
-                .cloned()
-                .collect();
-            for key in keys {
-                if let Some(prev) = guard.map.remove(&key) {
-                    guard.size_bytes = guard.size_bytes.saturating_sub(key.len() + prev.len());
+            let mut removed_bytes = 0usize;
+            guard.map.retain(|k, v| {
+                if k.starts_with(prefix) {
+                    removed_bytes += k.len() + v.len();
+                    false
+                } else {
+                    true
                 }
-            }
+            });
+            guard.size_bytes = guard.size_bytes.saturating_sub(removed_bytes);
         }
     }
 
