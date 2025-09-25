@@ -17,8 +17,13 @@ use crate::rpc::{
 };
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use murmur3::murmur3_32;
-use tonic::Request;
+use once_cell::sync::Lazy;
+use tonic::{
+    Request,
+    transport::{Channel, Endpoint},
+};
 
+use crate::telemetry::PropagatingInterceptor;
 use crate::{
     Database, SqlEngine,
     query::{LwtCondition, ParsedQuery, QueryError, QueryOutput},
@@ -30,7 +35,7 @@ use sqlparser::ast::{
     AssignmentTarget, Expr, ObjectName, ObjectType, SelectItem, SetExpr, Statement, TableFactor,
 };
 use tokio::{
-    sync::{Mutex, RwLock, mpsc},
+    sync::{Mutex, RwLock},
     time::sleep,
 };
 use tracing::{Instrument, Span, field, instrument};
@@ -100,6 +105,42 @@ fn proto_to_output(resp: QueryResponse) -> QueryOutput {
 /// Each node owns a number of virtual nodes on the ring in order to
 /// balance load.  Requests are replicated to the selected peers based on
 /// a Murmur3 hash of the incoming statement.
+static SHARED_ENGINE: Lazy<SqlEngine> = Lazy::new(SqlEngine::new);
+
+#[derive(Clone, Default)]
+struct ClientPool {
+    channels: Arc<RwLock<HashMap<String, Channel>>>,
+}
+
+impl ClientPool {
+    async fn channel(&self, dst: &str) -> Result<Channel, tonic::transport::Error> {
+        if let Some(chan) = self.channels.read().await.get(dst).cloned() {
+            return Ok(chan);
+        }
+        let mut guard = self.channels.write().await;
+        if let Some(chan) = guard.get(dst).cloned() {
+            return Ok(chan);
+        }
+        let channel = Endpoint::from_shared(dst.to_string())?.connect().await?;
+        guard.insert(dst.to_string(), channel.clone());
+        Ok(channel)
+    }
+
+    async fn client(
+        &self,
+        dst: &str,
+    ) -> Result<
+        CassClient<tonic::codegen::InterceptedService<Channel, PropagatingInterceptor>>,
+        tonic::transport::Error,
+    > {
+        let channel = self.channel(dst).await?;
+        Ok(CassClient::with_interceptor(
+            channel,
+            PropagatingInterceptor::default(),
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct Cluster {
     db: Arc<Database>,
@@ -111,8 +152,9 @@ pub struct Cluster {
     health: Arc<RwLock<HashMap<String, Instant>>>,
     panic_until: Arc<RwLock<Option<Instant>>>,
     disk_ok: Arc<AtomicBool>,
-    hints: Arc<RwLock<HashMap<String, Vec<(u64, String)>>>>,
+    hints: Arc<RwLock<HashMap<String, Vec<(u64, Arc<str>)>>>>,
     lwt: Arc<RwLock<HashMap<String, PaxosSlot>>>,
+    client_pool: ClientPool,
 }
 
 #[derive(Clone)]
@@ -190,9 +232,11 @@ impl Cluster {
         }
         let health = Arc::new(RwLock::new(initial));
         let panic_until = Arc::new(RwLock::new(None));
+        let client_pool = ClientPool::default();
         let gossip_peers = peers.clone();
         let gossip_addr = self_addr.clone();
         let gossip_health = health.clone();
+        let gossip_pool = client_pool.clone();
         tokio::spawn(async move {
             let mut idx = 0usize;
             loop {
@@ -203,11 +247,11 @@ impl Cluster {
                 idx = (idx + 1) % gossip_peers.len();
                 let peer = &gossip_peers[idx];
                 if peer != &gossip_addr {
-                    let ok = if let Ok(mut client) = CassClient::connect_traced(peer.clone()).await
-                    {
-                        client.health(Request::new(HealthRequest {})).await.is_ok()
-                    } else {
-                        false
+                    let ok = match gossip_pool.client(peer).await {
+                        Ok(mut client) => {
+                            client.health(Request::new(HealthRequest {})).await.is_ok()
+                        }
+                        Err(_) => false,
                     };
                     let mut map = gossip_health.write().await;
                     if ok {
@@ -259,7 +303,60 @@ impl Cluster {
             disk_ok,
             hints: Arc::new(RwLock::new(HashMap::new())),
             lwt: Arc::new(RwLock::new(HashMap::new())),
+            client_pool,
         }
+    }
+
+    fn sql_engine() -> &'static SqlEngine {
+        &SHARED_ENGINE
+    }
+
+    fn forwarded_payload(sql: &Arc<str>, ts: u64) -> Arc<String> {
+        if ts > 0 {
+            Arc::new(format!("--ts:{}\n{}", ts, sql))
+        } else {
+            Arc::new(sql.to_string())
+        }
+    }
+
+    fn enqueue_hints(&self, nodes: Vec<String>, sql: Arc<str>, ts: u64) {
+        if nodes.is_empty() {
+            return;
+        }
+        let cluster = self.clone();
+        tokio::spawn(async move {
+            cluster.store_hints(nodes, sql, ts).await;
+        });
+    }
+
+    async fn grpc_client(
+        &self,
+        node: &str,
+    ) -> Result<
+        CassClient<tonic::codegen::InterceptedService<Channel, PropagatingInterceptor>>,
+        QueryError,
+    > {
+        self.client_pool
+            .client(node)
+            .await
+            .map_err(|e| QueryError::Other(e.to_string()))
+    }
+
+    async fn send_internal(
+        &self,
+        node: &str,
+        payload: Arc<String>,
+        ts: u64,
+    ) -> Result<QueryOutput, QueryError> {
+        let mut client = self.grpc_client(node).await?;
+        client
+            .internal(Request::new(QueryRequest {
+                sql: (*payload).clone(),
+                ts,
+            }))
+            .await
+            .map(|resp| proto_to_output(resp.into_inner()))
+            .map_err(|e| QueryError::Other(e.to_string()))
     }
 
     pub fn replicas_for(&self, key: &str) -> Vec<String> {
@@ -344,16 +441,16 @@ impl Cluster {
     /// Flush memtables on all nodes in the cluster.
     pub async fn flush_all(&self) -> Result<(), String> {
         let nodes: HashSet<String> = self.ring.values().cloned().collect();
+        let cluster = self.clone();
         let tasks: Vec<_> = nodes
             .into_iter()
-            .map(|node| {
-                let self_addr = self.self_addr.clone();
-                let db = self.db.clone();
+            .map(move |node| {
+                let cluster = cluster.clone();
                 async move {
-                    if node == self_addr {
-                        db.flush().await.map_err(|e| e.to_string())
+                    if node == cluster.self_addr {
+                        cluster.db.flush().await.map_err(|e| e.to_string())
                     } else {
-                        match CassClient::connect_traced(node.clone()).await {
+                        match cluster.grpc_client(&node).await {
                             Ok(mut client) => client
                                 .flush_internal(Request::new(FlushRequest {}))
                                 .await
@@ -402,7 +499,7 @@ impl Cluster {
         forwarded: bool,
         forwarded_ts: u64,
     ) -> Result<QueryResponse, QueryError> {
-        let engine = SqlEngine::new();
+        let engine = Self::sql_engine();
         if forwarded {
             let out = engine
                 .execute_with_ts(&self.db, sql, forwarded_ts, true)
@@ -414,11 +511,11 @@ impl Cluster {
         let meta = Self::analyze_sql(&parsed);
         if meta.is_lwt {
             // Execute Cassandra-style LWT via Paxos across replicas
-            return self.execute_lwt(&engine, &parsed).await;
+            return self.execute_lwt(engine, &parsed).await;
         }
         let ts = Self::timestamp_for(meta.is_write);
         let replicas = self
-            .target_replicas(&engine, &parsed, meta.broadcast)
+            .target_replicas(engine, &parsed, meta.broadcast)
             .await?;
         let healthy = self.healthy_nodes(replicas.clone()).await;
         let unhealthy: Vec<String> = replicas
@@ -434,20 +531,22 @@ impl Cluster {
             if healthy.is_empty() {
                 return Err(QueryError::Other("no healthy replicas".into()));
             }
-            let sql_owned = sql.to_string();
+            let sql_arc: Arc<str> = Arc::from(sql.to_string());
             if !unhealthy.is_empty() {
-                self.store_hints(&unhealthy, sql_owned.clone(), ts).await;
+                self.enqueue_hints(unhealthy.clone(), sql_arc.clone(), ts);
             }
             if meta.broadcast {
-                let results = self.run_on_nodes(healthy, sql_owned, ts).await;
+                let results = self.run_on_nodes(healthy, sql_arc.clone(), ts).await;
                 return self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta);
             }
             return self
-                .execute_write_with_consistency(sql_owned, ts, healthy, meta)
+                .execute_write_with_consistency(sql_arc, ts, healthy, meta)
                 .await;
         }
         if meta.broadcast {
-            let results = self.run_on_nodes(healthy, sql.to_string(), ts).await;
+            let results = self
+                .run_on_nodes(healthy, Arc::<str>::from(sql.to_string()), ts)
+                .await;
             return self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta);
         }
 
@@ -458,7 +557,7 @@ impl Cluster {
         let results = self
             .run_read_with_quorum(
                 healthy,
-                sql.to_string(),
+                Arc::<str>::from(sql.to_string()),
                 ts,
                 required,
                 meta.clone(),
@@ -475,7 +574,7 @@ impl Cluster {
     )]
     async fn execute_write_with_consistency(
         &self,
-        sql: String,
+        sql: Arc<str>,
         ts: u64,
         healthy: Vec<String>,
         meta: QueryMeta,
@@ -495,8 +594,9 @@ impl Cluster {
 
         for node in healthy {
             if node == self.self_addr {
-                let engine = SqlEngine::new();
-                let res = engine.execute_with_ts(&self.db, &sql, ts, true).await;
+                let res = Self::sql_engine()
+                    .execute_with_ts(&self.db, sql.as_ref(), ts, true)
+                    .await;
                 if res.is_ok() {
                     successes += 1;
                 }
@@ -510,45 +610,39 @@ impl Cluster {
             return self.merge_results(results, meta);
         }
 
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let forwarded = Self::forwarded_payload(&sql, ts);
         let parent_span = span.clone();
+        let mut futures = FuturesUnordered::new();
         for node in remote_nodes {
-            let tx = tx.clone();
-            let sql_clone = sql.clone();
+            let cluster = self.clone();
+            let payload = forwarded.clone();
             let span = parent_span.clone();
-            tokio::spawn(
+            futures.push(
                 async move {
-                    let target = node;
-                    let res = match CassClient::connect_traced(target.clone()).await {
-                        Ok(mut client) => client
-                            .internal(Request::new(QueryRequest { sql: sql_clone, ts }))
-                            .await
-                            .map(|resp| proto_to_output(resp.into_inner()))
-                            .map_err(|e| QueryError::Other(e.to_string())),
-                        Err(e) => Err(QueryError::Other(e.to_string())),
-                    };
-                    let _ = tx.send((target, res));
+                    let res = cluster.send_internal(&node, payload, ts).await;
+                    (node, res)
                 }
                 .instrument(span),
             );
         }
-        drop(tx);
 
-        while let Some((node, res)) = rx.recv().await {
+        while let Some((node, res)) = futures.next().await {
             match res {
                 Ok(output) => {
                     successes += 1;
                     results.push(Ok(output));
                 }
                 Err(e) => {
+                    self.enqueue_hints(vec![node.clone()], sql.clone(), ts);
                     results.push(Err(e));
-                    self.store_hints(&[node], sql.clone(), ts).await;
                 }
             }
             if successes >= required {
                 break;
             }
         }
+
+        drop(futures);
 
         if successes < required {
             return Err(QueryError::Other("failed to reach write quorum".into()));
@@ -800,7 +894,7 @@ impl Cluster {
                         max_accepted_value = acc_v;
                     }
                 }
-            } else if let Ok(mut client) = CassClient::connect_traced(node.clone()).await {
+            } else if let Ok(mut client) = self.grpc_client(node).await {
                 if let Ok(resp) = client
                     .lwt_prepare(tonic::Request::new(LwtPrepareRequest {
                         namespace: ns.clone(),
@@ -836,7 +930,7 @@ impl Cluster {
                     read_ballot = b;
                     read_value = v;
                 }
-            } else if let Ok(mut client) = CassClient::connect_traced(node.clone()).await {
+            } else if let Ok(mut client) = self.grpc_client(node).await {
                 if let Ok(resp) = client
                     .lwt_read(tonic::Request::new(LwtReadRequest {
                         namespace: ns.clone(),
@@ -926,7 +1020,7 @@ impl Cluster {
                 {
                     accepted += 1;
                 }
-            } else if let Ok(mut client) = CassClient::connect_traced(node.clone()).await {
+            } else if let Ok(mut client) = self.grpc_client(node).await {
                 if let Ok(resp) = client
                     .lwt_propose(tonic::Request::new(LwtProposeRequest {
                         namespace: ns.clone(),
@@ -950,7 +1044,7 @@ impl Cluster {
         for node in &healthy {
             if node == &self.self_addr {
                 self.lwt_commit(&ns, &key, proposed_value.clone()).await;
-            } else if let Ok(mut client) = CassClient::connect_traced(node.clone()).await {
+            } else if let Ok(mut client) = self.grpc_client(node).await {
                 let _ = client
                     .lwt_commit(tonic::Request::new(LwtCommitRequest {
                         namespace: ns.clone(),
@@ -1039,28 +1133,21 @@ impl Cluster {
         healthy
     }
 
-    #[instrument(skip(self, sql), fields(node = %node, ts = ts))]
+    #[instrument(skip(self, sql, forwarded), fields(node = %node, ts = ts))]
     async fn execute_on_node(
         &self,
         node: &str,
-        sql: &str,
+        sql: Arc<str>,
+        forwarded: Option<Arc<String>>,
         ts: u64,
     ) -> Result<QueryOutput, QueryError> {
         if node == self.self_addr {
-            let engine = SqlEngine::new();
-            engine.execute_with_ts(&self.db, sql, ts, true).await
+            Self::sql_engine()
+                .execute_with_ts(&self.db, sql.as_ref(), ts, true)
+                .await
         } else {
-            match CassClient::connect_traced(node.to_string()).await {
-                Ok(mut client) => client
-                    .internal(Request::new(QueryRequest {
-                        sql: sql.to_string(),
-                        ts,
-                    }))
-                    .await
-                    .map(|resp| proto_to_output(resp.into_inner()))
-                    .map_err(|e| QueryError::Other(e.to_string())),
-                Err(e) => Err(QueryError::Other(e.to_string())),
-            }
+            let payload = forwarded.unwrap_or_else(|| Self::forwarded_payload(&sql, ts));
+            self.send_internal(node, payload, ts).await
         }
     }
 
@@ -1071,19 +1158,24 @@ impl Cluster {
     async fn run_on_nodes(
         &self,
         nodes: Vec<String>,
-        sql: String,
+        sql: Arc<str>,
         ts: u64,
     ) -> Vec<(String, Result<QueryOutput, QueryError>)> {
         let span = Span::current();
         span.record("node_count", &field::display(nodes.len()));
         let parent_span = span.clone();
+        let forwarded = Self::forwarded_payload(&sql, ts);
         let tasks: Vec<_> = nodes
             .into_iter()
             .map(|node| {
                 let sql = sql.clone();
+                let forwarded = forwarded.clone();
+                let cluster = self.clone();
                 let span = parent_span.clone();
                 async move {
-                    let res = self.execute_on_node(&node, &sql, ts).await;
+                    let res = cluster
+                        .execute_on_node(&node, sql, Some(forwarded), ts)
+                        .await;
                     (node, res)
                 }
                 .instrument(span)
@@ -1099,7 +1191,7 @@ impl Cluster {
     async fn run_read_with_quorum(
         &self,
         nodes: Vec<String>,
-        sql: String,
+        sql: Arc<str>,
         ts: u64,
         required: usize,
         meta: QueryMeta,
@@ -1117,14 +1209,18 @@ impl Cluster {
             Vec::<(String, Vec<(String, u64, String)>)>::new(),
         ));
         let mut futures = FuturesUnordered::new();
+        let forwarded = Self::forwarded_payload(&sql, ts);
         let parent_span = Span::current();
         for node in nodes {
             let sql = sql.clone();
+            let forwarded = forwarded.clone();
             let cluster = self.clone();
             let span = parent_span.clone();
             futures.push(
                 async move {
-                    let res = cluster.execute_on_node(&node, &sql, ts).await;
+                    let res = cluster
+                        .execute_on_node(&node, sql, Some(forwarded), ts)
+                        .await;
                     (node, res)
                 }
                 .instrument(span),
@@ -1190,13 +1286,13 @@ impl Cluster {
     }
 
     /// Record failed writes as hints for later delivery.
-    async fn store_hints(&self, nodes: &[String], sql: String, ts: u64) {
+    async fn store_hints(&self, nodes: Vec<String>, sql: Arc<str>, ts: u64) {
         if nodes.is_empty() {
             return;
         }
         let mut map = self.hints.write().await;
-        for n in nodes {
-            map.entry(n.clone()).or_default().push((ts, sql.clone()));
+        for node in nodes {
+            map.entry(node).or_default().push((ts, sql.clone()));
         }
     }
 
@@ -1342,14 +1438,14 @@ impl Cluster {
                 .map(|c| format!("'{}'", row_map.get(c).cloned().unwrap_or_default()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let insert_sql = format!(
+            let insert_sql: Arc<str> = Arc::from(format!(
                 "INSERT INTO {} ({}) VALUES ({});",
                 ns,
                 cols.join(", "),
                 vals
-            );
+            ));
             if !unhealthy.is_empty() {
-                self.store_hints(&unhealthy, insert_sql.clone(), ts).await;
+                self.enqueue_hints(unhealthy.clone(), insert_sql.clone(), ts);
             }
             let _ = self.run_on_nodes(healthy.clone(), insert_sql, ts).await;
         }
@@ -1631,7 +1727,11 @@ mod tests {
         let peer = "http://127.0.0.1:9201".to_string();
         let cluster = test_cluster("http://127.0.0.1:9200", vec![peer.clone()]).await;
         cluster
-            .store_hints(&[peer.clone()], "INSERT INTO t (id) VALUES ('a')".into(), 1)
+            .store_hints(
+                vec![peer.clone()],
+                Arc::<str>::from("INSERT INTO t (id) VALUES ('a')"),
+                1,
+            )
             .await;
         assert!(cluster.hints.read().await.get(&peer).is_some());
         cluster.apply_hints(&peer).await;
