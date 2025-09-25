@@ -5,7 +5,7 @@ use std::{
 
 use cass::{
     rpc::{QueryRequest, cass_client::CassClient},
-    telemetry::PropagatingInterceptor,
+    telemetry::{self, PropagatingInterceptor},
 };
 use clap::Parser;
 use futures::{
@@ -14,9 +14,7 @@ use futures::{
 };
 use statrs::statistics::Statistics;
 use tokio::{fs, time::timeout};
-use tonic::{codegen::InterceptedService, transport::Channel};
-
-type TracedCassClient = CassClient<InterceptedService<Channel, PropagatingInterceptor>>;
+use tonic::{Status, codegen::InterceptedService, transport::Channel};
 use url::Url;
 
 #[derive(Parser)]
@@ -49,6 +47,34 @@ struct Args {
 
 const MAX_LOGGED_FAILURES: usize = 5;
 
+#[derive(Clone)]
+enum PerfClient {
+    Traced(CassClient<InterceptedService<Channel, PropagatingInterceptor>>),
+    Plain(CassClient<Channel>),
+}
+
+impl PerfClient {
+    async fn connect(node: String) -> Result<Self, tonic::transport::Error> {
+        if telemetry::tracing_disabled() {
+            CassClient::connect(node).await.map(PerfClient::Plain)
+        } else {
+            CassClient::connect_traced(node)
+                .await
+                .map(PerfClient::Traced)
+        }
+    }
+
+    async fn query(
+        &mut self,
+        request: QueryRequest,
+    ) -> Result<tonic::Response<cass::rpc::QueryResponse>, Status> {
+        match self {
+            PerfClient::Traced(client) => client.query(request).await,
+            PerfClient::Plain(client) => client.query(request).await,
+        }
+    }
+}
+
 #[derive(Default)]
 struct PhaseStats {
     errors: usize,
@@ -71,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     // Ensure table exists via a single client
     {
-        let mut client = CassClient::connect_traced(args.node.clone()).await?;
+        let mut client = PerfClient::connect(args.node.clone()).await?;
         client
             .query(QueryRequest {
                 sql: "CREATE TABLE IF NOT EXISTS perf (k INT PRIMARY KEY, v INT)".into(),
@@ -165,8 +191,8 @@ async fn run_phase(
     let base = ops / workers;
     let rem = ops % workers;
 
-    let clients: Vec<TracedCassClient> =
-        try_join_all((0..workers).map(|_| CassClient::connect_traced(node.clone()))).await?;
+    let clients: Vec<PerfClient> =
+        try_join_all((0..workers).map(|_| PerfClient::connect(node.clone()))).await?;
 
     let mut handles = Vec::with_capacity(workers);
     let concurrency = inflight.max(1);
@@ -213,7 +239,7 @@ enum RequestOutcome {
 }
 
 async fn run_worker(
-    client: TracedCassClient,
+    client: PerfClient,
     offset: usize,
     count: usize,
     write: bool,
@@ -235,7 +261,7 @@ async fn run_worker(
     let mut timeouts = 0;
     let mut messages = Vec::new();
 
-    let mut pool: VecDeque<TracedCassClient> = VecDeque::with_capacity(concurrency);
+    let mut pool: VecDeque<PerfClient> = VecDeque::with_capacity(concurrency);
     pool.push_back(client);
     if concurrency > 1 {
         let template = pool.front().expect("client pool").clone();
