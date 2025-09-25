@@ -427,3 +427,14 @@ fn fmt_f(x: f64) -> String {
         format!("{:.2}", x)
     }
 }
+
+fn tracing_disabled() -> bool {
+    matches!(
+        std::env::var("CASS_DISABLE_TRACING"),
+        Ok(v)
+            if matches!(
+                v.as_str(),
+                "1" | "true" | "TRUE" | "True" | "yes" | "YES"
+            )
+    )
+}
