@@ -5,7 +5,7 @@ use std::{
 
 use cass::{
     rpc::{QueryRequest, cass_client::CassClient},
-    telemetry::PropagatingInterceptor,
+    telemetry::{self, PropagatingInterceptor},
 };
 use clap::Parser;
 use futures::{
@@ -49,7 +49,7 @@ enum PerfClient {
 
 impl PerfClient {
     async fn connect(node: String) -> Result<Self, tonic::transport::Error> {
-        if tracing_disabled() {
+        if telemetry::tracing_disabled() {
             CassClient::connect(node).await.map(PerfClient::Plain)
         } else {
             CassClient::connect_traced(node)
