@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euox pipefail
+set -euo pipefail
 
 # Generate a CPU flamegraph for the query endpoint by running the cass server
 # under cargo-flamegraph while driving load with the examples/perf_client.

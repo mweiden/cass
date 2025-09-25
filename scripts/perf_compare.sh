@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euox pipefail
+set -euo pipefail
 
 # Perf compare harness: runs cass (docker compose) and Apache Cassandra (docker) and
 # collects throughput/latency logs, then plots a comparison.
