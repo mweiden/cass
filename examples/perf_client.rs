@@ -39,6 +39,12 @@ struct Args {
     /// Optional path to write the node's Prometheus metrics after the run
     #[clap(long)]
     metrics_out: Option<String>,
+    /// Only issue write operations
+    #[clap(long, conflicts_with = "reads_only")]
+    writes_only: bool,
+    /// Only issue read operations
+    #[clap(long, conflicts_with = "writes_only")]
+    reads_only: bool,
 }
 
 const MAX_LOGGED_FAILURES: usize = 5;
@@ -79,32 +85,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Duration::from_millis(args.timeout_ms))
     };
 
-    // Writes with concurrency
-    let (write_lat_ms, write_dur, write_stats) = run_phase(
-        args.node.clone(),
-        args.ops,
-        args.threads,
-        args.inflight,
-        true,
-        rpc_timeout,
-    )
-    .await?;
-    // Reads with concurrency
-    let (read_lat_ms, read_dur, read_stats) = run_phase(
-        args.node.clone(),
-        args.ops,
-        args.threads,
-        args.inflight,
-        false,
-        rpc_timeout,
-    )
-    .await?;
+    let write_phase = if args.reads_only {
+        None
+    } else {
+        Some(
+            run_phase(
+                args.node.clone(),
+                args.ops,
+                args.threads,
+                args.inflight,
+                true,
+                rpc_timeout,
+            )
+            .await?,
+        )
+    };
+
+    let read_phase = if args.writes_only {
+        None
+    } else {
+        Some(
+            run_phase(
+                args.node.clone(),
+                args.ops,
+                args.threads,
+                args.inflight,
+                false,
+                rpc_timeout,
+            )
+            .await?,
+        )
+    };
 
     // Report in a style similar to cassandra-stress
-    report("WRITE", args.ops, write_dur.as_secs_f64(), &write_lat_ms);
-    report("READ", args.ops, read_dur.as_secs_f64(), &read_lat_ms);
-    log_phase_errors("WRITE", &write_stats);
-    log_phase_errors("READ", &read_stats);
+    if let Some((write_lat_ms, write_dur, write_stats)) = &write_phase {
+        report("WRITE", args.ops, write_dur.as_secs_f64(), write_lat_ms);
+        log_phase_errors("WRITE", write_stats);
+    }
+    if let Some((read_lat_ms, read_dur, read_stats)) = &read_phase {
+        report("READ", args.ops, read_dur.as_secs_f64(), read_lat_ms);
+        log_phase_errors("READ", read_stats);
+    }
 
     if let Some(out) = args.metrics_out {
         // Derive metrics URL from the node address: gRPC port + 1000.
