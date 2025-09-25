@@ -126,10 +126,25 @@ for warm_node in "$NODE1" "$NODE2"; do
     --inflight 1
 done
 
-"$CLIENT_BIN" \
+client_log=$(mktemp)
+if ! "$CLIENT_BIN" \
   --node "$NODE1" \
   --ops "$OPS" \
   --threads "$THREADS" \
-  --inflight "$INFLIGHT"
+  --inflight "$INFLIGHT" \
+  >"$client_log" 2>&1; then
+  cat "$client_log"
+  rm -f "$client_log"
+  echo "error: perf_client exited with a failure status" >&2
+  exit 1
+fi
+
+cat "$client_log"
+if grep -qE '\[[A-Z]+\] [0-9]+ RPCs failed' "$client_log"; then
+  rm -f "$client_log"
+  echo "error: perf_client reported RPC failures" >&2
+  exit 1
+fi
+rm -f "$client_log"
 
 echo "Scale test completed successfully"
