@@ -29,21 +29,21 @@ async fn select_requires_partition_key() {
 
     let mut client = CassClient::connect(base.to_string()).await.unwrap();
     client
-        .query(QueryRequest {
-            sql: "CREATE TABLE orders (customer_id TEXT, order_id TEXT, order_date TEXT, PRIMARY KEY(customer_id, \
-                order_id))".into(),
-        })
+        .query(QueryRequest { sql: "CREATE TABLE orders (customer_id TEXT, order_id TEXT, order_date TEXT, PRIMARY KEY(customer_id, \
+                order_id))".into(), ts: 0 })
         .await
         .unwrap();
     client
         .query(QueryRequest {
             sql: "INSERT INTO orders VALUES ('nike','abc123','2025-08-25')".into(),
+            ts: 0,
         })
         .await
         .unwrap();
     client
         .query(QueryRequest {
             sql: "INSERT INTO orders VALUES ('nike','def456','2025-08-26')".into(),
+            ts: 0,
         })
         .await
         .unwrap();
@@ -51,6 +51,7 @@ async fn select_requires_partition_key() {
     let res = client
         .query(QueryRequest {
             sql: "SELECT * FROM orders".into(),
+            ts: 0,
         })
         .await;
     assert!(res.unwrap_err().message().contains("partition key"));
@@ -58,6 +59,7 @@ async fn select_requires_partition_key() {
     let rows = client
         .query(QueryRequest {
             sql: "SELECT * FROM orders WHERE customer_id = 'nike'".into(),
+            ts: 0,
         })
         .await
         .unwrap()
@@ -71,6 +73,7 @@ async fn select_requires_partition_key() {
     let cnt = client
         .query(QueryRequest {
             sql: "SELECT COUNT(*) FROM orders WHERE customer_id = 'nike'".into(),
+            ts: 0,
         })
         .await
         .unwrap()

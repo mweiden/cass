@@ -30,6 +30,7 @@ async fn show_tables_via_grpc() {
     client
         .query(QueryRequest {
             sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+            ts: 0,
         })
         .await
         .unwrap();
@@ -37,6 +38,7 @@ async fn show_tables_via_grpc() {
     let res = client
         .query(QueryRequest {
             sql: "SHOW TABLES".into(),
+            ts: 0,
         })
         .await
         .unwrap()

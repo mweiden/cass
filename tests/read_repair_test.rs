@@ -50,23 +50,27 @@ async fn read_repairs_stale_replicas() {
     let mut c2 = CassClient::connect(base2.to_string()).await.unwrap();
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+        ts: 0,
     })
     .await
     .unwrap();
 
     c1.internal(QueryRequest {
-        sql: "--ts:2\nINSERT INTO kv (id, val) VALUES ('r','new')".into(),
+        sql: "INSERT INTO kv (id, val) VALUES ('r','new')".into(),
+        ts: 2,
     })
     .await
     .unwrap();
     c2.internal(QueryRequest {
-        sql: "--ts:1\nINSERT INTO kv (id, val) VALUES ('r','old')".into(),
+        sql: "INSERT INTO kv (id, val) VALUES ('r','old')".into(),
+        ts: 1,
     })
     .await
     .unwrap();
 
     c1.query(QueryRequest {
         sql: "SELECT val FROM kv WHERE id = 'r'".into(),
+        ts: 0,
     })
     .await
     .unwrap();
@@ -74,6 +78,7 @@ async fn read_repairs_stale_replicas() {
     let resp = c2
         .query(QueryRequest {
             sql: "SELECT val FROM kv WHERE id = 'r'".into(),
+            ts: 0,
         })
         .await
         .unwrap()
@@ -129,13 +134,15 @@ async fn read_repair_populates_missing_replicas() {
     let mut c2 = CassClient::connect(base2.to_string()).await.unwrap();
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+        ts: 0,
     })
     .await
     .unwrap();
 
     // Write only to node1 so node2 lacks the row.
     c1.internal(QueryRequest {
-        sql: "--ts:5\nINSERT INTO kv (id, val) VALUES ('missing','present')".into(),
+        sql: "INSERT INTO kv (id, val) VALUES ('missing','present')".into(),
+        ts: 5,
     })
     .await
     .unwrap();
@@ -143,6 +150,7 @@ async fn read_repair_populates_missing_replicas() {
     // Coordinated read should trigger repair for node2.
     c1.query(QueryRequest {
         sql: "SELECT val FROM kv WHERE id = 'missing'".into(),
+        ts: 0,
     })
     .await
     .unwrap();
@@ -150,6 +158,7 @@ async fn read_repair_populates_missing_replicas() {
     let resp = c2
         .query(QueryRequest {
             sql: "SELECT val FROM kv WHERE id = 'missing'".into(),
+            ts: 0,
         })
         .await
         .unwrap()

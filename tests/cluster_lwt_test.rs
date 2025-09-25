@@ -40,6 +40,7 @@ async fn execute_lwt_insert_and_update_paths() {
         .execute(
             "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
             false,
+            0,
         )
         .await
         .unwrap();
@@ -48,6 +49,7 @@ async fn execute_lwt_insert_and_update_paths() {
         .execute(
             "INSERT INTO kv (id, val) VALUES ('a','1') IF NOT EXISTS",
             false,
+            0,
         )
         .await
         .unwrap();
@@ -57,19 +59,20 @@ async fn execute_lwt_insert_and_update_paths() {
         .execute(
             "INSERT INTO kv (id, val) VALUES ('a','2') IF NOT EXISTS",
             false,
+            0,
         )
         .await
         .unwrap();
     assert_eq!(applied(&resp), Some("false".to_string()));
 
     let resp = cluster
-        .execute("UPDATE kv SET val='3' WHERE id='a' IF val='1'", false)
+        .execute("UPDATE kv SET val='3' WHERE id='a' IF val='1'", false, 0)
         .await
         .unwrap();
     assert_eq!(applied(&resp), Some("true".to_string()));
 
     let resp = cluster
-        .execute("UPDATE kv SET val='4' WHERE id='a' IF val='1'", false)
+        .execute("UPDATE kv SET val='4' WHERE id='a' IF val='1'", false, 0)
         .await
         .unwrap();
     assert_eq!(applied(&resp), Some("false".to_string()));
@@ -81,7 +84,11 @@ async fn execute_lwt_errors_when_insufficient_replicas() {
     let addr = "http://127.0.0.1:6200";
     let cluster = build_cluster(2, addr).await; // rf=2 but only one node present
     cluster
-        .execute("CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))", false)
+        .execute(
+            "CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))",
+            false,
+            0,
+        )
         .await
         .unwrap();
 
@@ -89,6 +96,7 @@ async fn execute_lwt_errors_when_insufficient_replicas() {
         .execute(
             "INSERT INTO t (id, val) VALUES ('a','1') IF NOT EXISTS",
             false,
+            0,
         )
         .await
         .unwrap_err();

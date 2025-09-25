@@ -119,9 +119,11 @@ impl Cass for CassService {
         let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
         let span = Span::current();
         span.set_parent(parent_cx);
-        let sql = req.get_ref().sql.clone();
+        let req = req.into_inner();
+        let sql = req.sql;
+        let ts = req.ts;
         span.record("query.sql", &field::display(&sql));
-        match self.cluster.execute(&sql, false).await {
+        match self.cluster.execute(&sql, false, ts).await {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Err(Status::invalid_argument(e.to_string())),
         }
@@ -135,9 +137,11 @@ impl Cass for CassService {
         let parent_cx = telemetry::extract_remote_context_from_metadata(req.metadata());
         let span = Span::current();
         span.set_parent(parent_cx);
-        let sql = req.get_ref().sql.clone();
+        let req = req.into_inner();
+        let sql = req.sql;
+        let ts = req.ts;
         span.record("query.sql", &field::display(&sql));
-        match self.cluster.execute(&sql, true).await {
+        match self.cluster.execute(&sql, true, ts).await {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Err(Status::invalid_argument(e.to_string())),
         }
@@ -487,6 +491,7 @@ async fn repl(nodes: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(mut client) => match client
                     .query(QueryRequest {
                         sql: sql.to_string(),
+                        ts: 0,
                     })
                     .await
                 {

@@ -30,6 +30,7 @@ async fn grpc_query_roundtrip() {
     client
         .query(QueryRequest {
             sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+            ts: 0,
         })
         .await
         .unwrap();
@@ -37,6 +38,7 @@ async fn grpc_query_roundtrip() {
     client
         .query(QueryRequest {
             sql: "INSERT INTO kv (id, val) VALUES ('foo','bar')".into(),
+            ts: 0,
         })
         .await
         .unwrap();
@@ -44,6 +46,7 @@ async fn grpc_query_roundtrip() {
     let res = client
         .query(QueryRequest {
             sql: "SELECT val FROM kv WHERE id = 'foo'".into(),
+            ts: 0,
         })
         .await
         .unwrap()
@@ -59,6 +62,7 @@ async fn grpc_query_roundtrip() {
     let count = client
         .query(QueryRequest {
             sql: "SELECT COUNT(*) FROM kv WHERE id = 'foo'".into(),
+            ts: 0,
         })
         .await
         .unwrap()

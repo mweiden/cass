@@ -31,15 +31,16 @@ async fn forwarded_insert_executes() {
         .execute(
             "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
             false,
+            0,
         )
         .await
         .unwrap();
     cluster
-        .execute("--ts:5\nINSERT INTO kv (id, val) VALUES ('a','x')", true)
+        .execute("INSERT INTO kv (id, val) VALUES ('a','x')", true, 5)
         .await
         .unwrap();
     let resp = cluster
-        .execute("SELECT val FROM kv WHERE id='a'", false)
+        .execute("SELECT val FROM kv WHERE id='a'", false, 0)
         .await
         .unwrap();
     assert_eq!(first_val(resp, "val"), Some("x".to_string()));
@@ -50,12 +51,16 @@ async fn insert_errors_when_no_healthy_replicas() {
     let addr = "http://127.0.0.1:6001";
     let cluster = build_cluster(Vec::new(), 1, 1, addr).await;
     cluster
-        .execute("CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))", false)
+        .execute(
+            "CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))",
+            false,
+            0,
+        )
         .await
         .unwrap();
     cluster.panic_for(Duration::from_secs(2)).await;
     let err = cluster
-        .execute("INSERT INTO t (id, val) VALUES ('a','1')", false)
+        .execute("INSERT INTO t (id, val) VALUES ('a','1')", false, 0)
         .await
         .unwrap_err();
     match err {
@@ -70,7 +75,11 @@ async fn insert_errors_when_quorum_unavailable() {
     let peer = "http://127.0.0.1:6010".to_string();
     let cluster = build_cluster(vec![peer.clone()], 1, 2, addr).await;
     cluster
-        .execute("CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))", false)
+        .execute(
+            "CREATE TABLE t (id TEXT, val TEXT, PRIMARY KEY(id))",
+            false,
+            0,
+        )
         .await
         .unwrap();
 
@@ -82,7 +91,7 @@ async fn insert_errors_when_quorum_unavailable() {
     }
 
     let err = cluster
-        .execute("INSERT INTO t (id, val) VALUES ('a','1')", false)
+        .execute("INSERT INTO t (id, val) VALUES ('a','1')", false, 0)
         .await
         .unwrap_err();
     match err {
@@ -99,16 +108,17 @@ async fn select_errors_when_all_replicas_unhealthy() {
         .execute(
             "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
             false,
+            0,
         )
         .await
         .unwrap();
     cluster
-        .execute("INSERT INTO kv (id, val) VALUES ('a','v')", false)
+        .execute("INSERT INTO kv (id, val) VALUES ('a','v')", false, 0)
         .await
         .unwrap();
     cluster.panic_for(Duration::from_secs(2)).await;
     let err = cluster
-        .execute("SELECT val FROM kv WHERE id='a'", false)
+        .execute("SELECT val FROM kv WHERE id='a'", false, 0)
         .await
         .unwrap_err();
     match err {
@@ -126,10 +136,11 @@ async fn show_tables_succeeds_with_unhealthy_peer() {
         .execute(
             "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
             false,
+            0,
         )
         .await
         .unwrap();
-    let resp = cluster.execute("SHOW TABLES", false).await.unwrap();
+    let resp = cluster.execute("SHOW TABLES", false, 0).await.unwrap();
     if let Some(query_response::Payload::Tables(t)) = resp.payload {
         assert_eq!(t.tables, vec!["kv".to_string()]);
     } else {
@@ -145,15 +156,16 @@ async fn delete_removes_row() {
         .execute(
             "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
             false,
+            0,
         )
         .await
         .unwrap();
     cluster
-        .execute("INSERT INTO kv (id, val) VALUES ('a','x')", false)
+        .execute("INSERT INTO kv (id, val) VALUES ('a','x')", false, 0)
         .await
         .unwrap();
     let resp = cluster
-        .execute("DELETE FROM kv WHERE id='a'", false)
+        .execute("DELETE FROM kv WHERE id='a'", false, 0)
         .await
         .unwrap();
     if let Some(query_response::Payload::Mutation(m)) = resp.payload {
@@ -163,7 +175,7 @@ async fn delete_removes_row() {
         panic!("expected mutation response");
     }
     let resp = cluster
-        .execute("SELECT val FROM kv WHERE id='a'", false)
+        .execute("SELECT val FROM kv WHERE id='a'", false, 0)
         .await
         .unwrap();
     assert_eq!(first_val(resp, "val"), None);
@@ -177,17 +189,18 @@ async fn drop_table_removes_schema() {
         .execute(
             "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
             false,
+            0,
         )
         .await
         .unwrap();
-    let resp = cluster.execute("DROP TABLE kv", false).await.unwrap();
+    let resp = cluster.execute("DROP TABLE kv", false, 0).await.unwrap();
     if let Some(query_response::Payload::Mutation(m)) = resp.payload {
         assert_eq!(m.op, "DROP TABLE");
         assert_eq!(m.count, 1);
     } else {
         panic!("expected mutation response");
     }
-    let resp = cluster.execute("SHOW TABLES", false).await.unwrap();
+    let resp = cluster.execute("SHOW TABLES", false, 0).await.unwrap();
     if let Some(query_response::Payload::Tables(t)) = resp.payload {
         assert!(t.tables.is_empty());
     } else {
@@ -203,6 +216,7 @@ async fn select_with_in_returns_rows() {
         .execute(
             "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
             false,
+            0,
         )
         .await
         .unwrap();
@@ -211,12 +225,13 @@ async fn select_with_in_returns_rows() {
             .execute(
                 &format!("INSERT INTO kv (id, val) VALUES ('{}','{}')", id, val),
                 false,
+                0,
             )
             .await
             .unwrap();
     }
     let resp = cluster
-        .execute("SELECT val FROM kv WHERE id IN ('a','c')", false)
+        .execute("SELECT val FROM kv WHERE id IN ('a','c')", false, 0)
         .await
         .unwrap();
     if let Some(query_response::Payload::Rows(rs)) = resp.payload {

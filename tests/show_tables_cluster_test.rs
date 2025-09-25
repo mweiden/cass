@@ -50,6 +50,7 @@ async fn show_tables_with_unhealthy_replica() {
 
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+        ts: 0,
     })
     .await
     .unwrap();
@@ -61,6 +62,7 @@ async fn show_tables_with_unhealthy_replica() {
         let res = c1
             .query(QueryRequest {
                 sql: "SHOW TABLES".into(),
+                ts: 0,
             })
             .await;
         if let Ok(resp) = res {
