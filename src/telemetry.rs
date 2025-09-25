@@ -182,7 +182,7 @@ impl<'a> opentelemetry::propagation::Injector for MetadataMapInjector<'a> {
     }
 }
 
-fn tracing_disabled() -> bool {
+pub fn tracing_disabled() -> bool {
     matches!(
         std::env::var("CASS_DISABLE_TRACING"),
         Ok(v) if matches!(v.as_str(), "1" | "true" | "TRUE" | "True" | "yes" | "YES")

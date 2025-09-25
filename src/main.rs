@@ -429,27 +429,35 @@ async fn run_server(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> 
     });
 
     info!("Cass gRPC server listening on {addr}");
-    let trace_layer = TraceLayer::new_for_grpc()
-        .make_span_with(|request: &tonic::codegen::http::Request<_>| {
-            let path = request.uri().path();
-            let span = tracing::debug_span!(
-                "grpc.request",
-                otel.name = %path,
-                grpc.method = %path,
-                grpc.status_code = field::Empty,
-            );
-            let context = telemetry::extract_remote_context_from_headers(request.headers());
-            span.set_parent(context);
-            span
-        })
-        .on_request(DefaultOnRequest::new().level(Level::DEBUG))
-        .on_response(DefaultOnResponse::new().level(Level::DEBUG));
-    Server::builder()
-        .layer(metrics_layer)
-        .layer(trace_layer)
-        .add_service(CassServer::new(svc))
-        .serve(addr)
-        .await?;
+    if telemetry::tracing_disabled() {
+        Server::builder()
+            .layer(metrics_layer)
+            .add_service(CassServer::new(svc))
+            .serve(addr)
+            .await?;
+    } else {
+        let trace_layer = TraceLayer::new_for_grpc()
+            .make_span_with(|request: &tonic::codegen::http::Request<_>| {
+                let path = request.uri().path();
+                let span = tracing::debug_span!(
+                    "grpc.request",
+                    otel.name = %path,
+                    grpc.method = %path,
+                    grpc.status_code = field::Empty,
+                );
+                let context = telemetry::extract_remote_context_from_headers(request.headers());
+                span.set_parent(context);
+                span
+            })
+            .on_request(DefaultOnRequest::new().level(Level::DEBUG))
+            .on_response(DefaultOnResponse::new().level(Level::DEBUG));
+        Server::builder()
+            .layer(metrics_layer)
+            .layer(trace_layer)
+            .add_service(CassServer::new(svc))
+            .serve(addr)
+            .await?;
+    }
     Ok(())
 }
 
