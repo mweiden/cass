@@ -78,6 +78,8 @@ pushd "$ROOT_DIR" >/dev/null
 # Build the server binary and perf client once before launching anything.
 $CARGO_BIN build --bin cass --example perf_client
 
+export CASS_DISABLE_TRACING=${CASS_DISABLE_TRACING:-1}
+
 CASS_BIN="$ROOT_DIR/target/debug/cass"
 CLIENT_BIN="$ROOT_DIR/target/debug/examples/perf_client"
 if [[ ! -x "$CASS_BIN" || ! -x "$CLIENT_BIN" ]]; then
@@ -91,7 +93,7 @@ DATA_DIRS="$data_dir1 $data_dir2"
 
 # Launch both nodes with RF=2 and read consistency ALL so that every read
 # consults both replicas.
-CASS_DISABLE_TRACING=1 "$CASS_BIN" \
+"$CASS_BIN" \
   server \
   --node-addr "$NODE1" \
   --peer "$NODE2" \
@@ -100,7 +102,7 @@ CASS_DISABLE_TRACING=1 "$CASS_BIN" \
   --read-consistency all &
 SERVER1_PID=$!
 
-CASS_DISABLE_TRACING=1 "$CASS_BIN" \
+"$CASS_BIN" \
   server \
   --node-addr "$NODE2" \
   --peer "$NODE1" \
