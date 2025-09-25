@@ -626,6 +626,7 @@ impl Cluster {
             );
         }
 
+        let mut pending = None;
         while let Some((node, res)) = futures.next().await {
             match res {
                 Ok(output) => {
@@ -638,11 +639,22 @@ impl Cluster {
                 }
             }
             if successes >= required {
+                pending = Some(futures);
                 break;
             }
         }
 
-        drop(futures);
+        if let Some(mut remaining) = pending {
+            let cluster = self.clone();
+            let sql = sql.clone();
+            tokio::spawn(async move {
+                while let Some((node, res)) = remaining.next().await {
+                    if res.is_err() {
+                        cluster.enqueue_hints(vec![node], sql.clone(), ts);
+                    }
+                }
+            });
+        }
 
         if successes < required {
             return Err(QueryError::Other("failed to reach write quorum".into()));
