@@ -171,32 +171,32 @@ impl Database {
             .as_micros() as u64
     }
 
-    async fn insert_internal(&self, key: String, value: Vec<u8>) {
-        // best effort to log the write ahead of applying it
+    async fn insert_internal(&self, key: String, value: Vec<u8>) -> std::io::Result<()> {
         let mut rec = key.clone().into_bytes();
         rec.push(b'\t');
         let enc = base64::engine::general_purpose::STANDARD.encode(&value);
         rec.extend_from_slice(enc.as_bytes());
-        let _ = self.wal.append(&rec).await;
+        self.wal.append(&rec).await?;
 
         self.memtable.insert(key, value).await;
         if self.memtable.size_bytes().await >= self.max_memtable_bytes {
             // best-effort flush; ignore errors for now
             let _ = self.flush().await;
         }
+        Ok(())
     }
 
     /// Insert a key/value pair with an explicit timestamp.
-    pub async fn insert_ts(&self, key: String, value: Vec<u8>, ts: u64) {
+    pub async fn insert_ts(&self, key: String, value: Vec<u8>, ts: u64) -> std::io::Result<()> {
         let mut data = ts.to_be_bytes().to_vec();
         data.extend_from_slice(&value);
-        self.insert_internal(key, data).await;
+        self.insert_internal(key, data).await
     }
 
     /// Insert a key/value pair into the database using the current time.
-    pub async fn insert(&self, key: String, value: Vec<u8>) {
+    pub async fn insert(&self, key: String, value: Vec<u8>) -> std::io::Result<()> {
         let ts = Self::now_ts();
-        self.insert_ts(key, value, ts).await;
+        self.insert_ts(key, value, ts).await
     }
 
     /// Retrieve the value associated with `key`, if it exists.
@@ -229,9 +229,15 @@ impl Database {
     }
 
     /// Insert a key/value pair into the provided namespace with explicit timestamp.
-    pub async fn insert_ns_ts(&self, ns: &str, key: String, value: Vec<u8>, ts: u64) {
+    pub async fn insert_ns_ts(
+        &self,
+        ns: &str,
+        key: String,
+        value: Vec<u8>,
+        ts: u64,
+    ) -> std::io::Result<()> {
         let namespaced = format!("{}:{}", ns, key);
-        self.insert_ts(namespaced, value, ts).await;
+        self.insert_ts(namespaced, value, ts).await
     }
 
     /// Insert a key/value pair into the provided namespace with an explicit
@@ -261,9 +267,9 @@ impl Database {
     }
 
     /// Insert a key/value pair into the provided namespace using the current time.
-    pub async fn insert_ns(&self, ns: &str, key: String, value: Vec<u8>) {
+    pub async fn insert_ns(&self, ns: &str, key: String, value: Vec<u8>) -> std::io::Result<()> {
         let ts = Self::now_ts();
-        self.insert_ns_ts(ns, key, value, ts).await;
+        self.insert_ns_ts(ns, key, value, ts).await
     }
 
     /// Retrieve a value from the given namespace.

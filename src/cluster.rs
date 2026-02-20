@@ -1391,12 +1391,19 @@ impl Cluster {
     #[instrument(skip(self, value), fields(namespace = %ns, key = %key))]
     pub async fn lwt_commit(&self, ns: &str, key: &str, value: Vec<u8>) {
         if !value.is_empty() {
-            if value.len() >= 8 {
+            let result = if value.len() >= 8 {
                 let ts = u64::from_be_bytes(value[..8].try_into().unwrap_or([0; 8]));
                 let data = value[8..].to_vec();
-                self.db.insert_ns_ts(ns, key.to_string(), data, ts).await;
+                self.db.insert_ns_ts(ns, key.to_string(), data, ts).await
             } else {
-                self.db.insert_ns(ns, key.to_string(), value).await;
+                self.db.insert_ns(ns, key.to_string(), value).await
+            };
+            if let Err(e) = result {
+                tracing::error!(
+                    namespace = %ns,
+                    key = %key,
+                    "WAL write failed during lwt_commit: {e}"
+                );
             }
         }
         let composite = format!("{}:{}", ns, key);

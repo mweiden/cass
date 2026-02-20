@@ -441,7 +441,9 @@ impl SqlEngine {
             for row in &values.rows {
                 let (key, data) =
                     build_row(schema_ref, &cols, row).ok_or(QueryError::Unsupported)?;
-                db.insert_ns_ts(&ns, key, data, ts).await;
+                db.insert_ns_ts(&ns, key, data, ts)
+                    .await
+                    .map_err(|e| QueryError::Other(e.to_string()))?;
                 count += 1;
             }
             Ok(QueryOutput::Mutation {
@@ -518,7 +520,9 @@ impl SqlEngine {
             }
         }
         let data = encode_row(&row_map);
-        db.insert_ns_ts(&ns, key, data, ts).await;
+        db.insert_ns_ts(&ns, key, data, ts)
+            .await
+            .map_err(|e| QueryError::Other(e.to_string()))?;
         if cond.is_some() {
             let mut row = BTreeMap::new();
             row.insert("[applied]".to_string(), "true".to_string());
@@ -554,7 +558,9 @@ impl SqlEngine {
         let cond_map = where_to_map(expr);
         let key = build_single_key(schema.as_ref(), &cond_map).ok_or(QueryError::Unsupported)?;
         // record tombstone with timestamp
-        db.insert_ns_ts(&ns, key, Vec::new(), ts).await;
+        db.insert_ns_ts(&ns, key, Vec::new(), ts)
+            .await
+            .map_err(|e| QueryError::Other(e.to_string()))?;
         Ok(1)
     }
 
@@ -894,7 +900,9 @@ impl SqlEngine {
 /// Register a table name in the internal catalog if it does not already exist.
 async fn register_table(db: &Database, table: &str) {
     if db.get_ns("_tables", table).await.is_none() {
-        db.insert_ns("_tables", table.to_string(), Vec::new()).await;
+        if let Err(e) = db.insert_ns("_tables", table.to_string(), Vec::new()).await {
+            tracing::error!(table = %table, "WAL write failed registering table: {e}");
+        }
     }
 }
 
@@ -929,8 +937,10 @@ pub(crate) async fn lookup_schema(db: &Database, table: &str) -> Option<Arc<Tabl
 /// Persist a schema definition for a table.
 async fn save_schema(db: &Database, table: &str, schema: &TableSchema) {
     if let Ok(data) = serde_json::to_vec(schema) {
-        db.insert_ns("_schemas", table.to_string(), data).await;
-        cache_schema_entry(db, table, Arc::new(schema.clone())).await;
+        match db.insert_ns("_schemas", table.to_string(), data).await {
+            Ok(()) => cache_schema_entry(db, table, Arc::new(schema.clone())).await,
+            Err(e) => tracing::error!(table = %table, "WAL write failed saving schema: {e}"),
+        }
     }
 }
 
