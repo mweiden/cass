@@ -1390,7 +1390,7 @@ impl Cluster {
     /// Commit the chosen value to durable storage and clear any in-memory state.
     #[instrument(skip(self, value), fields(namespace = %ns, key = %key))]
     pub async fn lwt_commit(&self, ns: &str, key: &str, value: Vec<u8>) {
-        if !value.is_empty() {
+        let wal_ok = if !value.is_empty() {
             let result = if value.len() >= 8 {
                 let ts = u64::from_be_bytes(value[..8].try_into().unwrap_or([0; 8]));
                 let data = value[8..].to_vec();
@@ -1398,16 +1398,27 @@ impl Cluster {
             } else {
                 self.db.insert_ns(ns, key.to_string(), value).await
             };
-            if let Err(e) = result {
-                tracing::error!(
-                    namespace = %ns,
-                    key = %key,
-                    "WAL write failed during lwt_commit: {e}"
-                );
+            match result {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!(
+                        namespace = %ns,
+                        key = %key,
+                        "WAL write failed during lwt_commit, Paxos slot retained for retry: {e}"
+                    );
+                    false
+                }
             }
+        } else {
+            true
+        };
+        // Only release the Paxos slot once the value is safely on disk.
+        // If the WAL write failed we keep the slot so a subsequent prepare
+        // round from any coordinator can re-commit the chosen value.
+        if wal_ok {
+            let composite = format!("{}:{}", ns, key);
+            self.lwt.write().await.remove(&composite);
         }
-        let composite = format!("{}:{}", ns, key);
-        self.lwt.write().await.remove(&composite);
     }
 
     /// Reconcile divergent replicas by sending the freshest values to healthy nodes
