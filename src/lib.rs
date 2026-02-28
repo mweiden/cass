@@ -40,6 +40,18 @@ impl rpc::cass_client::CassClient<tonic::transport::Channel> {
 
 use base64::Engine;
 pub use query::SqlEngine;
+
+/// Marker written after the 8-byte timestamp to signal that a key has been deleted.
+///
+/// A value whose bytes from index 8 onward equal `TOMBSTONE` is treated as absent
+/// by all read paths.  Writing a tombstone through `insert_internal` ensures the
+/// deletion record survives a flush to an [`SsTable`] so that older versions of
+/// the key stored in earlier SSTables remain masked after the memtable is cleared.
+const TOMBSTONE: &[u8] = b"\x00TOMBSTONE";
+
+fn is_tombstone(val: &[u8]) -> bool {
+    val.len() == 8 + TOMBSTONE.len() && &val[8..] == TOMBSTONE
+}
 use std::{
     sync::{
         Arc,
@@ -202,25 +214,36 @@ impl Database {
     /// Retrieve the value associated with `key`, if it exists.
     pub async fn get(&self, key: &str) -> Option<Vec<u8>> {
         if let Some(val) = self.memtable.get(key).await {
-            return Some(val);
+            return if is_tombstone(&val) { None } else { Some(val) };
         }
         let tables = self.sstables.read().await;
         for table in tables.iter().rev() {
             if let Ok(Some(v)) = table.get(key, self.storage.as_ref()).await {
-                return Some(v);
+                return if is_tombstone(&v) { None } else { Some(v) };
             }
         }
         None
     }
 
     /// Delete a key from the database.
+    ///
+    /// Writes a timestamped tombstone record so that the deletion is durable
+    /// across flushes and masks any matching entry in older SSTables.
     pub async fn delete(&self, key: &str) {
-        self.memtable.delete(key).await;
+        let ts = Self::now_ts();
+        let mut data = ts.to_be_bytes().to_vec();
+        data.extend_from_slice(TOMBSTONE);
+        self.insert_internal(key.to_string(), data).await;
     }
 
     /// Return all key/value pairs currently stored.
     pub async fn scan(&self) -> Vec<(String, Vec<u8>)> {
-        self.memtable.scan().await
+        self.memtable
+            .scan()
+            .await
+            .into_iter()
+            .filter(|(_, v)| !is_tombstone(v))
+            .collect()
     }
 
     /// Remove all data from the in-memory table.
@@ -275,7 +298,10 @@ impl Database {
     /// Delete a key within the specified namespace.
     pub async fn delete_ns(&self, ns: &str, key: &str) {
         let namespaced = format!("{}:{}", ns, key);
-        self.memtable.delete(&namespaced).await;
+        let ts = Self::now_ts();
+        let mut data = ts.to_be_bytes().to_vec();
+        data.extend_from_slice(TOMBSTONE);
+        self.insert_internal(namespaced, data).await;
     }
 
     /// Scan all key/value pairs for a namespace, stripping the prefix.
@@ -317,7 +343,7 @@ impl Database {
             }
         }
 
-        map.into_iter().collect()
+        map.into_iter().filter(|(_, v)| !is_tombstone(v)).collect()
     }
 
     /// Clear all data for a namespace.
