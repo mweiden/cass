@@ -1447,7 +1447,10 @@ impl Cluster {
             let cols = schema.columns.clone();
             let vals = cols
                 .iter()
-                .map(|c| format!("'{}'", row_map.get(c).cloned().unwrap_or_default()))
+                .map(|c| {
+                    let val = row_map.get(c).cloned().unwrap_or_default();
+                    format!("'{}'", val.replace('\'', "''"))
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let insert_sql: Arc<str> = Arc::from(format!(
