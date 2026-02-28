@@ -24,3 +24,12 @@ target
 # Added by cargo
 
 /target
+
+# Coverage reports
+lcov.info
+
+# Performance testing
+perf-results/*.log
+perf-results/*.prom
+perf-results/*.svg
+.DS_Store

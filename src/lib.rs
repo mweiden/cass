@@ -5,6 +5,8 @@ pub mod query;
 pub mod schema;
 pub mod sstable;
 pub mod storage;
+pub mod telemetry;
+pub mod util;
 pub mod wal;
 pub mod zonemap;
 
@@ -12,19 +14,66 @@ pub mod rpc {
     tonic::include_proto!("cass");
 }
 
+impl rpc::cass_client::CassClient<tonic::transport::Channel> {
+    /// Connect to the target endpoint while installing the gRPC tracing
+    /// interceptor that injects OpenTelemetry context into every request.
+    pub async fn connect_traced(
+        dst: String,
+    ) -> Result<
+        rpc::cass_client::CassClient<
+            tonic::codegen::InterceptedService<
+                tonic::transport::Channel,
+                crate::telemetry::PropagatingInterceptor,
+            >,
+        >,
+        tonic::transport::Error,
+    > {
+        let channel = tonic::transport::Endpoint::from_shared(dst)?
+            .connect()
+            .await?;
+        Ok(rpc::cass_client::CassClient::with_interceptor(
+            channel,
+            crate::telemetry::PropagatingInterceptor::default(),
+        ))
+    }
+}
+
 use base64::Engine;
 pub use query::SqlEngine;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 /// Core database type combining an in-memory memtable with a persistent
 /// storage layer.
+pub struct DatabaseOptions {
+    pub wal: wal::WalOptions,
+    /// Approximate upper bound (in bytes) before the memtable is flushed.
+    pub max_memtable_bytes: usize,
+}
+
+impl Default for DatabaseOptions {
+    fn default() -> Self {
+        Self {
+            wal: wal::WalOptions::default(),
+            max_memtable_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
+static DATABASE_INSTANCE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
 pub struct Database {
     storage: Arc<dyn storage::Storage>,
     memtable: memtable::MemTable,
     sstables: tokio::sync::RwLock<Vec<sstable::SsTable>>,
-    max_memtable_size: usize,
-    next_id: std::sync::atomic::AtomicUsize,
+    max_memtable_bytes: usize,
+    next_id: AtomicUsize,
+    instance_id: usize,
     wal: wal::Wal,
 }
 
@@ -35,8 +84,22 @@ impl Database {
         storage: Arc<dyn storage::Storage>,
         wal_path: impl Into<String>,
     ) -> std::io::Result<Self> {
+        Self::new_with_options(storage, wal_path, DatabaseOptions::default()).await
+    }
+
+    /// Create a new database instance with explicit configuration options.
+    pub async fn new_with_options(
+        storage: Arc<dyn storage::Storage>,
+        wal_path: impl Into<String>,
+        options: DatabaseOptions,
+    ) -> std::io::Result<Self> {
         let wal_path = wal_path.into();
-        let (wal, entries) = wal::Wal::new(storage.clone(), wal_path).await?;
+        let DatabaseOptions {
+            wal: wal_options,
+            max_memtable_bytes,
+        } = options;
+        let (wal, entries) =
+            wal::Wal::new_with_options(storage.clone(), wal_path, wal_options).await?;
         let memtable = memtable::MemTable::new();
         for (k, v) in entries {
             memtable.insert(k, v).await;
@@ -68,13 +131,15 @@ impl Database {
         }
         pairs.sort_by_key(|(id, _)| *id);
         let sstables = pairs.into_iter().map(|(_, t)| t).collect();
+        let instance_id = DATABASE_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             storage,
             memtable,
             sstables: tokio::sync::RwLock::new(sstables),
             // default threshold before automatically flushing to disk
-            max_memtable_size: 1024,
-            next_id: std::sync::atomic::AtomicUsize::new(next_id),
+            max_memtable_bytes,
+            next_id: AtomicUsize::new(next_id),
+            instance_id,
             wal,
         })
     }
@@ -87,6 +152,15 @@ impl Database {
     /// Return a reference to the in-memory memtable used for writes.
     pub fn memtable(&self) -> &memtable::MemTable {
         &self.memtable
+    }
+
+    pub(crate) fn instance_id(&self) -> usize {
+        self.instance_id
+    }
+
+    /// Force the write-ahead log to flush pending entries to storage.
+    pub async fn sync_wal(&self) -> std::io::Result<()> {
+        self.wal.flush().await
     }
 
     /// Current timestamp in microseconds since Unix epoch.
@@ -106,7 +180,7 @@ impl Database {
         let _ = self.wal.append(&rec).await;
 
         self.memtable.insert(key, value).await;
-        if self.memtable.len().await >= self.max_memtable_size {
+        if self.memtable.size_bytes().await >= self.max_memtable_bytes {
             // best-effort flush; ignore errors for now
             let _ = self.flush().await;
         }
@@ -158,6 +232,32 @@ impl Database {
     pub async fn insert_ns_ts(&self, ns: &str, key: String, value: Vec<u8>, ts: u64) {
         let namespaced = format!("{}:{}", ns, key);
         self.insert_ts(namespaced, value, ts).await;
+    }
+
+    /// Insert a key/value pair into the provided namespace with an explicit
+    /// timestamp only if the key does not already exist.
+    ///
+    /// Returns `true` if the key was absent and has been inserted. If the key
+    /// already exists, no mutation occurs and `false` is returned.
+    pub async fn insert_ns_if_absent_ts(
+        &self,
+        ns: &str,
+        key: String,
+        value: Vec<u8>,
+        ts: u64,
+    ) -> bool {
+        let namespaced = format!("{}:{}", ns, key);
+        // Check for an existing value across both the memtable and any persisted
+        // SSTables before attempting to insert. This ensures `INSERT ... IF NOT
+        // EXISTS` semantics remain correct even after a flush or restart when
+        // data lives solely on disk.
+        if self.get(&namespaced).await.is_some() {
+            return false;
+        }
+
+        let mut data = ts.to_be_bytes().to_vec();
+        data.extend_from_slice(&value);
+        self.memtable.insert_if_absent(namespaced, data).await
     }
 
     /// Insert a key/value pair into the provided namespace using the current time.
@@ -232,11 +332,15 @@ impl Database {
         if entries.is_empty() {
             return Ok(());
         }
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let path = format!("sstable_{id}.tbl");
         let table = sstable::SsTable::create(&path, &entries, self.storage.as_ref()).await?;
+        let entry_count = entries.len();
+        tracing::info!(
+            "memtable_flush {entries} entries to {sstable}",
+            entries = entry_count,
+            sstable = path
+        );
         self.memtable.clear().await;
         self.sstables.write().await.push(table);
         // reset WAL since its contents are now persisted in the SSTable

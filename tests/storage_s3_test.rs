@@ -91,3 +91,65 @@ async fn s3_storage_get_missing_errors() {
 
     handle.abort();
 }
+
+#[tokio::test]
+async fn s3_storage_append() {
+    let _guard = serial().await;
+    let (endpoint, handle, _tmp) = start_s3_server().await;
+
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_REGION", "us-east-1");
+        std::env::set_var("AWS_ENDPOINT", &endpoint);
+    }
+
+    let storage = S3Storage::new("test-bucket").await.unwrap();
+    storage
+        .append("nested/dir/file.txt", b"hello")
+        .await
+        .unwrap();
+    storage
+        .append("nested/dir/file.txt", b" world")
+        .await
+        .unwrap();
+    let data = storage.get("nested/dir/file.txt").await.unwrap();
+    assert_eq!(data, b"hello world");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn s3_storage_list() {
+    let _guard = serial().await;
+    let (endpoint, handle, _tmp) = start_s3_server().await;
+
+    unsafe {
+        std::env::set_var("AWS_ACCESS_KEY_ID", "test");
+        std::env::set_var("AWS_SECRET_ACCESS_KEY", "test");
+        std::env::set_var("AWS_REGION", "us-east-1");
+        std::env::set_var("AWS_ENDPOINT", &endpoint);
+    }
+
+    let storage = S3Storage::new("test-bucket").await.unwrap();
+    storage
+        .put("nested/dir/file1.txt", b"a".to_vec())
+        .await
+        .unwrap();
+    storage
+        .put("nested/dir/file2.txt", b"b".to_vec())
+        .await
+        .unwrap();
+
+    let mut files = storage.list("nested/dir").await.unwrap();
+    files.sort();
+    assert_eq!(
+        files,
+        vec![
+            "nested/dir/file1.txt".to_string(),
+            "nested/dir/file2.txt".to_string()
+        ]
+    );
+
+    handle.abort();
+}

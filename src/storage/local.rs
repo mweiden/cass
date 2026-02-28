@@ -1,15 +1,23 @@
 use super::{Storage, StorageError};
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+use tokio::{io::AsyncWriteExt, sync::Mutex};
 
 pub struct LocalStorage {
     root: PathBuf,
+    // Cache of open append handles per path to avoid reopen on every append
+    append_handles: Mutex<HashMap<PathBuf, std::sync::Arc<Mutex<tokio::fs::File>>>>,
 }
 
 impl LocalStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            append_handles: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -17,6 +25,11 @@ impl LocalStorage {
 impl Storage for LocalStorage {
     async fn put(&self, path: &str, data: Vec<u8>) -> Result<(), StorageError> {
         let p = self.root.join(path);
+        // Invalidate any cached append handle for this path to ensure consistent state
+        {
+            let mut map = self.append_handles.lock().await;
+            map.remove(&p);
+        }
         if let Some(parent) = p.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -30,15 +43,27 @@ impl Storage for LocalStorage {
     }
 
     async fn append(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {
+        use tokio::fs::OpenOptions;
         let p = self.root.join(path);
         if let Some(parent) = p.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)
-            .await?;
+        let handle_arc = {
+            let mut map = self.append_handles.lock().await;
+            if let Some(h) = map.get(&p) {
+                h.clone()
+            } else {
+                let file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&p)
+                    .await?;
+                let arc = std::sync::Arc::new(Mutex::new(file));
+                map.insert(p.clone(), arc.clone());
+                arc
+            }
+        };
+        let mut file = handle_arc.lock().await;
         file.write_all(data).await?;
         Ok(())
     }

@@ -7,21 +7,30 @@ use common::CassProcess;
 
 #[tokio::test]
 async fn show_tables_via_grpc() {
-    let _ = std::fs::remove_dir_all("/tmp/cass-data");
-    let _child = CassProcess::spawn(["server"]);
+    let dir = tempfile::tempdir().unwrap();
+    let base = "http://127.0.0.1:18121";
+    let _child = CassProcess::spawn([
+        "server",
+        "--data-dir",
+        dir.path().to_str().unwrap(),
+        "--node-addr",
+        base,
+        "--rf",
+        "1",
+    ]);
 
-    let base = "http://127.0.0.1:8080".to_string();
-    for _ in 0..10 {
-        if CassClient::connect(base.clone()).await.is_ok() {
+    for _ in 0..20 {
+        if CassClient::connect(base.to_string()).await.is_ok() {
             break;
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(100)).await;
     }
 
-    let mut client = CassClient::connect(base.clone()).await.unwrap();
+    let mut client = CassClient::connect(base.to_string()).await.unwrap();
     client
         .query(QueryRequest {
             sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+            ts: 0,
         })
         .await
         .unwrap();
@@ -29,6 +38,7 @@ async fn show_tables_via_grpc() {
     let res = client
         .query(QueryRequest {
             sql: "SHOW TABLES".into(),
+            ts: 0,
         })
         .await
         .unwrap()

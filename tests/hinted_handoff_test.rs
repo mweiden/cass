@@ -25,7 +25,7 @@ async fn hinted_handoff_replays_when_node_recovers() {
         "--rf",
         "2",
         "--read-consistency",
-        "1",
+        "one",
     ]);
     let mut child2 = CassProcess::spawn([
         "server",
@@ -38,7 +38,7 @@ async fn hinted_handoff_replays_when_node_recovers() {
         "--rf",
         "2",
         "--read-consistency",
-        "1",
+        "one",
     ]);
 
     for _ in 0..20 {
@@ -53,6 +53,7 @@ async fn hinted_handoff_replays_when_node_recovers() {
     let mut c1 = CassClient::connect(base1.to_string()).await.unwrap();
     c1.query(QueryRequest {
         sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
+        ts: 0,
     })
     .await
     .unwrap();
@@ -61,6 +62,7 @@ async fn hinted_handoff_replays_when_node_recovers() {
 
     c1.query(QueryRequest {
         sql: "INSERT INTO kv (id, val) VALUES ('h','1')".into(),
+        ts: 0,
     })
     .await
     .unwrap();
@@ -76,7 +78,7 @@ async fn hinted_handoff_replays_when_node_recovers() {
         "--rf",
         "2",
         "--read-consistency",
-        "1",
+        "one",
     ]);
 
     for _ in 0..20 {
@@ -91,12 +93,14 @@ async fn hinted_handoff_replays_when_node_recovers() {
         let _ = c1
             .query(QueryRequest {
                 sql: "SELECT val FROM kv WHERE id = 'h'".into(),
+                ts: 0,
             })
             .await;
         let mut c2 = CassClient::connect(base2.to_string()).await.unwrap();
         let resp = c2
             .query(QueryRequest {
                 sql: "SELECT val FROM kv WHERE id = 'h'".into(),
+                ts: 0,
             })
             .await
             .unwrap()

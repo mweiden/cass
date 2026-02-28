@@ -16,7 +16,7 @@ serde_json = "1"
 murmur3 = "0.5"
 futures = "0.3"
 prost = "0.13"
-tonic = { version = "0.12", features = ["transport"] }
+tonic = { version = "0.13", features = ["transport"] }
 url = "2"
 sysinfo = "0.30"
 hyper = { version = "0.14", features = ["full"] }
@@ -27,7 +27,14 @@ rustyline = "12"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tower-http = { version = "0.6", features = ["trace"] }
+opentelemetry = { version = "0.30", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.30", default-features = false, features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["trace", "grpc-tonic"] }
+tracing-opentelemetry = "0.31"
 memmap2 = "0.9"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+statrs = "0.16"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
@@ -35,10 +42,17 @@ s3s = "0.12.0-minio-preview.3"
 s3s-fs = "0.12.0-minio-preview.3"
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
 criterion = "0.5"
+regex = "1"
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder"] }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-build = "0.13"
 protoc-bin-vendored = "3"
+
+[features]
+# Enable TTF font support for Plotters when running the plotting example locally.
+# This is disabled by default to avoid requiring system fontconfig in CI.
+plot-ttf = ["plotters/ttf"]
 
 [[bench]]
 name = "lookup"
