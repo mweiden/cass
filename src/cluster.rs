@@ -1629,10 +1629,6 @@ fn disk_free_ratio(path: &Path) -> Option<f64> {
         if stat.f_blocks == 0 || stat.f_frsize == 0 {
             return None;
         }
-        if stat.f_bavail == 0 {
-            // Some platforms report 0 when the value is unavailable; assume healthy.
-            return Some(1.0);
-        }
         let total = (stat.f_blocks as f64) * (stat.f_frsize as f64);
         if total == 0.0 {
             return None;
