@@ -25,8 +25,8 @@ async fn show_tables_via_grpc() {
     // first real call if we only probe at the transport level.
     let mut client = 'ready: {
         for _ in 0..50 {
-            if let Ok(mut c) = CassClient::connect(base.to_string()).await {
-                if c.query(QueryRequest {
+            if let Ok(mut c) = CassClient::connect(base.to_string()).await
+                && c.query(QueryRequest {
                     sql: "SHOW TABLES".into(),
                     ts: 0,
                 })
@@ -35,7 +35,6 @@ async fn show_tables_via_grpc() {
                 {
                     break 'ready c;
                 }
-            }
             sleep(Duration::from_millis(100)).await;
         }
         panic!("server did not become ready within 5 s");

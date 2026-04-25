@@ -12,7 +12,7 @@ async fn reload_existing_sstables_on_restart() {
     {
         let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(&path));
         let db = Database::new(storage, wal).await.unwrap();
-        db.insert("k1".to_string(), b"v1".to_vec()).await;
+        db.insert("k1".to_string(), b"v1".to_vec()).await.unwrap();
         db.flush().await.unwrap();
     }
     let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(&path));

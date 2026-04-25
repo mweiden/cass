@@ -90,7 +90,7 @@ async fn flush_all_flushes_memtable() {
     let db = Arc::new(Database::new(storage, "wal.log").await.unwrap());
     let self_addr = "http://127.0.0.1:5000".to_string();
     let cluster = Cluster::new(db.clone(), self_addr, Vec::new(), 1, 1, 1);
-    db.insert("k".into(), b"v".to_vec()).await;
+    db.insert("k".into(), b"v".to_vec()).await.unwrap();
     assert_eq!(db.memtable().len().await, 1);
     cluster.flush_all().await.unwrap();
     assert_eq!(db.memtable().len().await, 0);

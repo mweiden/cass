@@ -17,7 +17,7 @@ async fn build_cluster(peers: Vec<String>, vnodes: usize, rf: usize, self_addr: 
 fn first_val(resp: QueryResponse, col: &str) -> Option<String> {
     match resp.payload {
         Some(query_response::Payload::Rows(rs)) => {
-            rs.rows.get(0).and_then(|row| row.columns.get(col).cloned())
+            rs.rows.first().and_then(|row| row.columns.get(col).cloned())
         }
         _ => None,
     }

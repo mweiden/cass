@@ -61,11 +61,11 @@ fn parse_entries(data: &[u8]) -> std::io::Result<Vec<(String, Vec<u8>)>> {
         }
         if let Some(pos) = line.iter().position(|b| *b == b'\t') {
             let key = std::str::from_utf8(&line[..pos])
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+                .map_err(std::io::Error::other)?
                 .to_string();
             let val = STANDARD
                 .decode(&line[pos + 1..])
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             res.push((key, val));
         }
     }
@@ -76,7 +76,7 @@ fn map_err(e: StorageError) -> std::io::Error {
     match e {
         StorageError::Io(e) => e,
         StorageError::Unimplemented => {
-            std::io::Error::new(std::io::ErrorKind::Other, "unimplemented")
+            std::io::Error::other("unimplemented")
         }
     }
 }
@@ -146,11 +146,10 @@ impl Drop for Wal {
 
         inner.notify.notify_waiters();
 
-        if let Some(task) = inner.take_flush_task() {
-            if let Err(err) = task.join() {
+        if let Some(task) = inner.take_flush_task()
+            && let Err(err) = task.join() {
                 eprintln!("wal flush worker panicked: {err:?}");
             }
-        }
 
         let flush_inner = inner.clone();
         if let Err(err) = block_on_future(async move { flush_inner.flush_pending().await }) {

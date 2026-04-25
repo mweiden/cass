@@ -11,15 +11,15 @@ async fn queries_check_storage_in_reverse_chronological_order() {
     let db = Database::new(storage, "wal.log").await.unwrap();
 
     // Oldest value persisted in first SSTable
-    db.insert("k".to_string(), b"v1".to_vec()).await;
+    db.insert("k".to_string(), b"v1".to_vec()).await.unwrap();
     db.flush().await.unwrap();
 
     // Newer value persisted in second SSTable
-    db.insert("k".to_string(), b"v2".to_vec()).await;
+    db.insert("k".to_string(), b"v2".to_vec()).await.unwrap();
     db.flush().await.unwrap();
 
     // Latest value remains in memtable
-    db.insert("k".to_string(), b"v3".to_vec()).await;
+    db.insert("k".to_string(), b"v3".to_vec()).await.unwrap();
 
     // Memtable should take precedence over SSTables
     let v = db.get("k").await.map(|b| b[8..].to_vec());

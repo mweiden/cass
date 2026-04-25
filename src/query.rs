@@ -118,6 +118,12 @@ pub struct SqlEngine {
     dialect: GenericDialect,
 }
 
+impl Default for SqlEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SqlEngine {
     /// Create a new [`SqlEngine`].
     pub fn new() -> Self {
@@ -221,7 +227,7 @@ impl SqlEngine {
     /// For example, strips the trailing `IF NOT EXISTS` or `IF col='val'` from
     /// INSERT/UPDATE statements so the remaining SQL can be parsed normally for
     /// analysis, routing, and planning.
-    pub fn base_sql<'a>(&self, sql: &'a str) -> String {
+    pub fn base_sql(&self, sql: &str) -> String {
         let trimmed = sql.trim();
         // Only consider stripping a trailing IF clause for statements that
         // actually support LWT (INSERT/UPDATE). This avoids breaking valid
@@ -232,11 +238,10 @@ impl SqlEngine {
             .collect::<String>()
             .to_ascii_lowercase();
         let is_lwt_stmt = lower.starts_with("insert") || lower.starts_with("update");
-        if is_lwt_stmt {
-            if let Some(idx) = self.find_trailing_if_index(sql) {
+        if is_lwt_stmt
+            && let Some(idx) = self.find_trailing_if_index(sql) {
                 return sql[..idx].trim().to_string();
             }
-        }
         trimmed.to_string()
     }
 
@@ -256,16 +261,13 @@ impl SqlEngine {
                 return Some(LwtCondition::NotExists);
             }
             let cond_sql = format!("SELECT * FROM tmp WHERE {}", cond_str);
-            if let Ok(mut stmts) = Parser::parse_sql(&self.dialect, &cond_sql) {
-                if let Some(Statement::Query(q)) = stmts.pop() {
-                    if let SetExpr::Select(select) = *q.body {
-                        if let Some(expr) = select.selection {
+            if let Ok(mut stmts) = Parser::parse_sql(&self.dialect, &cond_sql)
+                && let Some(Statement::Query(q)) = stmts.pop()
+                    && let SetExpr::Select(select) = *q.body
+                        && let Some(expr) = select.selection {
                             let map = where_to_map(&expr);
                             return Some(LwtCondition::Equals(map));
                         }
-                    }
-                }
-            }
         }
         None
     }
@@ -344,7 +346,7 @@ impl SqlEngine {
                 if db.get_ns("_tables", &ns).await.is_some() {
                     return Err(QueryError::Unsupported);
                 }
-                let schema = schema_from_create(&ct).ok_or(QueryError::Unsupported)?;
+                let schema = schema_from_create(ct).ok_or(QueryError::Unsupported)?;
                 save_schema(db, &ns, &schema)
                     .await
                     .map_err(|e| QueryError::Other(e.to_string()))?;
@@ -434,7 +436,7 @@ impl SqlEngine {
             if values.rows.len() != 1 {
                 return Err(QueryError::Unsupported);
             }
-            let row = values.rows.get(0).ok_or(QueryError::Unsupported)?;
+            let row = values.rows.first().ok_or(QueryError::Unsupported)?;
             let (key, data) = build_row(schema_ref, &cols, row).ok_or(QueryError::Unsupported)?;
             let applied = db.insert_ns_if_absent_ts(&ns, key, data, ts).await;
             let mut row = BTreeMap::new();
@@ -510,8 +512,8 @@ impl SqlEngine {
             }
         }
         for assign in assignments {
-            if let AssignmentTarget::ColumnName(name) = &assign.target {
-                if let Some(id) = name.0.first().and_then(|p| p.as_ident()) {
+            if let AssignmentTarget::ColumnName(name) = &assign.target
+                && let Some(id) = name.0.first().and_then(|p| p.as_ident()) {
                     let col = id.value.to_lowercase();
                     if schema_ref.partition_keys.contains(&col)
                         || schema_ref.clustering_keys.contains(&col)
@@ -521,7 +523,6 @@ impl SqlEngine {
                     let val = expr_to_string(&assign.value).ok_or(QueryError::Unsupported)?;
                     row_map.insert(col, val);
                 }
-            }
         }
         let data = encode_row(&row_map);
         db.insert_ns_ts(&ns, key, data, ts)
@@ -603,14 +604,12 @@ impl SqlEngine {
         let schema_ref = schema.as_ref();
 
         // handle COUNT(*) with optional WHERE filtering
-        if select.projection.len() == 1 {
-            if let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0] {
-                if func.name.to_string().eq_ignore_ascii_case("count") {
+        if select.projection.len() == 1
+            && let SelectItem::UnnamedExpr(Expr::Function(func)) = &select.projection[0]
+                && func.name.to_string().eq_ignore_ascii_case("count") {
                     let selection = select.selection.as_ref();
                     return self.exec_count(db, &ns, schema_ref, selection).await;
                 }
-            }
-        }
 
         self.exec_select_schema(db, &ns, schema_ref, select, meta)
             .await
@@ -642,7 +641,7 @@ impl SqlEngine {
                     }
                     if cond_map
                         .iter()
-                        .all(|(c, v)| row_map.get(c).map_or(false, |val| val == v))
+                        .all(|(c, v)| row_map.get(c) == Some(v))
                     {
                         count = 1;
                     }
@@ -661,7 +660,7 @@ impl SqlEngine {
                 }
                 if cond_map
                     .iter()
-                    .all(|(c, v)| row_map.get(c).map_or(false, |val| val == v))
+                    .all(|(c, v)| row_map.get(c) == Some(v))
                 {
                     count += 1;
                 }
@@ -749,7 +748,7 @@ impl SqlEngine {
                         }
                         if cond_multi
                             .iter()
-                            .all(|(c, v)| row_map.get(c).map_or(false, |val| v.contains(val)))
+                            .all(|(c, v)| row_map.get(c).is_some_and(|val| v.contains(val)))
                         {
                             let sel_map = project_row(&row_map, &cols, wildcard);
                             if meta {
@@ -1004,6 +1003,7 @@ fn expr_to_string(expr: &Expr) -> Option<String> {
 }
 
 /// Parse the projection list of a `SELECT` into column names and optional casts.
+#[allow(clippy::type_complexity)]
 fn parse_projection(
     projection: &[SelectItem],
 ) -> Result<(Vec<(String, Option<DataType>)>, bool), QueryError> {
@@ -1046,11 +1046,10 @@ fn project_row(
     for (col, cast) in cols {
         if let Some(val) = row_map.get(col) {
             let mut v = val.clone();
-            if let Some(dt) = cast {
-                if let Some(cv) = cast_simple(val, dt) {
+            if let Some(dt) = cast
+                && let Some(cv) = cast_simple(val, dt) {
                     v = cv;
                 }
-            }
             sel_map.insert(col.clone(), v);
         }
     }
@@ -1065,13 +1064,11 @@ fn where_to_multi_map(expr: &Expr) -> BTreeMap<String, Vec<String>> {
                 if *op == BinaryOperator::And {
                     collect(left, out);
                     collect(right, out);
-                } else if *op == BinaryOperator::Eq {
-                    if let Expr::Identifier(id) = &**left {
-                        if let Some(val) = expr_to_string(right) {
+                } else if *op == BinaryOperator::Eq
+                    && let Expr::Identifier(id) = &**left
+                        && let Some(val) = expr_to_string(right) {
                             out.entry(id.value.to_lowercase()).or_default().push(val);
                         }
-                    }
-                }
             }
             Expr::InList { expr, list, .. } => {
                 if let Expr::Identifier(id) = &**expr {
@@ -1172,20 +1169,15 @@ fn build_single_key(schema: &TableSchema, map: &BTreeMap<String, String>) -> Opt
 /// Convert a simple WHERE clause into a map of column -> value.
 fn where_to_map(expr: &Expr) -> BTreeMap<String, String> {
     fn collect(e: &Expr, out: &mut BTreeMap<String, String>) {
-        match e {
-            Expr::BinaryOp { left, op, right } => {
-                if *op == BinaryOperator::And {
-                    collect(left, out);
-                    collect(right, out);
-                } else if *op == BinaryOperator::Eq {
-                    if let Expr::Identifier(id) = &**left {
-                        if let Some(val) = expr_to_string(right) {
-                            out.insert(id.value.to_lowercase(), val);
-                        }
+        if let Expr::BinaryOp { left, op, right } = e {
+            if *op == BinaryOperator::And {
+                collect(left, out);
+                collect(right, out);
+            } else if *op == BinaryOperator::Eq
+                && let Expr::Identifier(id) = &**left
+                    && let Some(val) = expr_to_string(right) {
+                        out.insert(id.value.to_lowercase(), val);
                     }
-                }
-            }
-            _ => {}
         }
     }
     let mut map = BTreeMap::new();

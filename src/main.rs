@@ -122,7 +122,7 @@ impl Cass for CassService {
         let req = req.into_inner();
         let sql = req.sql;
         let ts = req.ts;
-        span.record("query.sql", &field::display(&sql));
+        span.record("query.sql", field::display(&sql));
         match self.cluster.execute(&sql, false, ts).await {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Err(Status::invalid_argument(e.to_string())),
@@ -140,7 +140,7 @@ impl Cass for CassService {
         let req = req.into_inner();
         let sql = req.sql;
         let ts = req.ts;
-        span.record("query.sql", &field::display(&sql));
+        span.record("query.sql", field::display(&sql));
         match self.cluster.execute(&sql, true, ts).await {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Err(Status::invalid_argument(e.to_string())),
@@ -207,9 +207,9 @@ impl Cass for CassService {
         let span = Span::current();
         span.set_parent(parent_cx);
         let r = req.into_inner();
-        span.record("namespace", &field::display(&r.namespace));
-        span.record("key", &field::display(&r.key));
-        span.record("ballot", &field::display(r.ballot));
+        span.record("namespace", field::display(&r.namespace));
+        span.record("key", field::display(&r.key));
+        span.record("ballot", field::display(r.ballot));
         let (promised, ballot, value) = self
             .cluster
             .lwt_prepare(&r.namespace, &r.key, r.ballot)
@@ -233,9 +233,9 @@ impl Cass for CassService {
         let span = Span::current();
         span.set_parent(parent_cx);
         let r = req.into_inner();
-        span.record("namespace", &field::display(&r.namespace));
-        span.record("key", &field::display(&r.key));
-        span.record("ballot", &field::display(r.ballot));
+        span.record("namespace", field::display(&r.namespace));
+        span.record("key", field::display(&r.key));
+        span.record("ballot", field::display(r.ballot));
         let accepted = self
             .cluster
             .lwt_propose(&r.namespace, &r.key, r.ballot, r.value)
@@ -255,8 +255,8 @@ impl Cass for CassService {
         let span = Span::current();
         span.set_parent(parent_cx);
         let r = req.into_inner();
-        span.record("namespace", &field::display(&r.namespace));
-        span.record("key", &field::display(&r.key));
+        span.record("namespace", field::display(&r.namespace));
+        span.record("key", field::display(&r.key));
         let (ballot, value) = self.cluster.lwt_read(&r.namespace, &r.key).await;
         Ok(Response::new(LwtReadResponse { ballot, value }))
     }
@@ -273,8 +273,8 @@ impl Cass for CassService {
         let span = Span::current();
         span.set_parent(parent_cx);
         let r = req.into_inner();
-        span.record("namespace", &field::display(&r.namespace));
-        span.record("key", &field::display(&r.key));
+        span.record("namespace", field::display(&r.namespace));
+        span.record("key", field::display(&r.key));
         self.cluster.lwt_commit(&r.namespace, &r.key, r.value).await;
         Ok(Response::new(LwtCommitResponse {}))
     }
@@ -511,7 +511,7 @@ async fn repl(nodes: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 println!("({} tables)", t.tables.len());
                             }
-                            _ => println!(""),
+                            _ => println!(),
                         }
                         last_err = None;
                         break;

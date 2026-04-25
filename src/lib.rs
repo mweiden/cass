@@ -33,7 +33,7 @@ impl rpc::cass_client::CassClient<tonic::transport::Channel> {
             .await?;
         Ok(rpc::cass_client::CassClient::with_interceptor(
             channel,
-            crate::telemetry::PropagatingInterceptor::default(),
+            crate::telemetry::PropagatingInterceptor,
         ))
     }
 }
@@ -106,7 +106,7 @@ impl Database {
         }
         let files = storage.list("sstable_").await.map_err(|e| match e {
             storage::StorageError::Io(e) => e,
-            _ => std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+            _ => std::io::Error::other(e.to_string()),
         })?;
         let mut pairs = Vec::new();
         let mut next_id = 0usize;
@@ -114,12 +114,11 @@ impl Database {
             if let Some(id_str) = f
                 .strip_prefix("sstable_")
                 .and_then(|s| s.strip_suffix(".tbl"))
-            {
-                if let Ok(id) = id_str.parse::<usize>() {
+                && let Ok(id) = id_str.parse::<usize>() {
                     let table = sstable::SsTable::load(&f, storage.as_ref()).await.map_err(
                         |e| match e {
                             storage::StorageError::Io(e) => e,
-                            _ => std::io::Error::new(std::io::ErrorKind::Other, e.to_string()),
+                            _ => std::io::Error::other(e.to_string()),
                         },
                     )?;
                     if id >= next_id {
@@ -127,7 +126,6 @@ impl Database {
                     }
                     pairs.push((id, table));
                 }
-            }
         }
         pairs.sort_by_key(|(id, _)| *id);
         let sstables = pairs.into_iter().map(|(_, t)| t).collect();
@@ -301,17 +299,14 @@ impl Database {
         for table in tables.iter() {
             if let Ok(raw) = self.storage.get(&table.path).await {
                 for line in raw.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-                    if let Some(pos) = line.iter().position(|b| *b == b'\t') {
-                        if let Ok(key) = std::str::from_utf8(&line[..pos]) {
-                            if let Some(rest) = key.strip_prefix(&prefix) {
-                                if let Ok(val) = base64::engine::general_purpose::STANDARD
+                    if let Some(pos) = line.iter().position(|b| *b == b'\t')
+                        && let Ok(key) = std::str::from_utf8(&line[..pos])
+                            && let Some(rest) = key.strip_prefix(&prefix)
+                                && let Ok(val) = base64::engine::general_purpose::STANDARD
                                     .decode(&line[pos + 1..])
                                 {
                                     map.insert(rest.to_string(), val);
                                 }
-                            }
-                        }
-                    }
                 }
             }
         }

@@ -130,4 +130,5 @@ async fn repl_interaction_executes_queries() {
     assert!(found);
 
     let _ = repl.kill();
+    let _ = repl.wait();
 }

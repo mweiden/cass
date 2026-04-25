@@ -19,8 +19,7 @@ async fn build_cluster(peers: Vec<String>, self_addr: &str) -> Cluster {
 fn applied(resp: &cass::rpc::QueryResponse) -> Option<String> {
     match &resp.payload {
         Some(query_response::Payload::Rows(rs)) => rs
-            .rows
-            .get(0)
+            .rows.first()
             .and_then(|r| r.columns.get("[applied]").cloned()),
         _ => None,
     }
