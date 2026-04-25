@@ -19,14 +19,27 @@ async fn show_tables_via_grpc() {
         "1",
     ]);
 
-    for _ in 0..20 {
-        if CassClient::connect(base.to_string()).await.is_ok() {
-            break;
+    // Wait until the server can actually handle gRPC requests. Under
+    // coverage-instrumented builds the server may accept TCP connections before
+    // its gRPC stack is fully initialised, producing a broken-pipe error on the
+    // first real call if we only probe at the transport level.
+    let mut client = 'ready: {
+        for _ in 0..50 {
+            if let Ok(mut c) = CassClient::connect(base.to_string()).await {
+                if c.query(QueryRequest {
+                    sql: "SHOW TABLES".into(),
+                    ts: 0,
+                })
+                .await
+                .is_ok()
+                {
+                    break 'ready c;
+                }
+            }
+            sleep(Duration::from_millis(100)).await;
         }
-        sleep(Duration::from_millis(100)).await;
-    }
-
-    let mut client = CassClient::connect(base.to_string()).await.unwrap();
+        panic!("server did not become ready within 5 s");
+    };
     client
         .query(QueryRequest {
             sql: "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))".into(),
