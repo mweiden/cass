@@ -136,7 +136,7 @@ impl ClientPool {
         let channel = self.channel(dst).await?;
         Ok(CassClient::with_interceptor(
             channel,
-            PropagatingInterceptor::default(),
+            PropagatingInterceptor,
         ))
     }
 }
@@ -152,6 +152,7 @@ pub struct Cluster {
     health: Arc<RwLock<HashMap<String, Instant>>>,
     panic_until: Arc<RwLock<Option<Instant>>>,
     disk_ok: Arc<AtomicBool>,
+    #[allow(clippy::type_complexity)]
     hints: Arc<RwLock<HashMap<String, Vec<(u64, Arc<str>)>>>>,
     lwt: Arc<RwLock<HashMap<String, PaxosSlot>>>,
     client_pool: ClientPool,
@@ -269,8 +270,8 @@ impl Cluster {
             Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
             Err(_) => std::env::var("CI").is_ok(),
         };
-        if !skip_disk_health {
-            if let Some(path) = db.storage().local_path().map(|p| p.to_path_buf()) {
+        if !skip_disk_health
+            && let Some(path) = db.storage().local_path().map(|p| p.to_path_buf()) {
                 let disk_health = disk_ok.clone();
                 tokio::spawn(async move {
                     loop {
@@ -280,7 +281,6 @@ impl Cluster {
                     }
                 });
             }
-        }
 
         let read_cl = if read_consistency <= 1 {
             ConsistencyLevel::One
@@ -420,11 +420,10 @@ impl Cluster {
     /// A node is considered unhealthy if it is within a panic window
     /// or if its local storage has less than 5% free space remaining.
     pub async fn self_healthy(&self) -> bool {
-        if let Some(until) = *self.panic_until.read().await {
-            if Instant::now() < until {
+        if let Some(until) = *self.panic_until.read().await
+            && Instant::now() < until {
                 return false;
             }
-        }
         self.disk_ok.load(Ordering::Relaxed)
     }
 
@@ -524,9 +523,9 @@ impl Cluster {
             .cloned()
             .collect();
         let span = Span::current();
-        span.record("replica_count", &field::display(replicas.len()));
-        span.record("healthy_count", &field::display(healthy.len()));
-        span.record("unhealthy_count", &field::display(unhealthy.len()));
+        span.record("replica_count", field::display(replicas.len()));
+        span.record("healthy_count", field::display(healthy.len()));
+        span.record("unhealthy_count", field::display(unhealthy.len()));
         if meta.is_write {
             if healthy.is_empty() {
                 return Err(QueryError::Other("no healthy replicas".into()));
@@ -585,8 +584,8 @@ impl Cluster {
         }
 
         let span = Span::current();
-        span.record("required", &field::display(required));
-        span.record("target_count", &field::display(healthy.len()));
+        span.record("required", field::display(required));
+        span.record("target_count", field::display(healthy.len()));
 
         let mut successes = 0usize;
         let mut results: Vec<Result<QueryOutput, QueryError>> = Vec::new();
@@ -709,19 +708,14 @@ impl Cluster {
                 _ => None,
             };
         }
-        if let Some(stmt) = meta.first_stmt.as_ref() {
-            if let Statement::Query(q) = stmt.as_ref() {
-                if let SetExpr::Select(s) = &*q.body {
-                    if s.projection.len() == 1 {
-                        if let SelectItem::UnnamedExpr(Expr::Function(func)) = &s.projection[0] {
-                            if func.name.to_string().eq_ignore_ascii_case("count") {
+        if let Some(stmt) = meta.first_stmt.as_ref()
+            && let Statement::Query(q) = stmt.as_ref()
+                && let SetExpr::Select(s) = &*q.body
+                    && s.projection.len() == 1
+                        && let SelectItem::UnnamedExpr(Expr::Function(func)) = &s.projection[0]
+                            && func.name.to_string().eq_ignore_ascii_case("count") {
                                 meta.is_count = true;
                             }
-                        }
-                    }
-                }
-            }
-        }
         meta.broadcast = stmts.iter().all(|s| {
             matches!(
                 s.as_ref(),
@@ -746,12 +740,11 @@ impl Cluster {
                     }
             )
         });
-        if parsed.is_lwt() {
-            if let Some(st) = &meta.first_stmt {
+        if parsed.is_lwt()
+            && let Some(st) = &meta.first_stmt {
                 meta.is_lwt =
                     matches!(st.as_ref(), Statement::Insert(_) | Statement::Update { .. });
             }
-        }
         meta
     }
 
@@ -802,8 +795,8 @@ impl Cluster {
         // Determine replicas for the partition
         let replicas = self.target_replicas(engine, parsed, false).await?;
         let healthy = self.healthy_nodes(replicas.clone()).await;
-        Span::current().record("replica_count", &field::display(replicas.len()));
-        Span::current().record("healthy_count", &field::display(healthy.len()));
+        Span::current().record("replica_count", field::display(replicas.len()));
+        Span::current().record("healthy_count", field::display(healthy.len()));
         let rf = self.rf.max(1);
         let required = ConsistencyLevel::Quorum.required(rf);
         if healthy.len() < required {
@@ -851,7 +844,7 @@ impl Cluster {
                 } else {
                     schema.columns.clone()
                 };
-                let row_exprs = values.rows.get(0).ok_or(QueryError::Unsupported)?;
+                let row_exprs = values.rows.first().ok_or(QueryError::Unsupported)?;
                 if cols.len() != row_exprs.len() {
                     return Err(QueryError::Unsupported);
                 }
@@ -906,8 +899,8 @@ impl Cluster {
                         max_accepted_value = acc_v;
                     }
                 }
-            } else if let Ok(mut client) = self.grpc_client(node).await {
-                if let Ok(resp) = client
+            } else if let Ok(mut client) = self.grpc_client(node).await
+                && let Ok(resp) = client
                     .lwt_prepare(tonic::Request::new(LwtPrepareRequest {
                         namespace: ns.clone(),
                         key: key.clone(),
@@ -924,7 +917,6 @@ impl Cluster {
                         }
                     }
                 }
-            }
         }
         if promised < required {
             return Err(QueryError::Other("not enough healthy replicas".into()));
@@ -942,8 +934,8 @@ impl Cluster {
                     read_ballot = b;
                     read_value = v;
                 }
-            } else if let Ok(mut client) = self.grpc_client(node).await {
-                if let Ok(resp) = client
+            } else if let Ok(mut client) = self.grpc_client(node).await
+                && let Ok(resp) = client
                     .lwt_read(tonic::Request::new(LwtReadRequest {
                         namespace: ns.clone(),
                         key: key.clone(),
@@ -961,7 +953,6 @@ impl Cluster {
                         read_value = r.value;
                     }
                 }
-            }
         }
 
         // Evaluate condition and build proposed value
@@ -995,8 +986,8 @@ impl Cluster {
                         // apply assignments
                         if let Some((schema, assigns)) = assignments {
                             for assign in assigns {
-                                if let AssignmentTarget::ColumnName(name) = &assign.target {
-                                    if let Some(id) = name.0.first().and_then(|p| p.as_ident()) {
+                                if let AssignmentTarget::ColumnName(name) = &assign.target
+                                    && let Some(id) = name.0.first().and_then(|p| p.as_ident()) {
                                         let col = id.value.to_lowercase();
                                         if schema.partition_keys.contains(&col)
                                             || schema.clustering_keys.contains(&col)
@@ -1007,7 +998,6 @@ impl Cluster {
                                             current.insert(col, val);
                                         }
                                     }
-                                }
                             }
                         }
                         let mut buf = ts.to_be_bytes().to_vec();
@@ -1032,8 +1022,8 @@ impl Cluster {
                 {
                     accepted += 1;
                 }
-            } else if let Ok(mut client) = self.grpc_client(node).await {
-                if let Ok(resp) = client
+            } else if let Ok(mut client) = self.grpc_client(node).await
+                && let Ok(resp) = client
                     .lwt_propose(tonic::Request::new(LwtProposeRequest {
                         namespace: ns.clone(),
                         key: key.clone(),
@@ -1041,12 +1031,9 @@ impl Cluster {
                         value: proposed_value.clone(),
                     }))
                     .await
-                {
-                    if resp.into_inner().accepted {
+                    && resp.into_inner().accepted {
                         accepted += 1;
                     }
-                }
-            }
         }
         if accepted < required {
             return Err(QueryError::Other("not enough healthy replicas".into()));
@@ -1098,20 +1085,15 @@ impl Cluster {
 
     fn where_to_map(expr: &Expr) -> BTreeMap<String, String> {
         fn collect(e: &Expr, out: &mut BTreeMap<String, String>) {
-            match e {
-                Expr::BinaryOp { left, op, right } => {
-                    if *op == sqlparser::ast::BinaryOperator::And {
-                        collect(left, out);
-                        collect(right, out);
-                    } else if *op == sqlparser::ast::BinaryOperator::Eq {
-                        if let Expr::Identifier(id) = &**left {
-                            if let Some(val) = Cluster::expr_to_string(right) {
-                                out.insert(id.value.to_lowercase(), val);
-                            }
+            if let Expr::BinaryOp { left, op, right } = e {
+                if *op == sqlparser::ast::BinaryOperator::And {
+                    collect(left, out);
+                    collect(right, out);
+                } else if *op == sqlparser::ast::BinaryOperator::Eq
+                    && let Expr::Identifier(id) = &**left
+                        && let Some(val) = Cluster::expr_to_string(right) {
+                            out.insert(id.value.to_lowercase(), val);
                         }
-                    }
-                }
-                _ => {}
             }
         }
         let mut map = BTreeMap::new();
@@ -1174,7 +1156,7 @@ impl Cluster {
         ts: u64,
     ) -> Vec<(String, Result<QueryOutput, QueryError>)> {
         let span = Span::current();
-        span.record("node_count", &field::display(nodes.len()));
+        span.record("node_count", field::display(nodes.len()));
         let parent_span = span.clone();
         let forwarded = Self::forwarded_payload(&sql, ts);
         let tasks: Vec<_> = nodes
@@ -1196,6 +1178,8 @@ impl Cluster {
         join_all(tasks).await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::type_complexity)]
     #[instrument(
         skip(self, nodes, sql, meta, replicas, unhealthy),
         fields(ts = ts, required = required, node_count = field::Empty)
@@ -1215,7 +1199,7 @@ impl Cluster {
             return Ok(Vec::new());
         }
 
-        Span::current().record("node_count", &field::display(total));
+        Span::current().record("node_count", field::display(total));
 
         let meta_results = Arc::new(Mutex::new(
             Vec::<(String, Vec<(String, u64, String)>)>::new(),
@@ -1378,11 +1362,10 @@ impl Cluster {
             map.get(&composite)
                 .map(|s| (s.accepted_ballot, s.accepted_value.clone()))
         };
-        if let Some((ballot, val)) = maybe {
-            if ballot > 0 && !val.is_empty() {
+        if let Some((ballot, val)) = maybe
+            && ballot > 0 && !val.is_empty() {
                 return (ballot, val);
             }
-        }
         let val = self.db.get_ns(ns, key).await.unwrap_or_default();
         (0, val)
     }
@@ -1423,6 +1406,7 @@ impl Cluster {
 
     /// Reconcile divergent replicas by sending the freshest values to healthy nodes
     /// and hinting any that are down.
+    #[allow(clippy::type_complexity)]
     async fn read_repair(
         &self,
         meta: &QueryMeta,
@@ -1548,11 +1532,10 @@ impl Cluster {
                 }
                 Ok(QueryOutput::Rows(r)) => {
                     if meta.is_count {
-                        if count_val.is_none() {
-                            if let Some(c) = r.get(0).and_then(|m| m.get("count")) {
+                        if count_val.is_none()
+                            && let Some(c) = r.first().and_then(|m| m.get("count")) {
                                 count_val = c.parse::<u64>().ok();
                             }
-                        }
                     } else {
                         arr_rows.extend(r);
                     }

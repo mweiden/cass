@@ -37,6 +37,12 @@ pub struct MemTable {
     shards: Vec<Shard>,
 }
 
+impl Default for MemTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MemTable {
     /// Create a new, empty [`MemTable`].
     pub fn new() -> Self {
@@ -134,6 +140,10 @@ impl MemTable {
             total += shard.data.read().await.map.len();
         }
         total
+    }
+
+    pub async fn is_empty(&self) -> bool {
+        self.len().await == 0
     }
 
     /// Remove all entries from the table.

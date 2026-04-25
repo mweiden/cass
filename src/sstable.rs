@@ -126,8 +126,8 @@ impl SsTable {
     ) -> Result<Self, StorageError> {
         let path = path.into();
         let meta_path = meta_path(&path);
-        if let Ok(bytes) = storage.get(&meta_path).await {
-            if let Ok(meta) = TableMeta::decode(bytes.as_ref()) {
+        if let Ok(bytes) = storage.get(&meta_path).await
+            && let Ok(meta) = TableMeta::decode(bytes.as_ref()) {
                 let bloom = meta
                     .bloom
                     .map(BloomFilter::from_proto)
@@ -141,7 +141,6 @@ impl SsTable {
                     index,
                 });
             }
-        }
         let raw = storage.get(&path).await?;
         let mut bloom = BloomFilter::new(1024);
         let mut zone_map = ZoneMap::default();
@@ -151,7 +150,7 @@ impl SsTable {
         for line in raw.split(|b| *b == NL).filter(|l| !l.is_empty()) {
             if let Some(pos) = line.iter().position(|b| *b == SEP) {
                 let key = std::str::from_utf8(&line[..pos])
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    .map_err(std::io::Error::other)?;
                 bloom.insert(key);
                 zone_map.update(key);
                 if i % INDEX_INTERVAL == 0 {
@@ -191,7 +190,7 @@ impl SsTable {
             if let Some(enc) = Self::scan_from(&mmap[offset as usize..], key) {
                 let val = STANDARD
                     .decode(enc)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    .map_err(std::io::Error::other)?;
                 return Ok(Some(val));
             }
             return Ok(None);
@@ -201,7 +200,7 @@ impl SsTable {
         if let Some(enc) = Self::scan_from(&raw[offset as usize..], key) {
             let val = STANDARD
                 .decode(enc)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             return Ok(Some(val));
         }
         Ok(None)
@@ -213,7 +212,7 @@ impl SsTable {
     /// lines must be sorted by key in ascending order. When the target key is
     /// found the encoded value slice (the bytes after the separator) is
     /// returned. If the key is not present `None` is returned.
-
+    ///
     /// Find the starting byte offset for a given key using the sparse index.
     fn seek_offset(&self, key: &str) -> u64 {
         if self.index.is_empty() {
@@ -236,10 +235,7 @@ impl SsTable {
     /// value slice when found.
     fn scan_from<'a>(mut slice: &'a [u8], key: &str) -> Option<&'a [u8]> {
         while !slice.is_empty() {
-            let nl_pos = match slice.iter().position(|b| *b == NL) {
-                Some(p) => p,
-                None => return None,
-            };
+            let nl_pos = slice.iter().position(|b| *b == NL)?;
             let line = &slice[..nl_pos];
             if let Some(pos) = line.iter().position(|b| *b == SEP) {
                 let key_bytes = &line[..pos];
