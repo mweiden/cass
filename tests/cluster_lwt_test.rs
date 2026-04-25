@@ -16,8 +16,7 @@ async fn build_cluster(rf: usize, self_addr: &str) -> Cluster {
 fn applied(resp: &QueryResponse) -> Option<String> {
     match &resp.payload {
         Some(query_response::Payload::Rows(rs)) => rs
-            .rows
-            .get(0)
+            .rows.first()
             .and_then(|r| r.columns.get("[applied]").cloned()),
         _ => None,
     }
@@ -26,7 +25,7 @@ fn applied(resp: &QueryResponse) -> Option<String> {
 fn column(resp: &QueryResponse, name: &str) -> Option<String> {
     match &resp.payload {
         Some(query_response::Payload::Rows(rs)) => {
-            rs.rows.get(0).and_then(|r| r.columns.get(name).cloned())
+            rs.rows.first().and_then(|r| r.columns.get(name).cloned())
         }
         _ => None,
     }

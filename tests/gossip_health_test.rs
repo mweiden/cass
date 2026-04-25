@@ -194,12 +194,11 @@ async fn read_succeeds_with_lower_consistency() {
                 ts: 0,
             })
             .await;
-        if let Ok(resp) = res {
-            if let Some(cass::rpc::query_response::Payload::Rows(rs)) = resp.into_inner().payload {
+        if let Ok(resp) = res
+            && let Some(cass::rpc::query_response::Payload::Rows(rs)) = resp.into_inner().payload {
                 assert_eq!(rs.rows[0].columns.get("val"), Some(&"1".to_string()));
                 break;
             }
-        }
         if start.elapsed() > Duration::from_secs(2) {
             panic!("read did not succeed in time");
         }

@@ -105,11 +105,10 @@ async fn hinted_handoff_replays_when_node_recovers() {
             .await
             .unwrap()
             .into_inner();
-        if let Some(query_response::Payload::Rows(rs)) = resp.payload {
-            if rs.rows.get(0).and_then(|r| r.columns.get("val")) == Some(&"1".to_string()) {
+        if let Some(query_response::Payload::Rows(rs)) = resp.payload
+            && rs.rows.first().and_then(|r| r.columns.get("val")) == Some(&"1".to_string()) {
                 break;
             }
-        }
         if start.elapsed() > Duration::from_secs(4) {
             panic!("hint not delivered");
         }

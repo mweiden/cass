@@ -34,11 +34,10 @@ impl TelemetryGuard {
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        if let Some(provider) = self.provider.take() {
-            if let Err(err) = provider.shutdown() {
+        if let Some(provider) = self.provider.take()
+            && let Err(err) = provider.shutdown() {
                 tracing::error!(?err, "failed to shutdown tracer provider");
             }
-        }
     }
 }
 
@@ -174,11 +173,10 @@ struct MetadataMapInjector<'a>(&'a mut MetadataMap);
 
 impl<'a> opentelemetry::propagation::Injector for MetadataMapInjector<'a> {
     fn set(&mut self, key: &str, value: String) {
-        if let Ok(value) = MetadataValue::<Ascii>::try_from(value.as_str()) {
-            if let Ok(key) = key.parse::<MetadataKey<Ascii>>() {
+        if let Ok(value) = MetadataValue::<Ascii>::try_from(value.as_str())
+            && let Ok(key) = key.parse::<MetadataKey<Ascii>>() {
                 let _ = self.0.insert(key, value);
             }
-        }
     }
 }
 
