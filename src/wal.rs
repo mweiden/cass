@@ -12,6 +12,7 @@ use tokio::{
     runtime::Builder,
     sync::{Mutex, Notify},
 };
+use std::sync::Mutex as SyncMutex;
 
 use crate::storage::{Storage, StorageError};
 
@@ -40,7 +41,7 @@ pub struct Wal {
 struct WalInner {
     path: String,
     storage: Arc<dyn Storage>,
-    state: Mutex<WalState>,
+    state: SyncMutex<WalState>,
     flush_lock: Mutex<()>,
     shutdown: AtomicBool,
     flush_interval: Duration,
@@ -101,7 +102,7 @@ impl WalInner {
     async fn flush_pending(&self) -> std::io::Result<()> {
         let _flush_guard = self.flush_lock.lock().await;
         let (to_flush, new_flushed) = {
-            let state = self.state.lock().await;
+            let state = self.state.lock().expect("wal state mutex poisoned");
             let end = state.data.len();
             if state.flushed >= end {
                 return Ok(());
@@ -119,7 +120,7 @@ impl WalInner {
             .await
             .map_err(map_err)?;
 
-        let mut state = self.state.lock().await;
+        let mut state = self.state.lock().expect("wal state mutex poisoned");
         state.flushed = state.data.len().min(new_flushed);
         Ok(())
     }
@@ -182,7 +183,7 @@ impl Wal {
         let inner = Arc::new(WalInner {
             path,
             storage,
-            state: Mutex::new(WalState {
+            state: SyncMutex::new(WalState {
                 data: buf,
                 flushed: initial_len,
             }),
@@ -231,7 +232,7 @@ impl Wal {
     /// backend.
     pub async fn append(&self, data: &[u8]) -> std::io::Result<()> {
         {
-            let mut state = self.inner.state.lock().await;
+            let mut state = self.inner.state.lock().expect("wal state mutex poisoned");
             state.data.extend_from_slice(data);
             state.data.push(b'\n');
         }
@@ -253,7 +254,7 @@ impl Wal {
     pub async fn clear(&self) -> std::io::Result<()> {
         self.flush().await?;
         {
-            let mut state = self.inner.state.lock().await;
+            let mut state = self.inner.state.lock().expect("wal state mutex poisoned");
             state.data.clear();
             state.flushed = 0;
         }
