@@ -59,9 +59,14 @@ pub fn init_tracing(
     let env_filter =
         || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     if tracing_disabled() {
+        // When tracing is disabled, raise the default filter to WARN so the many
+        // #[instrument] spans on hot paths (default INFO level) short-circuit
+        // before allocating. Honor RUST_LOG if explicitly set.
+        let disabled_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
         let fmt_layer = tracing_subscriber::fmt::layer().with_target(true);
         tracing_subscriber::registry()
-            .with(env_filter())
+            .with(disabled_filter)
             .with(fmt_layer)
             .try_init()?;
         return Ok(TelemetryGuard { provider: None });
