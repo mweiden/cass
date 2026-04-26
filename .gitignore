@@ -32,6 +32,10 @@ lcov.info
 perf-results/*.log
 perf-results/*.prom
 perf-results/*.svg
+perf-results/*.png
 .DS_Store
 
 .claude
+
+# Ratchet autoresearch harness state
+.ratchet/

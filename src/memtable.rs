@@ -1,10 +1,10 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     io::Cursor,
+    sync::RwLock,
 };
 
 use murmur3::murmur3_32;
-use tokio::sync::RwLock;
 
 struct InnerTable {
     map: HashMap<String, Vec<u8>>,
@@ -68,7 +68,7 @@ impl MemTable {
         let shard_idx = self.shard_for(&key);
         let key_len = key.len();
         let value_len = value.len();
-        let mut guard = self.shards[shard_idx].data.write().await;
+        let mut guard = self.shards[shard_idx].data.write().expect("memtable shard poisoned");
         let InnerTable { map, size_bytes } = &mut *guard;
         match map.entry(key) {
             Entry::Occupied(mut entry) => {
@@ -89,7 +89,7 @@ impl MemTable {
         let shard_idx = self.shard_for(&key);
         let key_len = key.len();
         let value_len = value.len();
-        let mut guard = self.shards[shard_idx].data.write().await;
+        let mut guard = self.shards[shard_idx].data.write().expect("memtable shard poisoned");
         let InnerTable { map, size_bytes } = &mut *guard;
         match map.entry(key) {
             Entry::Occupied(_) => false,
@@ -107,7 +107,7 @@ impl MemTable {
         self.shards[shard_idx]
             .data
             .read()
-            .await
+            .expect("memtable shard poisoned")
             .map
             .get(key)
             .cloned()
@@ -116,7 +116,7 @@ impl MemTable {
     /// Remove a `key` from the table.
     pub async fn delete(&self, key: &str) {
         let shard_idx = self.shard_for(key);
-        let mut guard = self.shards[shard_idx].data.write().await;
+        let mut guard = self.shards[shard_idx].data.write().expect("memtable shard poisoned");
         if let Some(prev) = guard.map.remove(key) {
             guard.size_bytes = guard.size_bytes.saturating_sub(key.len() + prev.len());
         }
@@ -126,7 +126,7 @@ impl MemTable {
     pub async fn scan(&self) -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
         for shard in &self.shards {
-            let guard = shard.data.read().await;
+            let guard = shard.data.read().expect("memtable shard poisoned");
             out.extend(guard.map.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -137,7 +137,7 @@ impl MemTable {
     pub async fn len(&self) -> usize {
         let mut total = 0usize;
         for shard in &self.shards {
-            total += shard.data.read().await.map.len();
+            total += shard.data.read().expect("memtable shard poisoned").map.len();
         }
         total
     }
@@ -149,7 +149,7 @@ impl MemTable {
     /// Remove all entries from the table.
     pub async fn clear(&self) {
         for shard in &self.shards {
-            let mut guard = shard.data.write().await;
+            let mut guard = shard.data.write().expect("memtable shard poisoned");
             guard.map.clear();
             guard.map.shrink_to_fit();
             guard.size_bytes = 0;
@@ -159,7 +159,7 @@ impl MemTable {
     /// Delete every key that begins with `prefix`.
     pub async fn delete_prefix(&self, prefix: &str) {
         for shard in &self.shards {
-            let mut guard = shard.data.write().await;
+            let mut guard = shard.data.write().expect("memtable shard poisoned");
             let mut removed_bytes = 0usize;
             guard.map.retain(|k, v| {
                 if k.starts_with(prefix) {
@@ -177,7 +177,7 @@ impl MemTable {
     pub async fn size_bytes(&self) -> usize {
         let mut total = 0usize;
         for shard in &self.shards {
-            total += shard.data.read().await.size_bytes;
+            total += shard.data.read().expect("memtable shard poisoned").size_bytes;
         }
         total
     }
