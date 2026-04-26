@@ -149,7 +149,7 @@ pub struct Cluster {
     read_cl: ConsistencyLevel,
     write_cl: ConsistencyLevel,
     self_addr: String,
-    health: Arc<RwLock<HashMap<String, Instant>>>,
+    health: Arc<std::sync::RwLock<HashMap<String, Instant>>>,
     panic_until: Arc<RwLock<Option<Instant>>>,
     disk_ok: Arc<AtomicBool>,
     #[allow(clippy::type_complexity)]
@@ -231,7 +231,7 @@ impl Cluster {
                 initial.insert(p.clone(), Instant::now());
             }
         }
-        let health = Arc::new(RwLock::new(initial));
+        let health = Arc::new(std::sync::RwLock::new(initial));
         let panic_until = Arc::new(RwLock::new(None));
         let client_pool = ClientPool::default();
         let gossip_peers = peers.clone();
@@ -254,7 +254,7 @@ impl Cluster {
                         }
                         Err(_) => false,
                     };
-                    let mut map = gossip_health.write().await;
+                    let mut map = gossip_health.write().expect("health rwlock poisoned");
                     if ok {
                         map.insert(peer.clone(), Instant::now());
                     } else {
@@ -379,14 +379,14 @@ impl Cluster {
         if node == self.self_addr {
             return self.self_healthy().await;
         }
-        let map = self.health.read().await;
+        let map = self.health.read().expect("health rwlock poisoned");
         map.get(node)
             .map(|t| t.elapsed() < Duration::from_secs(8))
             .unwrap_or(false)
     }
 
     pub async fn peer_health(&self) -> Vec<(String, bool)> {
-        let map = self.health.read().await;
+        let map = self.health.read().expect("health rwlock poisoned");
         map.iter()
             .map(|(peer, t)| (peer.clone(), t.elapsed() < Duration::from_secs(8)))
             .collect()
@@ -1722,7 +1722,7 @@ mod tests {
             test_cluster("http://127.0.0.1:9000", vec![peer1.clone(), peer2.clone()]).await;
 
         {
-            let mut map = cluster.health.write().await;
+            let mut map = cluster.health.write().expect("health rwlock poisoned");
             map.insert(peer1.clone(), Instant::now());
             map.insert(peer2.clone(), Instant::now() - Duration::from_secs(10));
         }
