@@ -153,7 +153,7 @@ pub struct Cluster {
     panic_until: Arc<RwLock<Option<Instant>>>,
     disk_ok: Arc<AtomicBool>,
     #[allow(clippy::type_complexity)]
-    hints: Arc<RwLock<HashMap<String, Vec<(u64, Arc<str>)>>>>,
+    hints: Arc<std::sync::RwLock<HashMap<String, Vec<(u64, Arc<str>)>>>>,
     lwt: Arc<RwLock<HashMap<String, PaxosSlot>>>,
     client_pool: ClientPool,
 }
@@ -301,7 +301,7 @@ impl Cluster {
             health,
             panic_until,
             disk_ok,
-            hints: Arc::new(RwLock::new(HashMap::new())),
+            hints: Arc::new(std::sync::RwLock::new(HashMap::new())),
             lwt: Arc::new(RwLock::new(HashMap::new())),
             client_pool,
         }
@@ -1286,7 +1286,7 @@ impl Cluster {
         if nodes.is_empty() {
             return;
         }
-        let mut map = self.hints.write().await;
+        let mut map = self.hints.write().expect("hints rwlock poisoned");
         for node in nodes {
             map.entry(node).or_default().push((ts, sql.clone()));
         }
@@ -1298,11 +1298,11 @@ impl Cluster {
         // Steady-state (all peers healthy) the hints map is empty, and this method
         // runs per-replica on every coordinator request — taking a write lock here
         // serialized all concurrent requests through one mutex.
-        if !self.hints.read().await.contains_key(node) {
+        if !self.hints.read().expect("hints rwlock poisoned").contains_key(node) {
             return;
         }
         let hints = {
-            let mut map = self.hints.write().await;
+            let mut map = self.hints.write().expect("hints rwlock poisoned");
             map.remove(node)
         };
         if let Some(hints) = hints {
@@ -1311,7 +1311,7 @@ impl Cluster {
                     .run_on_nodes(vec![node.to_string()], sql.clone(), ts)
                     .await;
                 if res.first().map(|(_, r)| r.is_err()).unwrap_or(true) {
-                    let mut map = self.hints.write().await;
+                    let mut map = self.hints.write().expect("hints rwlock poisoned");
                     map.entry(node.to_string()).or_default().push((ts, sql));
                     break;
                 }
@@ -1752,8 +1752,8 @@ mod tests {
                 1,
             )
             .await;
-        assert!(cluster.hints.read().await.get(&peer).is_some());
+        assert!(cluster.hints.read().expect("hints rwlock poisoned").get(&peer).is_some());
         cluster.apply_hints(&peer).await;
-        assert!(cluster.hints.read().await.get(&peer).is_some());
+        assert!(cluster.hints.read().expect("hints rwlock poisoned").get(&peer).is_some());
     }
 }
