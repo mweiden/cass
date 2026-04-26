@@ -1,5 +1,5 @@
 # ---- Build stage ----
-    FROM rust:1.85-slim-bookworm AS build
+    FROM rust:1.89-slim-bookworm AS build
     WORKDIR /app
     
     # (optional) prime dependency cache
