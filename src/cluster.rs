@@ -1310,6 +1310,13 @@ impl Cluster {
 
     /// Attempt to deliver any stored hints to `node`.
     async fn apply_hints(&self, node: &str) {
+        // Fast path: avoid a contended write lock when there's nothing to deliver.
+        // Steady-state (all peers healthy) the hints map is empty, and this method
+        // runs per-replica on every coordinator request — taking a write lock here
+        // serialized all concurrent requests through one mutex.
+        if !self.hints.read().await.contains_key(node) {
+            return;
+        }
         let hints = {
             let mut map = self.hints.write().await;
             map.remove(node)
