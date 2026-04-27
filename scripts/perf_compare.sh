@@ -95,6 +95,24 @@ start_cassandra_cluster() {
     done
   }
 
+  # Helper to wait for the CQL native transport to become queryable on a node.
+  # UN (gossip) flips before CQL binds; cassandra-stress drivers will see
+  # "Connection refused" if we proceed without this check.
+  wait_for_cql() {
+    local node=$1
+    local tries=0
+    local max_tries=120  # ~10 minutes
+    until docker exec "$node" cqlsh -e 'DESCRIBE CLUSTER' >/dev/null 2>&1; do
+      tries=$((tries+1))
+      if [ "$tries" -ge "$max_tries" ]; then
+        echo "Timed out waiting for CQL on $node" >&2
+        return 1
+      fi
+      echo "waiting for cql on $node..."
+      sleep 5
+    done
+  }
+
   # Start seed (smaller heap, fewer tokens for quicker startup)
   docker run -d --name cassA1 --hostname cassA1 --network perf-cassandra-net \
     -e CASSANDRA_CLUSTER_NAME=perf \
@@ -107,8 +125,7 @@ start_cassandra_cluster() {
 
   echo "Waiting for seed to be UN and CQL ready..."
   wait_un_count 1 || { docker logs --tail=200 cassA1 || true; return 1; }
-  until docker exec cassA1 cqlsh -e 'DESCRIBE CLUSTER' >/dev/null 2>&1; do
-    echo "waiting for cql on cassA1..."; sleep 5; done
+  wait_for_cql cassA1 || { docker logs --tail=200 cassA1 || true; return 1; }
 
   # Start non-seeds one by one and wait after each
   for n in 2 3 4 5; do
@@ -121,6 +138,7 @@ start_cassandra_cluster() {
       -e HEAP_NEWSIZE=100M \
       cassandra:4.1 >/dev/null
     wait_un_count $n || { docker logs --tail=200 cassA$n || true; return 1; }
+    wait_for_cql cassA$n || { docker logs --tail=200 cassA$n || true; return 1; }
   done
 }
 
