@@ -149,11 +149,11 @@ pub struct Cluster {
     read_cl: ConsistencyLevel,
     write_cl: ConsistencyLevel,
     self_addr: String,
-    health: Arc<RwLock<HashMap<String, Instant>>>,
+    health: Arc<std::sync::RwLock<HashMap<String, Instant>>>,
     panic_until: Arc<RwLock<Option<Instant>>>,
     disk_ok: Arc<AtomicBool>,
     #[allow(clippy::type_complexity)]
-    hints: Arc<RwLock<HashMap<String, Vec<(u64, Arc<str>)>>>>,
+    hints: Arc<std::sync::RwLock<HashMap<String, Vec<(u64, Arc<str>)>>>>,
     lwt: Arc<RwLock<HashMap<String, PaxosSlot>>>,
     client_pool: ClientPool,
 }
@@ -231,7 +231,7 @@ impl Cluster {
                 initial.insert(p.clone(), Instant::now());
             }
         }
-        let health = Arc::new(RwLock::new(initial));
+        let health = Arc::new(std::sync::RwLock::new(initial));
         let panic_until = Arc::new(RwLock::new(None));
         let client_pool = ClientPool::default();
         let gossip_peers = peers.clone();
@@ -254,7 +254,7 @@ impl Cluster {
                         }
                         Err(_) => false,
                     };
-                    let mut map = gossip_health.write().await;
+                    let mut map = gossip_health.write().expect("health rwlock poisoned");
                     if ok {
                         map.insert(peer.clone(), Instant::now());
                     } else {
@@ -301,7 +301,7 @@ impl Cluster {
             health,
             panic_until,
             disk_ok,
-            hints: Arc::new(RwLock::new(HashMap::new())),
+            hints: Arc::new(std::sync::RwLock::new(HashMap::new())),
             lwt: Arc::new(RwLock::new(HashMap::new())),
             client_pool,
         }
@@ -379,14 +379,14 @@ impl Cluster {
         if node == self.self_addr {
             return self.self_healthy().await;
         }
-        let map = self.health.read().await;
+        let map = self.health.read().expect("health rwlock poisoned");
         map.get(node)
             .map(|t| t.elapsed() < Duration::from_secs(8))
             .unwrap_or(false)
     }
 
     pub async fn peer_health(&self) -> Vec<(String, bool)> {
-        let map = self.health.read().await;
+        let map = self.health.read().expect("health rwlock poisoned");
         map.iter()
             .map(|(peer, t)| (peer.clone(), t.elapsed() < Duration::from_secs(8)))
             .collect()
@@ -539,7 +539,7 @@ impl Cluster {
                 return self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta);
             }
             return self
-                .execute_write_with_consistency(sql_arc, ts, healthy, meta)
+                .execute_write_with_consistency(parsed, sql_arc, ts, healthy, meta)
                 .await;
         }
         if meta.broadcast {
@@ -568,11 +568,12 @@ impl Cluster {
     }
 
     #[instrument(
-        skip(self, sql, healthy, meta),
+        skip(self, parsed, sql, healthy, meta),
         fields(ts = ts, required = field::Empty, target_count = field::Empty)
     )]
     async fn execute_write_with_consistency(
         &self,
+        parsed: ParsedQuery,
         sql: Arc<str>,
         ts: u64,
         healthy: Vec<String>,
@@ -594,7 +595,7 @@ impl Cluster {
         for node in healthy {
             if node == self.self_addr {
                 let res = Self::sql_engine()
-                    .execute_with_ts(&self.db, sql.as_ref(), ts, true)
+                    .execute_with_parsed(&self.db, &parsed, ts, true)
                     .await;
                 if res.is_ok() {
                     successes += 1;
@@ -1286,7 +1287,7 @@ impl Cluster {
         if nodes.is_empty() {
             return;
         }
-        let mut map = self.hints.write().await;
+        let mut map = self.hints.write().expect("hints rwlock poisoned");
         for node in nodes {
             map.entry(node).or_default().push((ts, sql.clone()));
         }
@@ -1298,11 +1299,11 @@ impl Cluster {
         // Steady-state (all peers healthy) the hints map is empty, and this method
         // runs per-replica on every coordinator request — taking a write lock here
         // serialized all concurrent requests through one mutex.
-        if !self.hints.read().await.contains_key(node) {
+        if !self.hints.read().expect("hints rwlock poisoned").contains_key(node) {
             return;
         }
         let hints = {
-            let mut map = self.hints.write().await;
+            let mut map = self.hints.write().expect("hints rwlock poisoned");
             map.remove(node)
         };
         if let Some(hints) = hints {
@@ -1311,7 +1312,7 @@ impl Cluster {
                     .run_on_nodes(vec![node.to_string()], sql.clone(), ts)
                     .await;
                 if res.first().map(|(_, r)| r.is_err()).unwrap_or(true) {
-                    let mut map = self.hints.write().await;
+                    let mut map = self.hints.write().expect("hints rwlock poisoned");
                     map.entry(node.to_string()).or_default().push((ts, sql));
                     break;
                 }
@@ -1722,7 +1723,7 @@ mod tests {
             test_cluster("http://127.0.0.1:9000", vec![peer1.clone(), peer2.clone()]).await;
 
         {
-            let mut map = cluster.health.write().await;
+            let mut map = cluster.health.write().expect("health rwlock poisoned");
             map.insert(peer1.clone(), Instant::now());
             map.insert(peer2.clone(), Instant::now() - Duration::from_secs(10));
         }
@@ -1752,8 +1753,8 @@ mod tests {
                 1,
             )
             .await;
-        assert!(cluster.hints.read().await.get(&peer).is_some());
+        assert!(cluster.hints.read().expect("hints rwlock poisoned").get(&peer).is_some());
         cluster.apply_hints(&peer).await;
-        assert!(cluster.hints.read().await.get(&peer).is_some());
+        assert!(cluster.hints.read().expect("hints rwlock poisoned").get(&peer).is_some());
     }
 }
