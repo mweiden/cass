@@ -539,7 +539,7 @@ impl Cluster {
                 return self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta);
             }
             return self
-                .execute_write_with_consistency(sql_arc, ts, healthy, meta)
+                .execute_write_with_consistency(parsed, sql_arc, ts, healthy, meta)
                 .await;
         }
         if meta.broadcast {
@@ -568,11 +568,12 @@ impl Cluster {
     }
 
     #[instrument(
-        skip(self, sql, healthy, meta),
+        skip(self, parsed, sql, healthy, meta),
         fields(ts = ts, required = field::Empty, target_count = field::Empty)
     )]
     async fn execute_write_with_consistency(
         &self,
+        parsed: ParsedQuery,
         sql: Arc<str>,
         ts: u64,
         healthy: Vec<String>,
@@ -594,7 +595,7 @@ impl Cluster {
         for node in healthy {
             if node == self.self_addr {
                 let res = Self::sql_engine()
-                    .execute_with_ts(&self.db, sql.as_ref(), ts, true)
+                    .execute_with_parsed(&self.db, &parsed, ts, true)
                     .await;
                 if res.is_ok() {
                     successes += 1;
