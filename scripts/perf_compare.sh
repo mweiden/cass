@@ -121,6 +121,8 @@ start_cassandra_cluster() {
       -e HEAP_NEWSIZE=100M \
       cassandra:4.1 >/dev/null
     wait_un_count $n || { docker logs --tail=200 cassA$n || true; return 1; }
+    until docker exec cassA$n cqlsh -e 'DESCRIBE CLUSTER' >/dev/null 2>&1; do
+      echo "waiting for cql on cassA$n..."; sleep 5; done
   done
 }
 
