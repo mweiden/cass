@@ -54,6 +54,9 @@ protoc-bin-vendored = "3"
 # This is disabled by default to avoid requiring system fontconfig in CI.
 plot-ttf = ["plotters/ttf"]
 
+[profile.release]
+lto = "thin"
+
 [[bench]]
 name = "lookup"
 harness = false
