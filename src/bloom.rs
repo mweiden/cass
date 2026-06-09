@@ -12,12 +12,24 @@ pub struct BloomProto {
     pub bits: Vec<bool>,
 }
 
+/// Bits allocated per expected key. With the two hash functions used below
+/// this yields a false-positive rate of roughly 3%.
+const BITS_PER_KEY: usize = 10;
+
+/// Lower bound on filter size so tiny tables still get a useful filter.
+const MIN_BITS: usize = 1024;
+
 impl BloomFilter {
     /// Create a new filter with `size` bits.
     pub fn new(size: usize) -> Self {
         Self {
-            bits: vec![false; size],
+            bits: vec![false; size.max(1)],
         }
+    }
+
+    /// Create a filter sized for the expected number of distinct keys.
+    pub fn with_capacity(expected_keys: usize) -> Self {
+        Self::new(expected_keys.saturating_mul(BITS_PER_KEY).max(MIN_BITS))
     }
 
     /// Compute two simple hash values for `item` using a pair of
@@ -38,6 +50,9 @@ impl BloomFilter {
 
     /// Record `item` in the filter.
     pub fn insert(&mut self, item: &str) {
+        if self.bits.is_empty() {
+            return;
+        }
         let (a, b) = self.hashes(item);
         self.bits[a] = true;
         self.bits[b] = true;
@@ -46,6 +61,11 @@ impl BloomFilter {
     /// Return `true` if the filter indicates that `item` may be present.
     /// False positives are possible but false negatives are not.
     pub fn may_contain(&self, item: &str) -> bool {
+        // An empty filter (e.g. decoded from a missing/corrupt proto) carries
+        // no information, so it must not rule anything out.
+        if self.bits.is_empty() {
+            return true;
+        }
         let (a, b) = self.hashes(item);
         self.bits.get(a).copied().unwrap_or(false) && self.bits.get(b).copied().unwrap_or(false)
     }

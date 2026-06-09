@@ -75,7 +75,7 @@ impl SsTable {
         let path = path.into();
         let mut sorted = entries.to_vec();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut bloom = BloomFilter::new(1024);
+        let mut bloom = BloomFilter::with_capacity(sorted.len());
         let mut zone_map = ZoneMap::default();
         let mut data = Vec::new();
         let mut index = Vec::new();
@@ -142,22 +142,26 @@ impl SsTable {
                 });
             }
         let raw = storage.get(&path).await?;
-        let mut bloom = BloomFilter::new(1024);
-        let mut zone_map = ZoneMap::default();
-        let mut index = Vec::new();
+        // First pass: collect keys and offsets so the bloom filter can be
+        // sized for the actual number of entries.
+        let mut keys: Vec<(&str, u64)> = Vec::new();
         let mut offset: u64 = 0;
-        let mut i = 0;
         for line in raw.split(|b| *b == NL).filter(|l| !l.is_empty()) {
             if let Some(pos) = line.iter().position(|b| *b == SEP) {
                 let key = std::str::from_utf8(&line[..pos])
                     .map_err(std::io::Error::other)?;
-                bloom.insert(key);
-                zone_map.update(key);
-                if i % INDEX_INTERVAL == 0 {
-                    index.push((key.to_string(), offset));
-                }
+                keys.push((key, offset));
                 offset += line.len() as u64 + 1; // include newline
-                i += 1;
+            }
+        }
+        let mut bloom = BloomFilter::with_capacity(keys.len());
+        let mut zone_map = ZoneMap::default();
+        let mut index = Vec::new();
+        for (i, (key, off)) in keys.iter().enumerate() {
+            bloom.insert(key);
+            zone_map.update(key);
+            if i % INDEX_INTERVAL == 0 {
+                index.push((key.to_string(), *off));
             }
         }
         Ok(Self {
