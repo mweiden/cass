@@ -62,8 +62,8 @@ fn parse_entries(data: &[u8]) -> std::io::Result<Vec<(String, Vec<u8>)>> {
         }
         if let Some(pos) = line.iter().position(|b| *b == b'\t') {
             let key = std::str::from_utf8(&line[..pos])
-                .map_err(std::io::Error::other)?
-                .to_string();
+                .map_err(std::io::Error::other)?;
+            let key = crate::util::unescape_key(key).into_owned();
             let val = STANDARD
                 .decode(&line[pos + 1..])
                 .map_err(std::io::Error::other)?;

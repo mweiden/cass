@@ -170,7 +170,9 @@ impl Database {
     }
 
     async fn insert_internal(&self, key: String, value: Vec<u8>) -> std::io::Result<()> {
-        let mut rec = key.clone().into_bytes();
+        // Escape the key so tabs/newlines in user data cannot break the
+        // line-oriented WAL record format.
+        let mut rec = util::escape_key(&key).into_owned().into_bytes();
         rec.push(b'\t');
         let enc = base64::engine::general_purpose::STANDARD.encode(&value);
         rec.extend_from_slice(enc.as_bytes());
@@ -300,13 +302,15 @@ impl Database {
             if let Ok(raw) = self.storage.get(&table.path).await {
                 for line in raw.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
                     if let Some(pos) = line.iter().position(|b| *b == b'\t')
-                        && let Ok(key) = std::str::from_utf8(&line[..pos])
-                            && let Some(rest) = key.strip_prefix(&prefix)
+                        && let Ok(escaped) = std::str::from_utf8(&line[..pos]) {
+                            let key = util::unescape_key(escaped);
+                            if let Some(rest) = key.strip_prefix(&prefix)
                                 && let Ok(val) = base64::engine::general_purpose::STANDARD
                                     .decode(&line[pos + 1..])
                                 {
                                     map.insert(rest.to_string(), val);
                                 }
+                        }
                 }
             }
         }

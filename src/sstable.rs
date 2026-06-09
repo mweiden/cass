@@ -73,22 +73,29 @@ impl SsTable {
         storage: &S,
     ) -> Result<Self, StorageError> {
         let path = path.into();
-        let mut sorted = entries.to_vec();
+        // Keys are escaped on disk so embedded tabs/newlines cannot break the
+        // line format. The file (and the sparse index) is sorted by the
+        // escaped form, which is also what lookups scan with; the bloom
+        // filter and zone map work on raw keys.
+        let mut sorted: Vec<(String, &String, &Vec<u8>)> = entries
+            .iter()
+            .map(|(k, v)| (crate::util::escape_key(k).into_owned(), k, v))
+            .collect();
         sorted.sort_by(|a, b| a.0.cmp(&b.0));
         let mut bloom = BloomFilter::new(1024);
         let mut zone_map = ZoneMap::default();
         let mut data = Vec::new();
         let mut index = Vec::new();
         let mut offset: u64 = 0;
-        for (i, (k, v)) in sorted.iter().enumerate() {
+        for (i, (ek, k, v)) in sorted.iter().enumerate() {
             if i % INDEX_INTERVAL == 0 {
-                index.push((k.clone(), offset));
+                index.push((ek.clone(), offset));
             }
             // update auxiliary structures
             bloom.insert(k);
             zone_map.update(k);
-            // write "key\tbase64(value)\n" lines
-            data.extend_from_slice(k.as_bytes());
+            // write "escaped_key\tbase64(value)\n" lines
+            data.extend_from_slice(ek.as_bytes());
             data.push(SEP);
             let enc = STANDARD.encode(v);
             data.extend_from_slice(enc.as_bytes());
@@ -149,12 +156,13 @@ impl SsTable {
         let mut i = 0;
         for line in raw.split(|b| *b == NL).filter(|l| !l.is_empty()) {
             if let Some(pos) = line.iter().position(|b| *b == SEP) {
-                let key = std::str::from_utf8(&line[..pos])
+                let escaped = std::str::from_utf8(&line[..pos])
                     .map_err(std::io::Error::other)?;
-                bloom.insert(key);
-                zone_map.update(key);
+                let key = crate::util::unescape_key(escaped);
+                bloom.insert(&key);
+                zone_map.update(&key);
                 if i % INDEX_INTERVAL == 0 {
-                    index.push((key.to_string(), offset));
+                    index.push((escaped.to_string(), offset));
                 }
                 offset += line.len() as u64 + 1; // include newline
                 i += 1;
@@ -181,6 +189,10 @@ impl SsTable {
         if !self.zone_map.contains(key) || !self.bloom.may_contain(key) {
             return Ok(None);
         }
+        // The file and index store escaped keys, so probe with the escaped
+        // form.
+        let escaped = crate::util::escape_key(key);
+        let key = escaped.as_ref();
         let offset = self.seek_offset(key);
         if let Some(root) = storage.local_path() {
             let path = root.join(&self.path);
