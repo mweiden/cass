@@ -1608,6 +1608,15 @@ impl Cluster {
                     arr_rows.push(map);
                 }
             }
+            // Rows merged from replica meta results have not had ORDER BY or
+            // LIMIT applied yet; do so here on the merged set.
+            if let Some(Statement::Query(q)) = meta.first_stmt.as_deref() {
+                crate::query::apply_order_and_limit(
+                    &mut arr_rows,
+                    q.order_by.as_ref(),
+                    q.limit_clause.as_ref(),
+                )?;
+            }
             return Ok(output_to_proto(QueryOutput::Rows(arr_rows)));
         }
 
