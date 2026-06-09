@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete, Expr, FromTable,
-    Insert, LimitClause, ObjectName, ObjectType, OrderBy, Query, Select, SelectItem, SetExpr,
-    Statement, TableFactor, TableWithJoins, Value,
+    Insert, LimitClause, ObjectName, ObjectType, OrderBy, OrderByKind, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -590,8 +590,8 @@ impl SqlEngine {
         &self,
         db: &Database,
         select: &Select,
-        _order: &Option<OrderBy>,
-        _limit: Option<&LimitClause>,
+        order: &Option<OrderBy>,
+        limit: Option<&LimitClause>,
         meta: bool,
     ) -> Result<QueryOutput, QueryError> {
         if select.from.len() != 1 {
@@ -611,8 +611,15 @@ impl SqlEngine {
                     return self.exec_count(db, &ns, schema_ref, selection).await;
                 }
 
-        self.exec_select_schema(db, &ns, schema_ref, select, meta)
-            .await
+        let mut out = self
+            .exec_select_schema(db, &ns, schema_ref, select, meta)
+            .await?;
+        // Meta results are merged across replicas by the cluster layer,
+        // which applies ORDER BY/LIMIT after the merge.
+        if let QueryOutput::Rows(ref mut rows) = out {
+            apply_order_and_limit(rows, order.as_ref(), limit)?;
+        }
+        Ok(out)
     }
 
     /// Execute a `COUNT(*)` query with optional equality filters.
@@ -1121,6 +1128,104 @@ fn build_row(schema: &TableSchema, cols: &[String], row: &[Expr]) -> Option<(Str
         }
     }
     Some((key_parts.join("|"), encode_row(&data_map)))
+}
+
+/// Compare two stored values, numerically when both parse as numbers and
+/// lexicographically otherwise.
+fn cmp_values(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<f64>(), b.parse::<f64>()) {
+        (Ok(x), Ok(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        _ => a.cmp(b),
+    }
+}
+
+/// Extract a non-negative integer literal from an expression (e.g. a LIMIT
+/// or OFFSET count).
+fn expr_to_usize(expr: &Expr) -> Result<usize, QueryError> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            Value::Number(n, _) => n.parse::<usize>().map_err(|_| QueryError::Unsupported),
+            _ => Err(QueryError::Unsupported),
+        },
+        _ => Err(QueryError::Unsupported),
+    }
+}
+
+/// Apply `ORDER BY` and `LIMIT`/`OFFSET` clauses to a result row set.
+///
+/// Clause forms the engine cannot honor return [`QueryError::Unsupported`]
+/// instead of being silently ignored.
+pub fn apply_order_and_limit(
+    rows: &mut Vec<BTreeMap<String, String>>,
+    order: Option<&OrderBy>,
+    limit: Option<&LimitClause>,
+) -> Result<(), QueryError> {
+    if let Some(order) = order {
+        if order.interpolate.is_some() {
+            return Err(QueryError::Unsupported);
+        }
+        let OrderByKind::Expressions(exprs) = &order.kind else {
+            return Err(QueryError::Unsupported);
+        };
+        let mut sort_keys = Vec::new();
+        for e in exprs {
+            if e.with_fill.is_some() {
+                return Err(QueryError::Unsupported);
+            }
+            let Expr::Identifier(id) = &e.expr else {
+                return Err(QueryError::Unsupported);
+            };
+            let asc = e.options.asc.unwrap_or(true);
+            // SQL default: NULLs last when ascending, first when descending.
+            let nulls_first = e.options.nulls_first.unwrap_or(!asc);
+            sort_keys.push((id.value.to_lowercase(), asc, nulls_first));
+        }
+        rows.sort_by(|a, b| {
+            for (col, asc, nulls_first) in &sort_keys {
+                let ord = match (a.get(col), b.get(col)) {
+                    (Some(x), Some(y)) => {
+                        let o = cmp_values(x, y);
+                        if *asc { o } else { o.reverse() }
+                    }
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) if *nulls_first => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (Some(_), None) if *nulls_first => std::cmp::Ordering::Greater,
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+    }
+    if let Some(clause) = limit {
+        let (limit_expr, offset_expr) = match clause {
+            LimitClause::LimitOffset {
+                limit,
+                offset,
+                limit_by,
+            } => {
+                if !limit_by.is_empty() {
+                    return Err(QueryError::Unsupported);
+                }
+                (limit.as_ref(), offset.as_ref().map(|o| &o.value))
+            }
+            LimitClause::OffsetCommaLimit { offset, limit } => (Some(limit), Some(offset)),
+        };
+        let skip = match offset_expr {
+            Some(e) => expr_to_usize(e)?,
+            None => 0,
+        };
+        if skip > 0 {
+            rows.drain(..skip.min(rows.len()));
+        }
+        if let Some(e) = limit_expr {
+            rows.truncate(expr_to_usize(e)?);
+        }
+    }
+    Ok(())
 }
 
 /// Build partition key strings from column values, generating all combinations.
