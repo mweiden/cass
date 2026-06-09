@@ -181,13 +181,17 @@ impl SsTable {
         if !self.zone_map.contains(key) || !self.bloom.may_contain(key) {
             return Ok(None);
         }
-        let offset = self.seek_offset(key);
+        let offset = self.seek_offset(key) as usize;
         if let Some(root) = storage.local_path() {
             let path = root.join(&self.path);
             let file = File::open(path)?;
             // memory-map the file for efficient slicing
             let mmap = unsafe { MmapOptions::new().map(&file)? };
-            if let Some(enc) = Self::scan_from(&mmap[offset as usize..], key) {
+            // The sparse index comes from a separately stored meta file; an
+            // offset beyond the data file means the index is stale or
+            // corrupt, so fall back to scanning the whole table.
+            let slice = mmap.get(offset..).unwrap_or(&mmap[..]);
+            if let Some(enc) = Self::scan_from(slice, key) {
                 let val = STANDARD
                     .decode(enc)
                     .map_err(std::io::Error::other)?;
@@ -197,7 +201,8 @@ impl SsTable {
         }
         // fallback to reading entire file from storage
         let raw = storage.get(&self.path).await?;
-        if let Some(enc) = Self::scan_from(&raw[offset as usize..], key) {
+        let slice = raw.get(offset..).unwrap_or(&raw[..]);
+        if let Some(enc) = Self::scan_from(slice, key) {
             let val = STANDARD
                 .decode(enc)
                 .map_err(std::io::Error::other)?;
