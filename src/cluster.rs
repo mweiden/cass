@@ -966,7 +966,7 @@ impl Cluster {
                     applied = true;
                     let (_schema, row_map) = insert_row_values.unwrap();
                     let mut buf = ts.to_be_bytes().to_vec();
-                    buf.extend_from_slice(&crate::schema::encode_row(&row_map));
+                    buf.extend_from_slice(&crate::schema::encode_row(&row_map)?);
                     buf
                 } else {
                     Vec::new()
@@ -974,7 +974,7 @@ impl Cluster {
             }
             (Statement::Update { .. }, _) => {
                 let data = Self::split_ts(&read_value).1;
-                let mut current = crate::schema::decode_row(data);
+                let mut current = crate::schema::decode_row(data)?;
                 if !lwt_equals.is_empty() {
                     let success = lwt_equals
                         .iter()
@@ -1002,7 +1002,7 @@ impl Cluster {
                             }
                         }
                         let mut buf = ts.to_be_bytes().to_vec();
-                        buf.extend_from_slice(&crate::schema::encode_row(&current));
+                        buf.extend_from_slice(&crate::schema::encode_row(&current)?);
                         buf
                     }
                 } else {
@@ -1063,7 +1063,7 @@ impl Cluster {
         );
         if !applied && !lwt_equals.is_empty() {
             let data = Self::split_ts(&read_value).1;
-            let current = crate::schema::decode_row(data);
+            let current = crate::schema::decode_row(data)?;
             for (k, _) in lwt_equals.iter() {
                 if let Some(v) = current.get(k.as_str()) {
                     row.insert(k.clone(), v.clone());
@@ -1450,7 +1450,15 @@ impl Cluster {
             .filter(|n| !unhealthy.contains(n))
             .collect();
         for (key, (ts, val)) in latest {
-            let mut row_map = decode_row(val.as_bytes());
+            // Read repair is best effort: a corrupt replica value must not
+            // abort repair of the remaining keys.
+            let mut row_map = match decode_row(val.as_bytes()) {
+                Ok(map) => map,
+                Err(e) => {
+                    tracing::warn!(key = %key, "skipping read repair for undecodable row: {e}");
+                    continue;
+                }
+            };
             for (col, part) in schema.key_columns().iter().zip(key.split('|')) {
                 row_map.insert(col.clone(), part.to_string());
             }
@@ -1604,8 +1612,7 @@ impl Cluster {
         if !rows.is_empty() || !arr_rows.is_empty() {
             for (_k, (_ts, val)) in rows {
                 if !val.is_empty() {
-                    let map = decode_row(val.as_bytes());
-                    arr_rows.push(map);
+                    arr_rows.push(decode_row(val.as_bytes())?);
                 }
             }
             return Ok(output_to_proto(QueryOutput::Rows(arr_rows)));
