@@ -1,6 +1,54 @@
-use std::{fs, io::Write, path::Path};
+use std::{borrow::Cow, fs, io::Write, path::Path};
 
 use crate::rpc::Row as RpcRow;
+
+/// Escape a key for the line-oriented WAL/SSTable format (`key\tvalue\n`).
+///
+/// Tabs and newlines inside a key would otherwise be indistinguishable from
+/// the field and record delimiters, corrupting every record that follows.
+/// Backslash is escaped as well so decoding is unambiguous.
+pub fn escape_key(key: &str) -> Cow<'_, str> {
+    if !key.bytes().any(|b| matches!(b, b'\\' | b'\t' | b'\n')) {
+        return Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len() + 8);
+    for c in key.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Reverse [`escape_key`]. Unknown escape sequences are preserved verbatim
+/// so keys written before escaping existed still parse unchanged.
+pub fn unescape_key(key: &str) -> Cow<'_, str> {
+    if !key.contains('\\') {
+        return Cow::Borrowed(key);
+    }
+    let mut out = String::with_capacity(key.len());
+    let mut chars = key.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    Cow::Owned(out)
+}
 
 /// Print rows in a tabular format to the provided writer.
 pub fn print_rows<W: Write>(rows: &[RpcRow], w: &mut W) {
@@ -86,6 +134,36 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         let expected = "  a\n0 1\n1 2\n(2 rows)\n";
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn escape_key_roundtrip() {
+        for key in [
+            "plain",
+            "with\ttab",
+            "with\nnewline",
+            "with\\backslash",
+            "all\t\n\\three\\t\\n",
+            "",
+        ] {
+            let escaped = escape_key(key);
+            assert!(!escaped.contains('\t'));
+            assert!(!escaped.contains('\n'));
+            assert_eq!(unescape_key(&escaped), key);
+        }
+    }
+
+    #[test]
+    fn escape_key_borrows_for_plain_keys() {
+        assert!(matches!(escape_key("plain"), Cow::Borrowed(_)));
+        assert!(matches!(unescape_key("plain"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn unescape_preserves_unknown_sequences() {
+        // keys written before escaping existed may contain lone backslashes
+        assert_eq!(unescape_key("a\\xb"), "a\\xb");
+        assert_eq!(unescape_key("trailing\\"), "trailing\\");
     }
 
     #[test]
