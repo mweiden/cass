@@ -288,25 +288,22 @@ impl Database {
     /// merged together with later values (memtable/newer SSTables) overriding
     /// earlier ones. Returned entries are deduplicated and ordered by key.
     pub async fn scan_ns(&self, ns: &str) -> Vec<(String, Vec<u8>)> {
-        use base64::Engine;
         use std::collections::BTreeMap;
 
         let prefix = format!("{}:", ns);
         let mut map: BTreeMap<String, Vec<u8>> = BTreeMap::new();
 
-        // load from on-disk SSTables first so newer data overwrites older
+        // load from on-disk SSTables first so newer data overwrites older.
+        // scan_prefix consults the zone map and sparse index so tables (or
+        // file regions) that cannot contain this namespace are skipped
+        // instead of reading and decoding every file in full.
         let tables = self.sstables.read().await;
         for table in tables.iter() {
-            if let Ok(raw) = self.storage.get(&table.path).await {
-                for line in raw.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-                    if let Some(pos) = line.iter().position(|b| *b == b'\t')
-                        && let Ok(key) = std::str::from_utf8(&line[..pos])
-                            && let Some(rest) = key.strip_prefix(&prefix)
-                                && let Ok(val) = base64::engine::general_purpose::STANDARD
-                                    .decode(&line[pos + 1..])
-                                {
-                                    map.insert(rest.to_string(), val);
-                                }
+            if let Ok(entries) = table.scan_prefix(&prefix, self.storage.as_ref()).await {
+                for (key, val) in entries {
+                    if let Some(rest) = key.strip_prefix(&prefix) {
+                        map.insert(rest.to_string(), val);
+                    }
                 }
             }
         }

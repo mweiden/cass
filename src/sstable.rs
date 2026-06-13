@@ -211,6 +211,67 @@ impl SsTable {
         Ok(None)
     }
 
+    /// Return all entries whose key starts with `prefix`.
+    ///
+    /// The zone map is consulted first so tables that cannot contain the
+    /// prefix are skipped without any I/O. The sparse index is then used to
+    /// start scanning near the first candidate line, and the scan stops as
+    /// soon as keys sort past the prefix range, so only the matching region
+    /// of the file is decoded.
+    pub async fn scan_prefix<S: Storage + Sync + Send + ?Sized>(
+        &self,
+        prefix: &str,
+        storage: &S,
+    ) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+        if !self.zone_map.may_contain_prefix(prefix) {
+            return Ok(Vec::new());
+        }
+        let offset = self.seek_offset(prefix) as usize;
+        if let Some(root) = storage.local_path() {
+            let path = root.join(&self.path);
+            let file = File::open(path)?;
+            let mmap = unsafe { MmapOptions::new().map(&file)? };
+            let slice = mmap.get(offset..).unwrap_or(&mmap[..]);
+            return Self::collect_prefix(slice, prefix);
+        }
+        let raw = storage.get(&self.path).await?;
+        let slice = raw.get(offset..).unwrap_or(&raw[..]);
+        Self::collect_prefix(slice, prefix)
+    }
+
+    /// Scan sorted `key\tbase64(value)` lines collecting entries that start
+    /// with `prefix`, stopping at the first key sorting past the prefix.
+    fn collect_prefix(
+        mut slice: &[u8],
+        prefix: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+        let mut out = Vec::new();
+        while !slice.is_empty() {
+            let Some(nl_pos) = slice.iter().position(|b| *b == NL) else {
+                break;
+            };
+            let line = &slice[..nl_pos];
+            slice = &slice[nl_pos + 1..];
+            let Some(pos) = line.iter().position(|b| *b == SEP) else {
+                continue;
+            };
+            let key_bytes = &line[..pos];
+            if key_bytes.starts_with(prefix.as_bytes()) {
+                let key = std::str::from_utf8(key_bytes)
+                    .map_err(std::io::Error::other)?
+                    .to_string();
+                let val = STANDARD
+                    .decode(&line[pos + 1..])
+                    .map_err(std::io::Error::other)?;
+                out.push((key, val));
+            } else if key_bytes > prefix.as_bytes() {
+                // sorted order: nothing past this point can match
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     /// Perform a binary search over `lines` to find `key`.
     ///
     /// Each entry in `lines` must be of the form `key\tvalue` and the slice of
