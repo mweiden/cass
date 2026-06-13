@@ -108,6 +108,9 @@ pub enum QueryError {
     /// The query is syntactically valid but not supported by the engine.
     #[error("unsupported query")]
     Unsupported,
+    /// A stored row could not be serialized or deserialized.
+    #[error(transparent)]
+    Codec(#[from] crate::schema::RowCodecError),
     /// Any other internal or I/O error.
     #[error("{0}")]
     Other(String),
@@ -437,7 +440,9 @@ impl SqlEngine {
                 return Err(QueryError::Unsupported);
             }
             let row = values.rows.first().ok_or(QueryError::Unsupported)?;
-            let (key, data) = build_row(schema_ref, &cols, row).ok_or(QueryError::Unsupported)?;
+            let (key, row_map) =
+                build_row(schema_ref, &cols, row).ok_or(QueryError::Unsupported)?;
+            let data = encode_row(&row_map)?;
             let applied = db.insert_ns_if_absent_ts(&ns, key, data, ts).await;
             let mut row = BTreeMap::new();
             row.insert("[applied]".to_string(), applied.to_string());
@@ -445,8 +450,9 @@ impl SqlEngine {
         } else {
             let mut count = 0;
             for row in &values.rows {
-                let (key, data) =
+                let (key, row_map) =
                     build_row(schema_ref, &cols, row).ok_or(QueryError::Unsupported)?;
+                let data = encode_row(&row_map)?;
                 db.insert_ns_ts(&ns, key, data, ts)
                     .await
                     .map_err(|e| QueryError::Other(e.to_string()))?;
@@ -481,7 +487,7 @@ impl SqlEngine {
         let key = build_single_key(schema_ref, &cond_map).ok_or(QueryError::Unsupported)?;
         let mut row_map = if let Some(bytes) = db.get_ns(&ns, &key).await {
             let (_, data) = split_ts(&bytes);
-            decode_row(data)
+            decode_row(data)?
         } else {
             BTreeMap::new()
         };
@@ -524,7 +530,7 @@ impl SqlEngine {
                     row_map.insert(col, val);
                 }
         }
-        let data = encode_row(&row_map);
+        let data = encode_row(&row_map)?;
         db.insert_ns_ts(&ns, key, data, ts)
             .await
             .map_err(|e| QueryError::Other(e.to_string()))?;
@@ -640,7 +646,7 @@ impl SqlEngine {
             if let Some(bytes) = db.get_ns(ns, &key).await {
                 let (_, data) = split_ts(&bytes);
                 if !data.is_empty() {
-                    let mut row_map = decode_row(data);
+                    let mut row_map = decode_row(data)?;
                     for col in schema.key_columns() {
                         if let Some(v) = cond_map.get(&col) {
                             row_map.insert(col, v.clone());
@@ -661,7 +667,7 @@ impl SqlEngine {
                 if data.is_empty() {
                     continue;
                 }
-                let mut row_map = decode_row(data);
+                let mut row_map = decode_row(data)?;
                 for (col, part) in schema.key_columns().iter().zip(k.split('|')) {
                     row_map.insert(col.clone(), part.to_string());
                 }
@@ -721,13 +727,13 @@ impl SqlEngine {
                         }
                         continue;
                     }
-                    let mut row_map = decode_row(data);
+                    let mut row_map = decode_row(data)?;
                     for (col, part) in key_cols.iter().zip(key.split('|')) {
                         row_map.insert(col.clone(), part.to_string());
                     }
                     let sel_map = project_row(&row_map, &cols, wildcard);
                     if meta {
-                        let val = String::from_utf8_lossy(&encode_row(&sel_map)).into_owned();
+                        let val = String::from_utf8_lossy(&encode_row(&sel_map)?).into_owned();
                         meta_rows.push((key.clone(), ts, val));
                     } else {
                         out_rows.push(sel_map);
@@ -749,7 +755,7 @@ impl SqlEngine {
                             }
                             break;
                         }
-                        let mut row_map = decode_row(data);
+                        let mut row_map = decode_row(data)?;
                         for (col, part) in key_cols.iter().zip(k.split('|')) {
                             row_map.insert(col.clone(), part.to_string());
                         }
@@ -760,7 +766,7 @@ impl SqlEngine {
                             let sel_map = project_row(&row_map, &cols, wildcard);
                             if meta {
                                 let val =
-                                    String::from_utf8_lossy(&encode_row(&sel_map)).into_owned();
+                                    String::from_utf8_lossy(&encode_row(&sel_map)?).into_owned();
                                 meta_rows.push((k.clone(), ts, val));
                             } else {
                                 out_rows.push(sel_map);
@@ -1112,8 +1118,12 @@ fn extract_partition_key(schema: &TableSchema, cols: &[String], row: &[Expr]) ->
     }
 }
 
-/// Build the full key and encoded row data from an insert row.
-fn build_row(schema: &TableSchema, cols: &[String], row: &[Expr]) -> Option<(String, Vec<u8>)> {
+/// Build the full key and row column map from an insert row.
+fn build_row(
+    schema: &TableSchema,
+    cols: &[String],
+    row: &[Expr],
+) -> Option<(String, BTreeMap<String, String>)> {
     if cols.len() != row.len() {
         return None;
     }
@@ -1127,7 +1137,7 @@ fn build_row(schema: &TableSchema, cols: &[String], row: &[Expr]) -> Option<(Str
             data_map.insert(col.clone(), val);
         }
     }
-    Some((key_parts.join("|"), encode_row(&data_map)))
+    Some((key_parts.join("|"), data_map))
 }
 
 /// Compare two stored values, numerically when both parse as numbers and
