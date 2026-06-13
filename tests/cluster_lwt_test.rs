@@ -79,6 +79,41 @@ async fn execute_lwt_insert_and_update_paths() {
 }
 
 #[tokio::test]
+async fn concurrent_lwt_inserts_apply_exactly_once() {
+    let addr = "http://127.0.0.1:6300";
+    let cluster = Arc::new(build_cluster(1, addr).await);
+    cluster
+        .execute(
+            "CREATE TABLE kv (id TEXT, val TEXT, PRIMARY KEY(id))",
+            false,
+            0,
+        )
+        .await
+        .unwrap();
+
+    // Fire a batch of competing IF NOT EXISTS inserts for the same key in
+    // parallel; the Paxos rounds now fan out to replicas concurrently and
+    // exactly one contender may win.
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let c = cluster.clone();
+        handles.push(tokio::spawn(async move {
+            let sql = format!("INSERT INTO kv (id, val) VALUES ('race','{i}') IF NOT EXISTS");
+            c.execute(&sql, false, 0).await
+        }));
+    }
+    let mut wins = 0usize;
+    for h in handles {
+        if let Ok(Ok(resp)) = h.await
+            && applied(&resp) == Some("true".to_string())
+        {
+            wins += 1;
+        }
+    }
+    assert_eq!(wins, 1, "exactly one concurrent LWT insert may be applied");
+}
+
+#[tokio::test]
 async fn execute_lwt_errors_when_insufficient_replicas() {
     let addr = "http://127.0.0.1:6200";
     let cluster = build_cluster(2, addr).await; // rf=2 but only one node present
