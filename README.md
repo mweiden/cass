@@ -1,47 +1,67 @@
 # Cass
+
 [![Test Status](https://github.com/mweiden/cass/actions/workflows/ci.yml/badge.svg)](https://github.com/mweiden/cass/actions/workflows/ci.yml) [![codecov](https://codecov.io/gh/mweiden/cass/branch/main/graph/badge.svg)](https://codecov.io/gh/mweiden/cass)
 
 Toy/experimental clone of [Apache Cassandra](https://en.wikipedia.org/wiki/Apache_Cassandra) written in Rust, mostly using [OpenAI Codex](https://chatgpt.com/codex).
 
-## Table of Contents
+`cass` is a distributed, horizontally scalable key-value store with a SQL-ish
+query layer. It stores data in a [log-structured merge
+tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree), replicates
+partitions across a gossip-managed ring, and serves queries over gRPC — with
+tunable read consistency, hinted handoff, read repair, and Paxos-style
+lightweight transactions.
+
+## Quickstart
+
+Start a five-node cluster (replication factor 3) with Prometheus, Grafana, and
+Jaeger:
+
+```bash
+docker compose up
+```
+
+Then open a REPL against any node and run some queries:
+
+```bash
+cargo run -- repl http://localhost:8080
+```
+
+```
+> CREATE TABLE orders (customer_id TEXT, order_id TEXT, order_date TEXT, PRIMARY KEY(customer_id, order_id))
+CREATE TABLE 1 table
+> INSERT INTO orders VALUES ('nike', 'abc123', '2025-08-25')
+INSERT 1 row
+> SELECT * FROM orders WHERE customer_id = 'nike'
+  customer_id order_date  order_id
+0 nike        2025-08-25  abc123
+(1 rows)
+```
+
+The cluster exposes nodes on ports `8080`–`8084`, Grafana on
+<http://localhost:3000> (`admin`/`admin`), and Jaeger on
+<http://localhost:16686>.
+
+## Contents
 
 - [Features](#features)
-- [Design tradeoffs](#design-tradeoffs)
-- [Query Syntax](#query-syntax)
-  - [Lightweight Transactions (Compare-and-Set)](#lightweight-transactions-compare-and-set)
+- [Query Syntax](#query-syntax) — [primary keys](#primary-keys), [lightweight transactions](#lightweight-transactions-compare-and-set)
+- [Running Cass](#running-cass) — [install](#install), [server options](#server-options), [storage backends](#storage-backends), [cluster](#running-a-cluster), [maintenance](#maintenance-commands)
+- [How It Works](#how-it-works) — [architecture](#architecture), [module map](#module-map), [design tradeoffs](#design-tradeoffs), [consistency](#consistency-hinted-handoff-and-read-repair)
+- [Operations](#operations) — [monitoring](#monitoring), [tracing](#distributed-tracing)
+- [Benchmarking](#benchmarking) — [performance comparison](#performance-comparison), [flamegraphs](#flamegraph-profiling)
 - [Development](#development)
-  - [Contributing](#contributing)
-- [Storage Backends](#storage-backends)
-  - [Local](#local)
-  - [S3](#s3)
-- [Example / Docker Compose Cluster](#example--docker-compose-cluster)
-- [Consistency, Hinted Handoff, and Read Repair](#consistency-hinted-handoff-and-read-repair)
-- [Maintenance Commands](#maintenance-commands)
-- [Monitoring](#monitoring)
-- [Distributed Tracing](#distributed-tracing)
-  - [Viewing spans with Jaeger](#viewing-spans-with-jaeger)
-- [Performance Benchmarking](#performance-benchmarking)
-- [Flamegraph Profiling](#flamegraph-profiling)
 
 ## Features
 
-- **gRPC API and CLI** for submitting SQL queries
-- **Data Structure:** Stores data in a [log-structured merge tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree)
-- **Storage:** Column-oriented SSTable placeholders with bloom filters and zone maps to speed up queries; persist to local or S3 AWS backends
-- **Durability / Recovery:** Sharded write-ahead logs for durability and in-memory tables for parallel ingestion
+- **gRPC API and CLI** for submitting SQL queries — see [`proto/cass.proto`](proto/cass.proto) for the service definition
+- **Data structure:** stores data in a [log-structured merge tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree)
+- **Storage:** sorted string tables (SSTables) with bloom filters, zone maps, and a sparse index to skip unnecessary reads; persists to local disk or S3
+- **Durability / recovery:** sharded write-ahead logs for durability and in-memory tables for parallel ingestion
 - **Deployment:** Dockerfile and docker-compose for containerized deployment and local testing
-- **Scalability:** Horizontally scalable
-- **Gossip:** Cluster membership and liveness detection via gossip with health checks
-- **Consistency:** Tunable read replica count with hinted handoff and read repair
-- **Lightweight Transactions:** for compare and set operations
-
-## Design tradeoffs
-
-Like Cassandra itself, `cass` is an [AP system](https://en.wikipedia.org/wiki/CAP_theorem):
-
-- **Consistency:** Consistency is relaxed, last-write-wins conflict resolution
-- **Availability:** always writable, tunably consistent, fault-tolerant through replication
-- **Partition tolerance:** will continue to work even if parts of the cluster cannot communicate
+- **Scalability:** horizontally scalable
+- **Gossip:** cluster membership and liveness detection via gossip with health checks
+- **Consistency:** tunable read replica count with hinted handoff and read repair
+- **Lightweight transactions:** for compare-and-set operations
 
 ## Query Syntax
 
@@ -57,15 +77,15 @@ The built-in SQL engine understands a small subset of SQL:
 - Lightweight transactions (compare-and-set):
   - `INSERT ... IF NOT EXISTS`
   - `UPDATE ... IF col = value` (simple equality predicates)
-  - Returns a single row with `[applied]` and, on failure, the current values
-    for the checked columns
+
+### Primary Keys
 
 Note on creating [partition and clustering keys](https://cassandra.apache.org/doc/4.0/cassandra/data_modeling/intro.html#partitions):
 the first column in `PRIMARY KEY(...)` will be the partition key, subsequent columns will be indexed as clustering keys.
 
 So for the example `id` will be the partition key and `c` will be a clustering key:
 
-```
+```sql
 CREATE TABLE t (
    id int,
    c text,
@@ -74,6 +94,9 @@ CREATE TABLE t (
    PRIMARY KEY (id,c)
 );
 ```
+
+The partition key determines which replicas own the row — it is hashed onto the
+[ring](#architecture) to pick the replica set.
 
 ### Lightweight Transactions (Compare-and-Set)
 
@@ -92,6 +115,20 @@ Response shape mirrors Cassandra:
 - On failure: a single row with `[applied] = false` and the current values for
   the columns referenced in the `IF` clause.
 
+```
+> UPDATE orders SET order_date = '2025-08-27'
+    WHERE customer_id = 'nike' AND order_id = 'abc123' IF order_date = '2025-08-25'
+  [applied]
+0 true
+(1 rows)
+
+> UPDATE orders SET order_date = '2025-08-28'
+    WHERE customer_id = 'nike' AND order_id = 'abc123' IF order_date = '2025-08-25'
+  [applied] order_date
+0 false     2025-08-27
+(1 rows)
+```
+
 Consistency for LWT is QUORUM and does not depend on the server's read
 consistency setting. Normal reads continue to use the configured server-level
 read consistency (ONE/QUORUM/ALL via `--read-consistency`).
@@ -102,62 +139,102 @@ Notes:
   of quotes or comments (e.g., `-- comment`). Using the word "if" inside data
   values or identifiers does not trigger LWT behavior.
 
-## Development
+## Running Cass
+
+### Prerequisites
+
+- A recent Rust toolchain (the project uses edition 2024; the Docker build pins
+  1.89). No separate `protoc` install is needed — [`build.rs`](build.rs)
+  vendors it.
+- Docker and Docker Compose, for the example cluster and the benchmark harness.
+
+### Install
+
+Build and run straight from the repo:
 
 ```bash
-cargo test            # run unit tests
-cargo run -- server  # start the gRPC server on port 8080
-cargo run -- server --read-consistency one  # only one healthy replica required for reads
+cargo run -- server          # start the gRPC server on port 8080
 ```
 
-### Contributing
-
-Before submitting changes, ensure the code is formatted and tests pass:
+Or install the `cass` binary onto your `PATH`, which is what the rest of this
+README assumes when it writes `cass ...`:
 
 ```bash
-cargo fmt
-cargo test
+cargo install --path .
 ```
 
-The project uses idiomatic Rust patterns with small, focused functions. See the
-module-level comments in `src/` for a high-level overview of the architecture.
+### Server Options
 
-## Storage Backends
+```
+$ cass server --help
+Start the gRPC server
+
+Usage: cass server [OPTIONS]
+
+Options:
+      --storage <STORAGE>         [default: local] [possible values: local, s3]
+      --data-dir <DATA_DIR>       [default: /tmp/cass-data]
+      --bucket <BUCKET>
+      --node-addr <NODE_ADDR>     [default: http://127.0.0.1:8080]
+      --peer <PEER>
+      --rf <RF>                   [default: 1]
+      --vnodes <VNODES>           [default: 8]
+      --read-consistency <READ_CONSISTENCY>
+          Server-level read consistency: ONE, QUORUM, ALL [possible values: one, quorum, all]
+      --commitlog-sync-period-ms <COMMITLOG_SYNC_PERIOD_MS>
+          Periodic commitlog fsync interval in milliseconds (0 for immediate flushes) [default: 10000]
+```
+
+- `--node-addr` is this node's own address; its port also determines the
+  [metrics port](#monitoring).
+- `--peer` is repeated once per other node in the cluster.
+- `--rf` is the replication factor and `--vnodes` the number of virtual nodes
+  this node claims on the ring.
+- `--read-consistency` defaults to QUORUM and, despite the name, sets the
+  level for writes as well as reads. It must be satisfiable by the number of
+  healthy replicas or queries fail — see [Running a
+  Cluster](#running-a-cluster).
+
+The other subcommands are `cass repl <nodes...>`, `cass flush <node>`, and
+`cass panic <node>` — see [Maintenance Commands](#maintenance-commands).
+
+### Storage Backends
 
 The server supports both local filesystem storage and Amazon S3.
 
-### Local
+#### Local
 
 Local storage is the default. Specify a directory with `--data-dir`:
 
 ```bash
-cargo run -- --data-dir ./data
+cass server --data-dir ./data
 ```
 
-### S3
+#### S3
 
 To use S3, set AWS credentials in the environment and provide the bucket
 name:
 
 ```bash
-AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-  cargo run -- --storage s3 --bucket my-bucket
+AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1 \
+  cass server --storage s3 --bucket my-bucket
 ```
 
-`AWS_REGION` controls the region (default `us-east-1`).
+The region is read from `AWS_REGION`. Set `AWS_ENDPOINT` as well to point at an
+S3-compatible service such as MinIO or LocalStack.
 
+### Running a Cluster
 
-## Example / Docker Compose Cluster
-
-With the server running you can insert and query data using gRPC. The provided `docker-compose.yml` starts a five-node cluster using local
-storage with a replication factor of three where you can try this out.
-
-Start the cluster:
+The provided [`docker-compose.yml`](docker-compose.yml) starts a five-node
+cluster using local storage with a replication factor of three, alongside
+Prometheus, Grafana, and Jaeger:
 
 ```bash
 docker compose up
 ```
-Connect using the built-in REPL and run some queries:
+
+Nodes are published on `8080`, `8081`, `8082`, `8083`, and `8084`. Connect with
+the built-in REPL and run some queries:
 
 ```bash
 $ cass repl http://localhost:8080
@@ -181,32 +258,125 @@ INSERT 1 row
   customer_id order_date  order_id
 0 nike        2025-08-25  abc123
 (1 rows)
-
-# Check-and-set (lightweight transaction) examples
-> UPDATE orders SET order_date = '2025-08-27'
-    WHERE customer_id = 'nike' AND order_id = 'abc123' IF order_date = '2025-08-25'
-  [applied]
-0 true
-(1 rows)
-
-> UPDATE orders SET order_date = '2025-08-28'
-    WHERE customer_id = 'nike' AND order_id = 'abc123' IF order_date = '2025-08-25'
-  [applied] order_date
-0 false     2025-08-27
-(1 rows)
 ```
 
-## Consistency, Hinted Handoff, and Read Repair
+To build a cluster by hand, give each node its own address, data directory, and
+the list of its peers. Start all `--rf` nodes — each in its own terminal:
+
+```bash
+# terminal 1
+cass server --node-addr http://127.0.0.1:8080 \
+  --peer http://127.0.0.1:8081 --peer http://127.0.0.1:8082 \
+  --rf 3 --data-dir ./data1
+```
+
+```bash
+# terminal 2
+cass server --node-addr http://127.0.0.1:8081 \
+  --peer http://127.0.0.1:8080 --peer http://127.0.0.1:8082 \
+  --rf 3 --data-dir ./data2
+```
+
+```bash
+# terminal 3
+cass server --node-addr http://127.0.0.1:8082 \
+  --peer http://127.0.0.1:8080 --peer http://127.0.0.1:8081 \
+  --rf 3 --data-dir ./data3
+```
+
+Consistency defaults to QUORUM and applies to both reads and writes, so with
+`--rf 3` at least two of the three nodes must be healthy before either will
+succeed; below that the coordinator fails the query with "not enough healthy
+replicas". A single node started with `--rf 3` therefore cannot serve traffic at
+all — for a one-node setup use the default `--rf 1`, or pass
+`--read-consistency one`.
+
+### Maintenance Commands
+
+The CLI exposes helper commands useful during testing:
+
+- `cass flush <node>` instructs the specified node to broadcast a flush to all
+  peers.
+- `cass panic <node>` forces the target node to report itself as unhealthy for
+  60 seconds — handy for observing [hinted handoff and read
+  repair](#consistency-hinted-handoff-and-read-repair).
+
+## How It Works
+
+### Architecture
+
+Every node is both a coordinator and a replica. A query follows this path:
+
+```
+client ──gRPC Query──▶ coordinator node
+                         │
+                         │  parse SQL, hash the partition key (Murmur3)
+                         │  walk the ring to pick `rf` replicas
+                         │
+                         ├──gRPC Internal──▶ replica 1 ─┐
+                         ├──gRPC Internal──▶ replica 2 ─┤ WAL ▸ memtable ▸ SSTable
+                         └──gRPC Internal──▶ replica 3 ─┘
+```
+
+**The ring.** Each node claims `--vnodes` virtual nodes, each hashed to a token
+on a 32-bit Murmur3 ring. A row's partition key is hashed to a token, and the
+ring is walked clockwise to collect `--rf` distinct nodes — that is the
+partition's replica set.
+
+**Writes.** A write is appended to the node's write-ahead log, then applied to
+the in-memory memtable. When the memtable exceeds its size threshold (128 MB by
+default) it is flushed to an immutable SSTable and the WAL is truncated. The
+commitlog fsyncs on the interval set by `--commitlog-sync-period-ms`.
+
+**Reads.** A local read checks the memtable first, then SSTables newest-first.
+Each SSTable is gated by a zone map (min/max key) and a bloom filter before
+being touched at all, and a sparse index (one entry every 16 keys) narrows the
+scan. Across the cluster, the coordinator gathers from the replicas required by
+the consistency level and merges by last-write-wins on timestamp.
+
+**Liveness.** Each node round-robins a health probe to one peer per second; a
+peer counts as alive if it answered within the last 8 seconds.
+
+### Module Map
+
+| Module | Responsibility |
+| --- | --- |
+| [`src/main.rs`](src/main.rs) | CLI (`server`, `repl`, `flush`, `panic`), gRPC service, metrics endpoint |
+| [`src/lib.rs`](src/lib.rs) | `Database` — ties the WAL, memtable, and SSTables together |
+| [`src/cluster.rs`](src/cluster.rs) | Ring, coordinator, replication, gossip, hinted handoff, read repair, LWT/Paxos |
+| [`src/query.rs`](src/query.rs) | SQL parsing and execution |
+| [`src/schema.rs`](src/schema.rs) | Table schemas, partition and clustering keys |
+| [`src/wal.rs`](src/wal.rs) | Write-ahead log |
+| [`src/memtable.rs`](src/memtable.rs) | In-memory write buffer |
+| [`src/sstable.rs`](src/sstable.rs) | On-disk sorted string tables and sparse index |
+| [`src/bloom.rs`](src/bloom.rs) | Bloom filters over SSTable keys |
+| [`src/zonemap.rs`](src/zonemap.rs) | Min/max key summaries for coarse SSTable filtering |
+| [`src/storage/`](src/storage) | `Storage` trait with local filesystem and S3 backends |
+| [`src/telemetry.rs`](src/telemetry.rs) | OpenTelemetry setup and gRPC context propagation |
+| [`proto/cass.proto`](proto/cass.proto) | gRPC service definition |
+
+Integration tests in [`tests/`](tests) double as worked examples of most of
+these subsystems.
+
+### Design Tradeoffs
+
+Like Cassandra itself, `cass` is an [AP system](https://en.wikipedia.org/wiki/CAP_theorem):
+
+- **Consistency:** consistency is relaxed, last-write-wins conflict resolution
+- **Availability:** always writable, tunably consistent, fault-tolerant through replication
+- **Partition tolerance:** will continue to work even if parts of the cluster cannot communicate
+
+### Consistency, Hinted Handoff, and Read Repair
 
 Cass uses a coordinator-per-request model similar to Cassandra. Each statement
 is routed to the partition's replicas using a Murmur3-based ring. The
 coordinator enforces consistency and repairs divergence opportunistically:
 
- - Read consistency: configured per server with `--read-consistency {one|quorum|all}`.
-   If there are not enough healthy replicas for the chosen level, the read fails.
+- Read consistency: configured per server with `--read-consistency {one|quorum|all}`.
+  If there are not enough healthy replicas for the chosen level, the read fails.
 
 - Hinted handoff: if a write targets replicas that are currently unhealthy, the
-  coordinator writes to the healthy replicas and stores a “hint” for each
+  coordinator writes to the healthy replicas and stores a "hint" for each
   unreachable replica (original SQL and timestamp). When a replica becomes
   healthy again, the coordinator replays the hints to bring it up to date. Hints
   are in-memory and best-effort (non-durable across coordinator restarts).
@@ -220,16 +390,9 @@ coordinator enforces consistency and repairs divergence opportunistically:
 Tip: you can use `cass panic <node>` to temporarily mark a node as unhealthy and
 observe hinted handoff and subsequent repair behavior when it recovers.
 
-## Maintenance Commands
+## Operations
 
-The CLI exposes helper commands useful during testing:
-
-- `cass flush <node>` instructs the specified node to broadcast a flush to all
-  peers.
-- `cass panic <node>` forces the target node to report itself as unhealthy for
-  60 seconds.
-
-## Monitoring
+### Monitoring
 
 Each node exposes Prometheus metrics on the gRPC port plus 1000 at
 `/metrics` (for example, if the server listens on `8080`, metrics are
@@ -247,9 +410,9 @@ counts, peer health, RAM and CPU usage, and SSTable disk usage.
 
 There is also a preconfigured dashboard with basic metrics from all instances. Screenshot below:
 
-<img width="1257" height="821" alt="Screenshot 2025-08-17 at 11 48 28 PM" src="https://github.com/user-attachments/assets/cbaf71aa-c726-4c6a-a1eb-422060aecd0a" />
+<img width="1257" height="821" alt="Screenshot 2025-08-17 at 11 48 28 PM" src="https://github.com/user-attachments/assets/cbaf71aa-c726-4c6a-a1eb-422060aecd0a" />
 
-## Distributed Tracing
+### Distributed Tracing
 
 `cass` emits OpenTelemetry spans for every gRPC request, coordinator hop, and
 lightweight-transaction phase. Spans are exported via OTLP/gRPC to the endpoint
@@ -261,14 +424,17 @@ Each process also honours the standard OpenTelemetry metadata:
 - `OTEL_SERVICE_INSTANCE_ID` – a per-process identifier (defaults to the gRPC
   listen address when running `cass server`).
 
+Set `CASS_DISABLE_TRACING=1` to turn span export off entirely — the benchmark
+harness does this to avoid export overhead.
+
 Clients (`cass flush`, `cass panic`, `cass repl`, and the `CassClient`
 helpers) automatically propagate the current span context through gRPC metadata
 so child spans on downstream nodes appear under the correct parent in your
 tracing backend.
 
-### Viewing spans with Jaeger
+#### Viewing spans with Jaeger
 
-The bundled `docker-compose.yml` now includes a Jaeger all-in-one deployment.
+The bundled `docker-compose.yml` includes a Jaeger all-in-one deployment.
 Start the full stack with:
 
 ```bash
@@ -287,7 +453,7 @@ To run the server outside of Docker, point it at any OTLP collector:
 OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4317 \
 OTEL_SERVICE_NAME=cass-dev \
 OTEL_SERVICE_INSTANCE_ID=dev-node-1 \
-cargo run -- server --node-addr http://127.0.0.1:8080
+cass server --node-addr http://127.0.0.1:8080
 ```
 
 Then launch Jaeger separately if desired:
@@ -300,15 +466,31 @@ Once the server starts handling requests (for example via `cass repl`), spans
 will appear in Jaeger with parent/child relationships that follow the full
 replication and LWT flow across nodes.
 
-## Performance Benchmarking
+## Benchmarking
 
-The repository includes a simple harness for comparing write and read throughput of `cass` against a reference Apache Cassandra node.
+### Performance Comparison
+
+The repository includes a harness for comparing write and read throughput of
+`cass` against Apache Cassandra.
 
 ```bash
 scripts/perf_compare.sh         # runs both databases and stores metrics in ./perf-results
 ```
 
-The script starts a three-node `cass` cluster and uses the example program `perf_client` to drive load. Metrics from the first `cass` node and `nodetool` statistics from Cassandra are written to the `perf-results` directory for analysis.
+The script starts the five-node `cass` cluster from `docker-compose.yml` and a
+five-node Apache Cassandra cluster in Docker, then drives load against both with
+the [`perf_client`](examples/perf_client.rs) example at a range of thread
+counts. Metrics from the first `cass` node and `nodetool` statistics from
+Cassandra are written to the `perf-results` directory, and a comparison plot is
+rendered with the [`plot_perf`](examples/plot_perf.rs) example.
+
+Tunables:
+
+- `--cass-only` — skip the Cassandra phase and only collect `cass` metrics,
+  reusing existing `cassandra_*` logs in `$OUTDIR`.
+- Env vars: `OPS` (default `5000`), `THREADS_SET` (default `1 2 4 8 16 32 64`),
+  `OUTDIR` (default `perf-results`), `CASS_NODE` (default
+  `http://localhost:8080`).
 
 Current results (in comparison to Cassandra):
 
@@ -316,8 +498,7 @@ Current results (in comparison to Cassandra):
 
 _5 nodes, replication factor 3, read consistency QUORUM, x axis is number of threads querying_
 
-
-## Flamegraph Profiling
+### Flamegraph Profiling
 
 Generate a CPU flamegraph for the query endpoint with a one-shot helper that runs the server under `cargo flamegraph` and drives load via the example perf client:
 
@@ -336,3 +517,28 @@ Current flamegraph for simple reads and writes:
 ![Flamegraph](perf-results/query_flamegraph.svg)
 
 _Single node_
+
+## Development
+
+```bash
+cargo test                                   # run unit and integration tests
+cargo run -- server                          # start the gRPC server on port 8080
+cargo run -- server --read-consistency one   # only one healthy replica required for reads
+cargo bench                                  # run the lookup benchmark
+```
+
+`scripts/ci_scale_test.sh` runs the same two-node smoke test that CI does.
+
+### Contributing
+
+Before submitting changes, ensure the code is formatted and tests pass:
+
+```bash
+cargo fmt
+cargo test
+```
+
+The project uses idiomatic Rust patterns with small, focused functions. See the
+[module map](#module-map) and the module-level comments in `src/` for a
+high-level overview of the architecture. [`AGENTS.md`](AGENTS.md) documents
+repository conventions in more detail.
