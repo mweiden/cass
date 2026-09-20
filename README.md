@@ -190,6 +190,10 @@ Options:
 - `--peer` is repeated once per other node in the cluster.
 - `--rf` is the replication factor and `--vnodes` the number of virtual nodes
   this node claims on the ring.
+- `--read-consistency` defaults to QUORUM and, despite the name, sets the
+  level for writes as well as reads. It must be satisfiable by the number of
+  healthy replicas or queries fail — see [Running a
+  Cluster](#running-a-cluster).
 
 The other subcommands are `cass repl <nodes...>`, `cass flush <node>`, and
 `cass panic <node>` — see [Maintenance Commands](#maintenance-commands).
@@ -256,14 +260,36 @@ INSERT 1 row
 (1 rows)
 ```
 
-To build a cluster by hand, give each node its own address and list the others
-as peers:
+To build a cluster by hand, give each node its own address, data directory, and
+the list of its peers. Start all `--rf` nodes — each in its own terminal:
 
 ```bash
+# terminal 1
 cass server --node-addr http://127.0.0.1:8080 \
   --peer http://127.0.0.1:8081 --peer http://127.0.0.1:8082 \
   --rf 3 --data-dir ./data1
 ```
+
+```bash
+# terminal 2
+cass server --node-addr http://127.0.0.1:8081 \
+  --peer http://127.0.0.1:8080 --peer http://127.0.0.1:8082 \
+  --rf 3 --data-dir ./data2
+```
+
+```bash
+# terminal 3
+cass server --node-addr http://127.0.0.1:8082 \
+  --peer http://127.0.0.1:8080 --peer http://127.0.0.1:8081 \
+  --rf 3 --data-dir ./data3
+```
+
+Consistency defaults to QUORUM and applies to both reads and writes, so with
+`--rf 3` at least two of the three nodes must be healthy before either will
+succeed; below that the coordinator fails the query with "not enough healthy
+replicas". A single node started with `--rf 3` therefore cannot serve traffic at
+all — for a one-node setup use the default `--rf 1`, or pass
+`--read-consistency one`.
 
 ### Maintenance Commands
 
