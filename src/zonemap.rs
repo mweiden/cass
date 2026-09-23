@@ -41,6 +41,21 @@ impl ZoneMap {
         }
     }
 
+    /// Return `true` if any key starting with `prefix` could lie within the
+    /// stored bounds. When bounds are missing the function defaults to
+    /// `true` so as not to filter out potential matches.
+    pub fn may_contain_prefix(&self, prefix: &str) -> bool {
+        match (self.min.as_deref(), self.max.as_deref()) {
+            (Some(min), Some(max)) => {
+                // Keys with `prefix` form the interval [prefix, succ(prefix)).
+                // They cannot exist if every key sorts below the prefix, or
+                // if the smallest key already sorts past the whole interval.
+                !(max < prefix || (min > prefix && !min.starts_with(prefix)))
+            }
+            _ => true,
+        }
+    }
+
     /// Convert the zone map into a protobuf message.
     pub fn to_proto(&self) -> ZoneMapProto {
         ZoneMapProto {
