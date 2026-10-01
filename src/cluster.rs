@@ -476,12 +476,11 @@ impl Cluster {
 
     /// Execute `sql` against the appropriate replicas.
     ///
-    /// When `forwarded` is false the current node acts as the coordinator
-    /// and forwards the statement to the replica nodes determined by the
-    /// partition key.  Results from all replicas are unioned together and
-    /// returned to the caller.  When `forwarded` is true the query is being
-    /// handled on behalf of a peer and is executed locally without further
-    /// replication.
+    /// When `forwarded` is false, the current node coordinates the request and
+    /// routes it to replicas selected by the partition key. For non-broadcast
+    /// reads, only successful replies count toward consistency; errors cannot
+    /// override the result after enough replies succeed. When `forwarded` is
+    /// true, the query is executed locally without further replication.
     #[instrument(
         skip(self, sql),
         fields(
@@ -564,7 +563,15 @@ impl Cluster {
                 unhealthy,
             )
             .await?;
-        self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta)
+        // The quorum above counted only successful replies; errors from other
+        // replicas must not override an empty merged result.
+        self.merge_results(
+            results
+                .into_iter()
+                .filter_map(|(_, result)| result.ok().map(Ok))
+                .collect(),
+            meta,
+        )
     }
 
     #[instrument(
