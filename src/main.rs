@@ -545,10 +545,14 @@ mod scan_read_tests {
         time::Duration,
     };
     use tempfile::TempDir;
-    use tokio::{sync::oneshot, time::timeout};
+    use tokio::{
+        sync::{Semaphore, oneshot},
+        time::timeout,
+    };
     use tonic::transport::{Channel, Server};
 
     const SELECT_ORDERS: &str = "SELECT * FROM orders WHERE customer_id = 'nike'";
+    const SELECT_MISSING_ORDERS: &str = "SELECT * FROM orders WHERE customer_id = 'adidas'";
     const COUNT_ORDERS: &str = "SELECT COUNT(*) FROM orders WHERE customer_id = 'nike'";
     const SSTABLE_WITH_NEWER_ROWS: &str = "sstable_2.tbl";
     const INJECTED_READ_ERROR: &str = "injected SSTable read failure";
@@ -559,6 +563,7 @@ mod scan_read_tests {
         fail_reads: AtomicBool,
         failed_reads: AtomicUsize,
         successful_data_reads: AtomicUsize,
+        data_read_gate: std::sync::Mutex<Option<Arc<Semaphore>>>,
     }
 
     impl FailingStorage {
@@ -569,6 +574,7 @@ mod scan_read_tests {
                 fail_reads: AtomicBool::new(false),
                 failed_reads: AtomicUsize::new(0),
                 successful_data_reads: AtomicUsize::new(0),
+                data_read_gate: std::sync::Mutex::new(None),
             }
         }
 
@@ -587,6 +593,10 @@ mod scan_read_tests {
         fn successful_data_read_count(&self) -> usize {
             self.successful_data_reads.load(Ordering::SeqCst)
         }
+
+        fn gate_data_reads(&self, gate: Arc<Semaphore>) {
+            *self.data_read_gate.lock().unwrap() = Some(gate);
+        }
     }
 
     #[async_trait]
@@ -597,9 +607,16 @@ mod scan_read_tests {
 
         async fn get(&self, path: &str) -> Result<Vec<u8>, StorageError> {
             if path == self.failed_path {
+                let gate = self.data_read_gate.lock().unwrap().clone();
                 if self.fail_reads.load(Ordering::SeqCst) {
                     self.failed_reads.fetch_add(1, Ordering::SeqCst);
+                    if let Some(gate) = &gate {
+                        gate.add_permits(2);
+                    }
                     return Err(StorageError::Io(io::Error::other(INJECTED_READ_ERROR)));
+                }
+                if let Some(gate) = gate {
+                    gate.acquire().await.expect("read gate closed").forget();
                 }
                 self.successful_data_reads.fetch_add(1, Ordering::SeqCst);
             }
@@ -1033,6 +1050,78 @@ mod scan_read_tests {
         assert!(
             error.message().contains(INJECTED_READ_ERROR),
             "the remaining failed replica did not expose its storage error"
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_returns_empty_rows_after_one_failed_and_two_complete_empty_scans() {
+        let replicas = start_replicas(2).await;
+        let request = QueryRequest {
+            sql: SELECT_MISSING_ORDERS.to_string(),
+            ts: 0,
+        };
+
+        for replica in &replicas {
+            let mut client = connect(&replica.uri).await;
+            let response = client.internal(request.clone()).await.unwrap().into_inner();
+            assert!(
+                response.payload.is_none(),
+                "an absent partition should have an empty internal result"
+            );
+        }
+
+        let gate = Arc::new(Semaphore::new(0));
+        replicas[0].storage.gate_data_reads(gate.clone());
+        replicas[1].storage.gate_data_reads(gate.clone());
+        replicas[2].storage.gate_data_reads(gate.clone());
+        replicas[2].storage.fail_reads();
+
+        let faulted_reads_before = replicas[2].storage.failed_read_count();
+        let intact_reads_before = [
+            replicas[0].storage.successful_data_read_count(),
+            replicas[1].storage.successful_data_read_count(),
+        ];
+        let mut coordinator = connect(&replicas[2].uri).await;
+        let response = timeout(Duration::from_secs(5), coordinator.query(request.clone()))
+            .await
+            .expect("QUORUM query stalled with two held SSTable reads");
+
+        assert!(
+            replicas[2].storage.failed_read_count() > faulted_reads_before,
+            "the coordinator replica did not reach the injected SSTable failure"
+        );
+        assert!(
+            replicas[0].storage.successful_data_read_count() > intact_reads_before[0],
+            "the first intact replica did not complete its SSTable scan"
+        );
+        assert!(
+            replicas[1].storage.successful_data_read_count() > intact_reads_before[1],
+            "the second intact replica did not complete its SSTable scan"
+        );
+
+        let response = match response {
+            Ok(response) => response.into_inner(),
+            Err(status) if status.message().contains(INJECTED_READ_ERROR) => {
+                panic!(
+                    "QUORUM returned an error after two complete empty scans and one failed scan: {}",
+                    status.message()
+                );
+            }
+            Err(status) => panic!("unexpected QUORUM query error: {}", status.message()),
+        };
+        assert!(
+            matches!(
+                response.payload,
+                Some(query_response::Payload::Rows(rows)) if rows.rows.is_empty()
+            ),
+            "QUORUM returned something other than an empty row set for an absent partition"
+        );
+
+        let mut failed_replica = connect(&replicas[2].uri).await;
+        let error = failed_replica.internal(request).await.unwrap_err();
+        assert!(
+            error.message().contains(INJECTED_READ_ERROR),
+            "the failed replica did not report the source storage error"
         );
     }
 }
