@@ -526,3 +526,513 @@ async fn repl(nodes: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
+
+#[cfg(test)]
+mod scan_read_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use cass::{
+        query::{QueryOutput, SqlEngine},
+        schema::encode_row,
+        storage::{StorageError, local::LocalStorage},
+    };
+    use std::{
+        collections::BTreeMap,
+        io,
+        net::{SocketAddr, TcpListener},
+        path::Path,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        time::Duration,
+    };
+    use tempfile::TempDir;
+    use tokio::{sync::oneshot, time::timeout};
+    use tonic::transport::{Channel, Server};
+
+    const SELECT_ORDERS: &str = "SELECT * FROM orders WHERE customer_id = 'nike'";
+    const COUNT_ORDERS: &str = "SELECT COUNT(*) FROM orders WHERE customer_id = 'nike'";
+    const SSTABLE_WITH_NEWER_ROWS: &str = "sstable_2.tbl";
+    const INJECTED_READ_ERROR: &str = "injected SSTable read failure";
+
+    struct FailingStorage {
+        inner: LocalStorage,
+        failed_path: &'static str,
+        fail_reads: AtomicBool,
+        failed_reads: AtomicUsize,
+        successful_data_reads: AtomicUsize,
+    }
+
+    impl FailingStorage {
+        fn new(path: &Path) -> Self {
+            Self {
+                inner: LocalStorage::new(path),
+                failed_path: SSTABLE_WITH_NEWER_ROWS,
+                fail_reads: AtomicBool::new(false),
+                failed_reads: AtomicUsize::new(0),
+                successful_data_reads: AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_reads(&self) {
+            self.fail_reads.store(true, Ordering::SeqCst);
+        }
+
+        fn allow_reads(&self) {
+            self.fail_reads.store(false, Ordering::SeqCst);
+        }
+
+        fn failed_read_count(&self) -> usize {
+            self.failed_reads.load(Ordering::SeqCst)
+        }
+
+        fn successful_data_read_count(&self) -> usize {
+            self.successful_data_reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl Storage for FailingStorage {
+        async fn put(&self, path: &str, data: Vec<u8>) -> Result<(), StorageError> {
+            self.inner.put(path, data).await
+        }
+
+        async fn get(&self, path: &str) -> Result<Vec<u8>, StorageError> {
+            if path == self.failed_path {
+                if self.fail_reads.load(Ordering::SeqCst) {
+                    self.failed_reads.fetch_add(1, Ordering::SeqCst);
+                    return Err(StorageError::Io(io::Error::other(INJECTED_READ_ERROR)));
+                }
+                self.successful_data_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.get(path).await
+        }
+
+        async fn append(&self, path: &str, data: &[u8]) -> Result<(), StorageError> {
+            self.inner.append(path, data).await
+        }
+
+        fn local_path(&self) -> Option<&Path> {
+            self.inner.local_path()
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+            self.inner.list(prefix).await
+        }
+    }
+
+    async fn seed_storage(storage: Arc<FailingStorage>) -> Arc<Database> {
+        let db = Arc::new(Database::new(storage.clone(), "wal.log").await.unwrap());
+        let engine = SqlEngine::new();
+        engine
+            .execute_with_ts(
+                &db,
+                "CREATE TABLE orders (customer_id TEXT, order_id TEXT, order_date TEXT, PRIMARY KEY(customer_id, order_id))",
+                0,
+                false,
+            )
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+
+        engine
+            .execute_with_ts(
+                &db,
+                "INSERT INTO orders VALUES ('nike','aaa','first'), ('nike','abc123','old'), ('nike','gone','present'), ('nike','memover','old')",
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+
+        engine
+            .execute_with_ts(
+                &db,
+                "UPDATE orders SET order_date = 'new' WHERE customer_id = 'nike' AND order_id = 'abc123'",
+                2,
+                false,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute_with_ts(
+                &db,
+                "DELETE FROM orders WHERE customer_id = 'nike' AND order_id = 'gone'",
+                3,
+                false,
+            )
+            .await
+            .unwrap();
+        engine
+            .execute_with_ts(
+                &db,
+                "UPDATE orders SET order_date = 'disk' WHERE customer_id = 'nike' AND order_id = 'memover'",
+                4,
+                false,
+            )
+            .await
+            .unwrap();
+        db.flush().await.unwrap();
+
+        let files = storage.list("sstable_").await.unwrap();
+        assert!(files.iter().any(|file| file == SSTABLE_WITH_NEWER_ROWS));
+        db
+    }
+
+    async fn add_memtable_overlay(db: &Database) {
+        let overwritten = BTreeMap::from([("order_date".to_string(), "memtable".to_string())]);
+        db.insert_ns_ts(
+            "orders",
+            "nike|memover".to_string(),
+            encode_row(&overwritten),
+            5,
+        )
+        .await
+        .unwrap();
+
+        let inserted = BTreeMap::from([("order_date".to_string(), "last".to_string())]);
+        db.insert_ns_ts("orders", "nike|zzz".to_string(), encode_row(&inserted), 6)
+            .await
+            .unwrap();
+        db.sync_wal().await.unwrap();
+    }
+
+    fn result_rows(output: QueryOutput) -> Vec<BTreeMap<String, String>> {
+        match output {
+            QueryOutput::Rows(rows) => rows,
+            _ => panic!("expected row result"),
+        }
+    }
+
+    fn response_rows(response: &QueryResponse) -> Option<Vec<(String, String)>> {
+        let Some(query_response::Payload::Rows(rows)) = response.payload.as_ref() else {
+            return None;
+        };
+        Some(
+            rows.rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.columns.get("order_id").cloned().unwrap_or_default(),
+                        row.columns.get("order_date").cloned().unwrap_or_default(),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn row_pairs(rows: &[BTreeMap<String, String>]) -> Vec<(String, String)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.get("order_id").cloned().unwrap_or_default(),
+                    row.get("order_date").cloned().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_complete_rows(rows: Vec<BTreeMap<String, String>>) {
+        assert_eq!(
+            row_pairs(&rows),
+            vec![
+                ("aaa".to_string(), "first".to_string()),
+                ("abc123".to_string(), "new".to_string()),
+                ("memover".to_string(), "memtable".to_string()),
+                ("zzz".to_string(), "last".to_string()),
+            ],
+            "successful scans must preserve key ordering, newest values, tombstones, and memtable overlay"
+        );
+    }
+
+    fn free_addresses(count: usize) -> Vec<SocketAddr> {
+        let mut addresses = Vec::with_capacity(count);
+        while addresses.len() < count {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+        addresses
+    }
+
+    struct RunningServer {
+        uri: String,
+        shutdown: Option<oneshot::Sender<()>>,
+    }
+
+    impl Drop for RunningServer {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
+    }
+
+    async fn connect(uri: &str) -> CassClient<Channel> {
+        let uri = uri.to_string();
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(client) = CassClient::connect(uri.clone()).await {
+                    return client;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("gRPC server did not become ready")
+    }
+
+    async fn start_server(address: SocketAddr, cluster: Arc<Cluster>) -> RunningServer {
+        let (shutdown, shutdown_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(CassServer::new(CassService { cluster }))
+                .serve_with_shutdown(address, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+
+        let server = RunningServer {
+            uri: format!("http://{address}"),
+            shutdown: Some(shutdown),
+        };
+        drop(connect(&server.uri).await);
+        server
+    }
+
+    struct Replica {
+        _dir: TempDir,
+        storage: Arc<FailingStorage>,
+        cluster: Arc<Cluster>,
+        address: SocketAddr,
+        uri: String,
+        server: Option<RunningServer>,
+    }
+
+    async fn start_replicas(read_consistency: usize) -> Vec<Replica> {
+        let addresses = free_addresses(3);
+        let uris: Vec<String> = addresses
+            .iter()
+            .map(|address| format!("http://{address}"))
+            .collect();
+        let mut replicas = Vec::with_capacity(addresses.len());
+        for (index, address) in addresses.iter().copied().enumerate() {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Arc::new(FailingStorage::new(dir.path()));
+            let seeded = seed_storage(storage.clone()).await;
+            add_memtable_overlay(&seeded).await;
+            let db = Arc::new(Database::new(storage.clone(), "wal.log").await.unwrap());
+            let peers = uris
+                .iter()
+                .enumerate()
+                .filter_map(|(peer_index, uri)| (peer_index != index).then_some(uri.clone()))
+                .collect();
+            let cluster = Arc::new(Cluster::new(
+                db.clone(),
+                uris[index].clone(),
+                peers,
+                1,
+                3,
+                read_consistency,
+            ));
+            replicas.push(Replica {
+                _dir: dir,
+                storage,
+                cluster,
+                address,
+                uri: uris[index].clone(),
+                server: None,
+            });
+        }
+
+        for index in 0..replicas.len() {
+            let address = replicas[index].address;
+            let cluster = replicas[index].cluster.clone();
+            replicas[index].server = Some(start_server(address, cluster).await);
+        }
+
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let mut all_healthy = true;
+                for replica in &replicas {
+                    for uri in &uris {
+                        if !replica.cluster.is_alive(uri).await {
+                            all_healthy = false;
+                        }
+                    }
+                }
+                if all_healthy {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("replica cluster did not become healthy");
+
+        replicas
+    }
+
+    fn request() -> QueryRequest {
+        QueryRequest {
+            sql: SELECT_ORDERS.to_string(),
+            ts: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn one_replica_query_does_not_return_partial_rows_after_sstable_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FailingStorage::new(dir.path()));
+        let healthy_db = seed_storage(storage.clone()).await;
+        add_memtable_overlay(&healthy_db).await;
+
+        let healthy_address = free_addresses(1)[0];
+        let healthy_cluster = Arc::new(Cluster::new(
+            healthy_db,
+            format!("http://{healthy_address}"),
+            Vec::new(),
+            1,
+            1,
+            1,
+        ));
+        let healthy_server = start_server(healthy_address, healthy_cluster).await;
+        let mut healthy_client = connect(&healthy_server.uri).await;
+        let response = healthy_client.query(request()).await.unwrap().into_inner();
+        assert_complete_rows(result_rows(match response.payload {
+            Some(query_response::Payload::Rows(rows)) => QueryOutput::Rows(
+                rows.rows
+                    .into_iter()
+                    .map(|row| row.columns.into_iter().collect())
+                    .collect(),
+            ),
+            _ => panic!("expected rows from a complete scan"),
+        }));
+        let count = healthy_client
+            .query(QueryRequest {
+                sql: COUNT_ORDERS.to_string(),
+                ts: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let Some(query_response::Payload::Rows(rows)) = count.payload else {
+            panic!("expected COUNT result");
+        };
+        assert_eq!(rows.rows[0].columns.get("count"), Some(&"4".to_string()));
+        drop(healthy_server);
+
+        // Reopen after the healthy query so this Database instance has no cached
+        // schema; its schema must still be loaded from the older SSTable.
+        let db = Arc::new(Database::new(storage.clone(), "wal.log").await.unwrap());
+        let address = free_addresses(1)[0];
+        let cluster = Arc::new(Cluster::new(
+            db.clone(),
+            format!("http://{address}"),
+            Vec::new(),
+            1,
+            1,
+            1,
+        ));
+        let server = start_server(address, cluster).await;
+        let mut client = connect(&server.uri).await;
+        storage.fail_reads();
+
+        let response = client.query(request()).await;
+        assert!(
+            storage.failed_read_count() > 0,
+            "the injected SSTable read error was not reached"
+        );
+        let observed = response
+            .as_ref()
+            .ok()
+            .and_then(|response| response_rows(response.get_ref()));
+        assert!(
+            response.is_err(),
+            "partial-key SELECT returned a successful response after an injected SSTable read error: {observed:?}"
+        );
+        let count = client
+            .query(QueryRequest {
+                sql: COUNT_ORDERS.to_string(),
+                ts: 0,
+            })
+            .await;
+        assert!(
+            count.is_err(),
+            "COUNT returned after an injected SSTable read error"
+        );
+
+        let internal_error = client.internal(request()).await.unwrap_err();
+        assert!(
+            internal_error.message().contains(INJECTED_READ_ERROR),
+            "replica did not return the source-owned storage error: {}",
+            internal_error.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn quorum_requires_complete_scans_and_accepts_two_intact_replicas() {
+        let replicas = start_replicas(2).await;
+        replicas[0].storage.fail_reads();
+        replicas[1].storage.fail_reads();
+
+        let mut internal_results = Vec::new();
+        for index in 0..2 {
+            let mut client = connect(&replicas[index].uri).await;
+            internal_results.push(client.internal(request()).await);
+            assert!(
+                replicas[index].storage.failed_read_count() > 0,
+                "replica {index} did not exercise the injected SSTable error"
+            );
+        }
+
+        let mut coordinator = connect(&replicas[2].uri).await;
+        let result = coordinator.query(request()).await;
+        assert!(
+            result.is_err(),
+            "QUORUM counted failed partition scans as acknowledgements when only one replica completed"
+        );
+
+        for result in internal_results {
+            let error = result.expect_err("faulted replica returned a partial successful scan");
+            assert!(
+                error.message().contains(INJECTED_READ_ERROR),
+                "replica did not preserve the source storage error: {}",
+                error.message()
+            );
+        }
+
+        replicas[1].storage.allow_reads();
+        let node_one_before = replicas[1].storage.successful_data_read_count();
+        let node_two_before = replicas[2].storage.successful_data_read_count();
+        let response = coordinator.query(request()).await.unwrap().into_inner();
+        assert_complete_rows(result_rows(match response.payload {
+            Some(query_response::Payload::Rows(rows)) => QueryOutput::Rows(
+                rows.rows
+                    .into_iter()
+                    .map(|row| row.columns.into_iter().collect())
+                    .collect(),
+            ),
+            _ => panic!("expected merged rows when two replicas complete the scan"),
+        }));
+        assert!(
+            replicas[1].storage.successful_data_read_count() > node_one_before,
+            "the first intact replica did not complete a data SSTable read"
+        );
+        assert!(
+            replicas[2].storage.successful_data_read_count() > node_two_before,
+            "the second intact replica did not complete a data SSTable read"
+        );
+
+        let mut failed_replica = connect(&replicas[0].uri).await;
+        let error = failed_replica.internal(request()).await.unwrap_err();
+        assert!(
+            error.message().contains(INJECTED_READ_ERROR),
+            "the remaining failed replica did not expose its storage error"
+        );
+    }
+}
