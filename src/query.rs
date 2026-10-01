@@ -656,7 +656,12 @@ impl SqlEngine {
             }
         } else {
             // Scan the namespace which now includes both in-memory and on-disk rows.
-            for (k, bytes) in db.scan_ns(ns).await.into_iter() {
+            for (k, bytes) in db
+                .scan_ns(ns)
+                .await
+                .map_err(|e| QueryError::Other(e.to_string()))?
+                .into_iter()
+            {
                 let (_, data) = split_ts(&bytes);
                 if data.is_empty() {
                     continue;
@@ -739,7 +744,12 @@ impl SqlEngine {
             let prefixes = build_keys(prefix_cols, &cond_multi);
             // Expanded scan returns rows from both the memtable and on-disk tables
             // which are then filtered by the prefix conditions.
-            for (k, bytes) in db.scan_ns(ns).await.into_iter() {
+            for (k, bytes) in db
+                .scan_ns(ns)
+                .await
+                .map_err(|e| QueryError::Other(e.to_string()))?
+                .into_iter()
+            {
                 for prefix in &prefixes {
                     if k == *prefix || k.starts_with(&format!("{}|", prefix)) {
                         let (ts, data) = split_ts(&bytes);
@@ -788,6 +798,7 @@ impl SqlEngine {
         let mut tables: Vec<String> = db
             .scan_ns("_tables")
             .await
+            .map_err(|e| QueryError::Other(e.to_string()))?
             .into_iter()
             .map(|(k, _)| k)
             .collect();
