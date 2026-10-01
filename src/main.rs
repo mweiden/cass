@@ -554,6 +554,7 @@ mod scan_read_tests {
     const SELECT_ORDERS: &str = "SELECT * FROM orders WHERE customer_id = 'nike'";
     const SELECT_MISSING_ORDERS: &str = "SELECT * FROM orders WHERE customer_id = 'adidas'";
     const COUNT_ORDERS: &str = "SELECT COUNT(*) FROM orders WHERE customer_id = 'nike'";
+    const SHOW_TABLES: &str = "SHOW TABLES";
     const SSTABLE_WITH_NEWER_ROWS: &str = "sstable_2.tbl";
     const INJECTED_READ_ERROR: &str = "injected SSTable read failure";
 
@@ -899,6 +900,121 @@ mod scan_read_tests {
             sql: SELECT_ORDERS.to_string(),
             ts: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn show_tables_errors_when_every_metadata_scan_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(FailingStorage::new(dir.path()));
+        drop(seed_storage(storage.clone()).await);
+        let db = Arc::new(Database::new(storage.clone(), "wal.log").await.unwrap());
+        let address = free_addresses(1)[0];
+        let cluster = Arc::new(Cluster::new(
+            db,
+            format!("http://{address}"),
+            Vec::new(),
+            1,
+            1,
+            1,
+        ));
+        let _server = start_server(address, cluster).await;
+        let mut client = connect(&format!("http://{address}")).await;
+        let registered = client
+            .query(QueryRequest {
+                sql: SHOW_TABLES.to_string(),
+                ts: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(
+            matches!(
+                registered.payload,
+                Some(query_response::Payload::Tables(tables))
+                    if tables.tables == vec!["orders".to_string()]
+            ),
+            "the persisted orders registry was not readable before the injected failure"
+        );
+        storage.fail_reads();
+
+        let response = client
+            .query(QueryRequest {
+                sql: SHOW_TABLES.to_string(),
+                ts: 0,
+            })
+            .await;
+        let error =
+            response.expect_err("SHOW TABLES succeeded after every attempted metadata scan failed");
+        assert!(
+            error.message().contains(INJECTED_READ_ERROR),
+            "SHOW TABLES returned a different error than the injected SSTable read: {}",
+            error.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn show_tables_keeps_empty_success_when_a_peer_scan_fails() {
+        let addresses = free_addresses(2);
+        let uris: Vec<String> = addresses
+            .iter()
+            .map(|address| format!("http://{address}"))
+            .collect();
+
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty_storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(empty_dir.path()));
+        let empty_db = Arc::new(Database::new(empty_storage, "wal.log").await.unwrap());
+
+        let failed_dir = tempfile::tempdir().unwrap();
+        let failed_storage = Arc::new(FailingStorage::new(failed_dir.path()));
+        drop(seed_storage(failed_storage.clone()).await);
+        let failed_db = Arc::new(
+            Database::new(failed_storage.clone(), "wal.log")
+                .await
+                .unwrap(),
+        );
+
+        let empty_cluster = Arc::new(Cluster::new(
+            empty_db,
+            uris[0].clone(),
+            vec![uris[1].clone()],
+            1,
+            2,
+            2,
+        ));
+        let failed_cluster = Arc::new(Cluster::new(
+            failed_db,
+            uris[1].clone(),
+            vec![uris[0].clone()],
+            1,
+            2,
+            2,
+        ));
+        let _empty_server = start_server(addresses[0], empty_cluster).await;
+        let _failed_server = start_server(addresses[1], failed_cluster).await;
+        let mut client = connect(&uris[0]).await;
+        let failed_reads_before = failed_storage.failed_read_count();
+        failed_storage.fail_reads();
+
+        let response = client
+            .query(QueryRequest {
+                sql: SHOW_TABLES.to_string(),
+                ts: 0,
+            })
+            .await;
+        assert!(
+            failed_storage.failed_read_count() > failed_reads_before,
+            "the broadcast did not reach the peer's injected SSTable read error"
+        );
+        let response = response
+            .expect("a failed peer discarded the empty successful metadata reply")
+            .into_inner();
+        assert!(
+            matches!(
+                response.payload,
+                Some(query_response::Payload::Tables(tables)) if tables.tables.is_empty()
+            ),
+            "SHOW TABLES did not preserve the successful empty metadata result"
+        );
     }
 
     #[tokio::test]
