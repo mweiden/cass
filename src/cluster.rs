@@ -1522,6 +1522,7 @@ impl Cluster {
         let mut table_set: BTreeSet<String> = BTreeSet::new();
         let mut arr_rows: Vec<BTreeMap<String, String>> = Vec::new();
         let mut last_err: Option<QueryError> = None;
+        let mut has_successful_table_reply = false;
         let mut row_count: u64 = 0;
         let mut count_val: Option<u64> = None;
 
@@ -1541,6 +1542,7 @@ impl Cluster {
                     row_count = row_count.max(count as u64);
                 }
                 Ok(QueryOutput::Tables(tables)) => {
+                    has_successful_table_reply = true;
                     for t in tables {
                         table_set.insert(t);
                     }
@@ -1597,6 +1599,9 @@ impl Cluster {
             meta.first_stmt.as_deref(),
             Some(Statement::ShowTables { .. })
         ) {
+            if !has_successful_table_reply && let Some(err) = last_err.take() {
+                return Err(err);
+            }
             let tables: Vec<String> = table_set.into_iter().collect();
             return Ok(output_to_proto(QueryOutput::Tables(tables)));
         }
