@@ -286,8 +286,9 @@ impl Database {
     ///
     /// Results from the in-memory memtable and any on-disk [`SsTable`]s are
     /// merged together with later values (memtable/newer SSTables) overriding
-    /// earlier ones. Returned entries are deduplicated and ordered by key.
-    pub async fn scan_ns(&self, ns: &str) -> Vec<(String, Vec<u8>)> {
+    /// earlier ones. Returned entries are deduplicated and ordered by key. A
+    /// storage read error is returned rather than exposing an incomplete scan.
+    pub async fn scan_ns(&self, ns: &str) -> Result<Vec<(String, Vec<u8>)>, storage::StorageError> {
         use base64::Engine;
         use std::collections::BTreeMap;
 
@@ -297,16 +298,15 @@ impl Database {
         // load from on-disk SSTables first so newer data overwrites older
         let tables = self.sstables.read().await;
         for table in tables.iter() {
-            if let Ok(raw) = self.storage.get(&table.path).await {
-                for line in raw.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-                    if let Some(pos) = line.iter().position(|b| *b == b'\t')
-                        && let Ok(key) = std::str::from_utf8(&line[..pos])
-                            && let Some(rest) = key.strip_prefix(&prefix)
-                                && let Ok(val) = base64::engine::general_purpose::STANDARD
-                                    .decode(&line[pos + 1..])
-                                {
-                                    map.insert(rest.to_string(), val);
-                                }
+            let raw = self.storage.get(&table.path).await?;
+            for line in raw.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                if let Some(pos) = line.iter().position(|b| *b == b'\t')
+                    && let Ok(key) = std::str::from_utf8(&line[..pos])
+                    && let Some(rest) = key.strip_prefix(&prefix)
+                    && let Ok(val) =
+                        base64::engine::general_purpose::STANDARD.decode(&line[pos + 1..])
+                {
+                    map.insert(rest.to_string(), val);
                 }
             }
         }
@@ -318,7 +318,7 @@ impl Database {
             }
         }
 
-        map.into_iter().collect()
+        Ok(map.into_iter().collect())
     }
 
     /// Clear all data for a namespace.

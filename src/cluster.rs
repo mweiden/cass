@@ -476,12 +476,11 @@ impl Cluster {
 
     /// Execute `sql` against the appropriate replicas.
     ///
-    /// When `forwarded` is false the current node acts as the coordinator
-    /// and forwards the statement to the replica nodes determined by the
-    /// partition key.  Results from all replicas are unioned together and
-    /// returned to the caller.  When `forwarded` is true the query is being
-    /// handled on behalf of a peer and is executed locally without further
-    /// replication.
+    /// When `forwarded` is false, the current node coordinates the request and
+    /// routes it to replicas selected by the partition key. For non-broadcast
+    /// reads, only successful replies count toward consistency; errors cannot
+    /// override the result after enough replies succeed. When `forwarded` is
+    /// true, the query is executed locally without further replication.
     #[instrument(
         skip(self, sql),
         fields(
@@ -564,7 +563,15 @@ impl Cluster {
                 unhealthy,
             )
             .await?;
-        self.merge_results(results.into_iter().map(|(_, r)| r).collect(), meta)
+        // The quorum above counted only successful replies; errors from other
+        // replicas must not override an empty merged result.
+        self.merge_results(
+            results
+                .into_iter()
+                .filter_map(|(_, result)| result.ok().map(Ok))
+                .collect(),
+            meta,
+        )
     }
 
     #[instrument(
@@ -1515,6 +1522,7 @@ impl Cluster {
         let mut table_set: BTreeSet<String> = BTreeSet::new();
         let mut arr_rows: Vec<BTreeMap<String, String>> = Vec::new();
         let mut last_err: Option<QueryError> = None;
+        let mut has_successful_table_reply = false;
         let mut row_count: u64 = 0;
         let mut count_val: Option<u64> = None;
 
@@ -1534,6 +1542,7 @@ impl Cluster {
                     row_count = row_count.max(count as u64);
                 }
                 Ok(QueryOutput::Tables(tables)) => {
+                    has_successful_table_reply = true;
                     for t in tables {
                         table_set.insert(t);
                     }
@@ -1590,6 +1599,9 @@ impl Cluster {
             meta.first_stmt.as_deref(),
             Some(Statement::ShowTables { .. })
         ) {
+            if !has_successful_table_reply && let Some(err) = last_err.take() {
+                return Err(err);
+            }
             let tables: Vec<String> = table_set.into_iter().collect();
             return Ok(output_to_proto(QueryOutput::Tables(tables)));
         }
