@@ -886,74 +886,76 @@ impl Cluster {
         };
         let ballot = (ts << 16) | (salt & 0xffff);
 
-        // Prepare phase
+        // Prepare phase: contact all replicas concurrently so latency is
+        // bounded by the slowest replica rather than the sum of round trips.
+        let prepare_results = join_all(healthy.iter().map(|node| {
+            let ns = ns.clone();
+            let key = key.clone();
+            async move {
+                if node == &self.self_addr {
+                    self.lwt_prepare(&ns, &key, ballot).await
+                } else if let Ok(mut client) = self.grpc_client(node).await
+                    && let Ok(resp) = client
+                        .lwt_prepare(tonic::Request::new(LwtPrepareRequest {
+                            namespace: ns,
+                            key,
+                            ballot,
+                        }))
+                        .await
+                {
+                    let r = resp.into_inner();
+                    (r.promised, r.ballot, r.value)
+                } else {
+                    (false, 0, Vec::new())
+                }
+            }
+        }))
+        .await;
         let mut promised = 0usize;
         let mut max_accepted_ballot = 0u64;
         let mut max_accepted_value: Vec<u8> = Vec::new();
-        for node in &healthy {
-            if node == &self.self_addr {
-                let (ok, acc_b, acc_v) = self.lwt_prepare(&ns, &key, ballot).await;
-                if ok {
-                    promised += 1;
-                    if acc_b > max_accepted_ballot {
-                        max_accepted_ballot = acc_b;
-                        max_accepted_value = acc_v;
-                    }
+        for (ok, acc_b, acc_v) in prepare_results {
+            if ok {
+                promised += 1;
+                if acc_b > max_accepted_ballot {
+                    max_accepted_ballot = acc_b;
+                    max_accepted_value = acc_v;
                 }
-            } else if let Ok(mut client) = self.grpc_client(node).await
-                && let Ok(resp) = client
-                    .lwt_prepare(tonic::Request::new(LwtPrepareRequest {
-                        namespace: ns.clone(),
-                        key: key.clone(),
-                        ballot,
-                    }))
-                    .await
-                {
-                    let r = resp.into_inner();
-                    if r.promised {
-                        promised += 1;
-                        if r.ballot > max_accepted_ballot {
-                            max_accepted_ballot = r.ballot;
-                            max_accepted_value = r.value;
-                        }
-                    }
-                }
+            }
         }
         if promised < required {
             return Err(QueryError::Other("not enough healthy replicas".into()));
         }
 
-        // Read phase
-        let mut read_ballot = max_accepted_ballot;
-        let mut read_value = max_accepted_value.clone();
-        for node in &healthy {
-            if node == &self.self_addr {
-                let (b, v) = self.lwt_read(&ns, &key).await;
-                if b > read_ballot
-                    || (b == 0 && read_ballot == 0 && read_value.is_empty() && !v.is_empty())
-                {
-                    read_ballot = b;
-                    read_value = v;
-                }
-            } else if let Ok(mut client) = self.grpc_client(node).await
-                && let Ok(resp) = client
-                    .lwt_read(tonic::Request::new(LwtReadRequest {
-                        namespace: ns.clone(),
-                        key: key.clone(),
-                    }))
-                    .await
+        // Read phase (concurrent fan-out, results merged sequentially)
+        let read_results = join_all(healthy.iter().map(|node| {
+            let ns = ns.clone();
+            let key = key.clone();
+            async move {
+                if node == &self.self_addr {
+                    Some(self.lwt_read(&ns, &key).await)
+                } else if let Ok(mut client) = self.grpc_client(node).await
+                    && let Ok(resp) = client
+                        .lwt_read(tonic::Request::new(LwtReadRequest { namespace: ns, key }))
+                        .await
                 {
                     let r = resp.into_inner();
-                    if r.ballot > read_ballot
-                        || (r.ballot == 0
-                            && read_ballot == 0
-                            && read_value.is_empty()
-                            && !r.value.is_empty())
-                    {
-                        read_ballot = r.ballot;
-                        read_value = r.value;
-                    }
+                    Some((r.ballot, r.value))
+                } else {
+                    None
                 }
+            }
+        }))
+        .await;
+        let mut read_ballot = max_accepted_ballot;
+        let mut read_value = max_accepted_value.clone();
+        for (b, v) in read_results.into_iter().flatten() {
+            if b > read_ballot
+                || (b == 0 && read_ballot == 0 && read_value.is_empty() && !v.is_empty())
+            {
+                read_ballot = b;
+                read_value = v;
+            }
         }
 
         // Evaluate condition and build proposed value
@@ -1013,47 +1015,56 @@ impl Cluster {
             _ => return Err(QueryError::Unsupported),
         };
 
-        // Propose phase
-        let mut accepted = 0usize;
-        for node in &healthy {
-            if node == &self.self_addr {
-                if self
-                    .lwt_propose(&ns, &key, ballot, proposed_value.clone())
-                    .await
+        // Propose phase (concurrent fan-out)
+        let propose_results = join_all(healthy.iter().map(|node| {
+            let ns = ns.clone();
+            let key = key.clone();
+            let value = proposed_value.clone();
+            async move {
+                if node == &self.self_addr {
+                    self.lwt_propose(&ns, &key, ballot, value).await
+                } else if let Ok(mut client) = self.grpc_client(node).await
+                    && let Ok(resp) = client
+                        .lwt_propose(tonic::Request::new(LwtProposeRequest {
+                            namespace: ns,
+                            key,
+                            ballot,
+                            value,
+                        }))
+                        .await
                 {
-                    accepted += 1;
+                    resp.into_inner().accepted
+                } else {
+                    false
                 }
-            } else if let Ok(mut client) = self.grpc_client(node).await
-                && let Ok(resp) = client
-                    .lwt_propose(tonic::Request::new(LwtProposeRequest {
-                        namespace: ns.clone(),
-                        key: key.clone(),
-                        ballot,
-                        value: proposed_value.clone(),
-                    }))
-                    .await
-                    && resp.into_inner().accepted {
-                        accepted += 1;
-                    }
-        }
+            }
+        }))
+        .await;
+        let accepted = propose_results.into_iter().filter(|ok| *ok).count();
         if accepted < required {
             return Err(QueryError::Other("not enough healthy replicas".into()));
         }
 
-        // Commit phase (best effort to all healthy replicas)
-        for node in &healthy {
-            if node == &self.self_addr {
-                self.lwt_commit(&ns, &key, proposed_value.clone()).await;
-            } else if let Ok(mut client) = self.grpc_client(node).await {
-                let _ = client
-                    .lwt_commit(tonic::Request::new(LwtCommitRequest {
-                        namespace: ns.clone(),
-                        key: key.clone(),
-                        value: proposed_value.clone(),
-                    }))
-                    .await;
+        // Commit phase (best effort to all healthy replicas, concurrently)
+        join_all(healthy.iter().map(|node| {
+            let ns = ns.clone();
+            let key = key.clone();
+            let value = proposed_value.clone();
+            async move {
+                if node == &self.self_addr {
+                    self.lwt_commit(&ns, &key, value).await;
+                } else if let Ok(mut client) = self.grpc_client(node).await {
+                    let _ = client
+                        .lwt_commit(tonic::Request::new(LwtCommitRequest {
+                            namespace: ns,
+                            key,
+                            value,
+                        }))
+                        .await;
+                }
             }
-        }
+        }))
+        .await;
 
         // Build LWT response row
         let mut row = BTreeMap::new();
