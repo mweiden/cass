@@ -54,23 +54,41 @@ struct WalState {
     flushed: usize,
 }
 
-fn parse_entries(data: &[u8]) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+/// Parse WAL records, skipping any that are corrupted.
+///
+/// A torn write or damaged byte must not prevent the node from starting, so
+/// malformed records (bad UTF-8 keys, invalid base64 values, or missing
+/// separators) are logged and dropped while the remaining entries are
+/// replayed.
+fn parse_entries(data: &[u8]) -> Vec<(String, Vec<u8>)> {
     let mut res = Vec::new();
+    let mut skipped = 0usize;
     for line in data.split(|b| *b == b'\n') {
         if line.is_empty() {
             continue;
         }
-        if let Some(pos) = line.iter().position(|b| *b == b'\t') {
-            let key = std::str::from_utf8(&line[..pos])
-                .map_err(std::io::Error::other)?
-                .to_string();
-            let val = STANDARD
-                .decode(&line[pos + 1..])
-                .map_err(std::io::Error::other)?;
-            res.push((key, val));
-        }
+        let Some(pos) = line.iter().position(|b| *b == b'\t') else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(key) = std::str::from_utf8(&line[..pos]) else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(val) = STANDARD.decode(&line[pos + 1..]) else {
+            skipped += 1;
+            continue;
+        };
+        res.push((key.to_string(), val));
     }
-    Ok(res)
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            recovered = res.len(),
+            "skipped corrupted WAL records during recovery"
+        );
+    }
+    res
 }
 
 fn map_err(e: StorageError) -> std::io::Error {
@@ -177,7 +195,7 @@ impl Wal {
     ) -> std::io::Result<(Self, Vec<(String, Vec<u8>)>)> {
         let path = path.into();
         let buf = storage.get(&path).await.unwrap_or_default();
-        let entries = parse_entries(&buf)?;
+        let entries = parse_entries(&buf);
         let initial_len = buf.len();
         let inner = Arc::new(WalInner {
             path,
